@@ -1,7 +1,7 @@
-# Study Guide Update Summary - Zero-Trades Bug Fix
+# Study Guide Update Summary
 
-**Date**: February 17, 2026
-**Updates Made**: Added comprehensive documentation of the zero-trades bug fix to alpha_trade_study_guide.md
+**Last Updated**: February 18, 2026
+**Updates Made**: Zero-trades bug fix (Feb 17) + RL engine deep fix (Feb 18)
 
 ## Changes Made
 
@@ -141,11 +141,69 @@ All bug descriptions include:
 - ✅ Beginner-friendly analogies and examples
 - ✅ No jargon without explanation
 
-## Next Steps for Maintenance
+---
+
+## Update 2: RL Engine Deep Fix (February 18, 2026)
+
+### Changes Made
+
+#### Header Update (Line 7)
+Added: "RL engine NaN fixes (4 bugs), CV parallelization (10x speedup), RL zero-trades policy collapse (5 bugs), training budget increase, and local optima detection (3 improvements)"
+
+#### Table of Contents
+Added entry 19: "RL Engine Deep Fix (February 18, 2026)"
+
+#### New Section 19 — RL Engine Deep Fix (~200 lines added)
+
+**19.1 The NaN Problem (Fixes 1-4)** — "Poison in the Pipeline"
+- Analogy: Factory assembly line with defective parts jamming downstream machines
+- 6 quality control checkpoints added across the NaN pipeline
+- Table showing each fix, location, and analogy
+
+**19.2 CV Parallelization (Fix 5)** — "One Cashier vs Five"
+- Analogy: Grocery store with 15 customers but 1 cashier scanning items one-by-one
+- Part A: Batch folds via VectorizedEnvs (5 customers on one belt)
+- Part B: Thread symbols via ThreadPoolExecutor (3 checkout lanes)
+- Result: 10 min → 1-2 min
+
+**19.3 Zero-Trades Policy Collapse (Fix 6)** — "The Couch Potato Bug"
+- Analogy: Restaurant employee fined for every order, gets permanent record of complaints, tiny bonus for standing still → learns to never take orders
+- 5 compounding causes documented with individual analogies
+- Before/After: 0 trades/40yr → active trading
+
+**19.4 Training Budget (Fix 7)** — "Trying to Learn Piano in 5 Minutes"
+- Analogy: 150k steps = half an episode per env = not enough practice
+- 150k → 800k steps (5.3x increase)
+
+**19.5 Local Optima Detection (Fix 8)** — "Stuck on a Hill"
+- Analogy: Hiker in fog climbing nearest small hill, missing the real mountain
+- 8A: Warm Restarts = car downshifting to climb new hills
+- 8B: Entropy Floor = thermostat for curiosity
+- 8C: Dashboard = gauges showing training health
+
+**19.6 Configuration Changes Summary**
+- Full before/after table of all 12 parameter changes
+
+**19.7 Bug Count Summary**
+- Running total: 27 bugs fixed across 3 sessions
+
+### File Growth
+- **Before**: ~4,162 lines
+- **After**: ~4,370 lines (+208 lines, +5% growth)
+
+### Documentation References Added
+- All code locations for Fixes 1-8
+- Cross-references to CLAUDE.md and SYSTEM_STATUS.md
+
+---
+
+## Maintenance Guide
 
 When future bugs are discovered:
-1. Add to the bug table in Section 18
-2. Document with same format (Problem → Fix → Impact → Code Location)
-3. Update the header count (currently "14 Critical Bugs Fixed")
+1. Add to the bug table in the appropriate section (18 for pipeline, 19 for RL engine)
+2. Document with same format (Problem → Analogy → Fix → Impact → Code Location)
+3. Update the header count (currently "27 bugs fixed across 3 sessions")
 4. Add test results if available
 5. Cross-reference detailed documentation files
+6. Update CLAUDE.md "Completed Fixes" section
+7. Update SYSTEM_STATUS.md tables

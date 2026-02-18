@@ -4,7 +4,7 @@
 
 **From Absolute Zero to Understanding Every Moving Part**
 
-*Last Updated: February 17, 2026 — Includes RL observation fix, horizon optimization, Tier 1-3 alpha improvements, 3 dead alpha resurrections, ICIR/HitRate/Persistence quality metrics, no-trade threshold optimization, auto-flip mechanism, **asymmetric stop losses (8 bugs fixed), zero-trades bug fix (6 bugs fixed), crowding detection, and professional table formatting***
+*Last Updated: February 18, 2026 — Includes RL observation fix, horizon optimization, Tier 1-3 alpha improvements, 3 dead alpha resurrections, ICIR/HitRate/Persistence quality metrics, no-trade threshold optimization, auto-flip mechanism, **asymmetric stop losses (8 bugs fixed), zero-trades bug fix (6 bugs fixed), crowding detection, professional table formatting, RL engine NaN fixes (4 bugs), CV parallelization (10x speedup), RL zero-trades policy collapse (5 bugs), training budget increase, and local optima detection (3 improvements)***
 
 *If you've never written a trading algorithm, never heard of "alpha," and aren't sure what a neural network does — this guide is for you. We start from scratch and build up, one concept at a time.*
 
@@ -43,6 +43,7 @@ If something doesn't make sense, skip ahead — it's often explained more fully 
 16. [Glossary: Every Term Explained](#16-glossary-every-term-explained)
 17. [Configuration Reference](#17-configuration-reference)
 18. [What's New in v7.0? (February 2026 Update)](#18-whats-new-in-v70-february-2026-update)
+19. [RL Engine Deep Fix (February 18, 2026)](#19-rl-engine-deep-fix-february-18-2026)
 
 ---
 
@@ -4132,7 +4133,7 @@ print(table.render())
 │    Multiple testing: Holm-Bonferroni corrected                   │
 │    Multi-horizon IC: Test at 1, 5, 15-bar horizons               │
 │                                                                  │
-│  BUG FIXES (Feb 17 - Production Ready ✅):                        │
+│  BUG FIXES (Feb 17 - Stops + Pipeline):                           │
 │    ✅ ATR extraction (handles numpy + DataFrame)                 │
 │    ✅ Bar counter (increment before check)                       │
 │    ✅ Clone isolation (deep copy for MCTS)                       │
@@ -4141,6 +4142,19 @@ print(table.render())
 │    ✅ Log timing (after execution, not before)                   │
 │    ✅ Config validation (fail fast on bad params)                │
 │    ✅ Lookahead prevention (early-bar ATR calc)                  │
+│                                                                  │
+│  BUG FIXES (Feb 18 - RL Engine, 13 bugs):                        │
+│    ✅ NaN MCTS policies (uniform fallback)                       │
+│    ✅ NaN filter + KL guard (clean distillation)                 │
+│    ✅ PPO stability (clamp ratio, skip bad loss, clean obs)      │
+│    ✅ CV parallelization (VectorizedEnvs + ThreadPool)           │
+│    ✅ Action mask bug (current DD, not historical max)           │
+│    ✅ Turnover cost 0.5→0.05, holding bonus removed             │
+│    ✅ Lagrangian turnover 0.5→5.0, entropy 0.01→0.03            │
+│    ✅ Training budget 150k→800k steps                            │
+│    ✅ LR warm restarts (SGDR) + plateau detection                │
+│    ✅ Entropy floor (auto-boost when < 0.3)                      │
+│    ✅ Diagnostics dashboard (ent, grad_norm, action dist)        │
 │                                                                  │
 │  FILES:                                                          │
 │    Engine:     alphago_trading_system.py (v3.0 core)             │
@@ -4156,6 +4170,195 @@ print(table.render())
 │    Artifacts:  run_artifacts.py                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 19. RL Engine Deep Fix (February 18, 2026)
+
+This section documents 8 fixes to the RL training engine (`alphago_trading_system.py`). Think of this session as taking the car to the mechanic for 8 things at once — some were broken parts (bugs), some were bad settings (config), and some were missing gauges on the dashboard (diagnostics).
+
+### 19.1 The NaN Problem (Fixes 1-4): "Poison in the Pipeline"
+
+**What happened:** During training, the system kept printing warnings like `"Non-finite values in critic output"` and `"KL=nan"`. Training was corrupted.
+
+**Analogy:** Imagine a factory assembly line where one machine occasionally produces defective parts (NaN = "Not a Number"). If you don't catch and remove the defective parts, they jam every machine downstream. Eventually, the final product is garbage.
+
+That's exactly what was happening:
+1. The neural network's `BatchNorm` layer (a normalizer) occasionally produced garbage numbers
+2. These flowed into the MCTS planner, corrupting the improved policies
+3. The corrupted policies made the KL divergence loss = NaN
+4. NaN loss meant the training step was wasted (or worse, corrupted the model weights)
+
+**The Fixes — adding quality control at every stage:**
+
+| Fix | Where | What It Does | Analogy |
+|-----|-------|-------------|---------|
+| Fix 1 | MCTS policy output | Replace NaN policies with "equal chance for all actions" | Defective parts replaced with blank templates |
+| Fix 2 | Before distillation | Filter out any remaining bad rows | Metal detector before the packaging machine |
+| Fix 3 | KL loss computation | Skip NaN loss batches, only count valid ones | Don't count spoiled ingredients in the recipe |
+| Fix 4A | PPO loss | Skip entire update if loss is NaN | Don't ship a defective product |
+| Fix 4B | Log-ratio | Clamp `exp(x)` input to [-5, 5] to prevent overflow | Speed limiter on the conveyor belt |
+| Fix 4C | Observations | Replace NaN inputs with safe defaults before forward pass | Wash the raw materials before processing |
+
+**Code locations:** `alphago_mcts_parallel.py` (Fix 1, lines 142-168), `alphago_trading_system.py` (Fixes 2-4)
+
+---
+
+### 19.2 CV Parallelization (Fix 5): "One Cashier vs Five"
+
+**What happened:** Cross-validation after each training iteration took 10+ minutes. The system evaluated 3 symbols x 5 folds = 15 evaluations, one at a time, each making single-observation GPU calls.
+
+**Analogy:** Imagine a grocery store with 15 customers (evaluations) but only 1 cashier (GPU), and each customer pays for items one at a time (batch-size-1 inference). That's incredibly slow.
+
+**The fix has two parts:**
+
+**Part A — Batch the folds (VectorizedEnvs):**
+Instead of running 5 folds one at a time, we run all 5 simultaneously. Each "step" sends 5 observations to the GPU at once. Like having all 5 customers put their items on the belt together — the cashier scans them all in one pass.
+
+**Part B — Thread the symbols:**
+The 3 symbols now run in parallel threads using `ThreadPoolExecutor`. Like opening 3 checkout lanes instead of 1.
+
+**Result:** ~10 min → ~1-2 min (5-10x speedup)
+
+**Code location:** `alphago_trading_system.py` — `_batched_eval()` (lines ~2659-2690), `walk_forward()` (lines ~2691-2713), threaded validation (lines ~3224-3249)
+
+---
+
+### 19.3 Zero-Trades Policy Collapse (Fix 6): "The Couch Potato Bug"
+
+**What happened:** The RL agent learned to NEVER trade. Across 40 years of backtesting, zero trades. The Sharpe ratio showed as 400 million (meaningless — dividing by zero volatility). The agent just sat in cash forever.
+
+**Analogy:** Imagine training a new employee at a restaurant. Every time they take an order, they get a small fine (turnover cost). Every time a customer complains (drawdown), their fine goes up permanently and never comes back down. Plus, they get a tiny bonus for standing still and doing nothing (holding bonus). After a few bad experiences, the employee learns: "The safest strategy is to never take any orders at all." They just stand at the counter doing nothing. Forever.
+
+**Five problems were compounding:**
+
+**Bug 6A — The Permanent Scar (action masking bug):**
+The system tracked `max_dd` — the worst drawdown EVER seen in the episode. Once the portfolio had a 13% drawdown and recovered, `max_dd` stayed at 13% forever. This permanently blocked risky actions (LONG/SHORT). If it ever hit 15%, ONLY the FLAT action was allowed for the rest of the 40-year episode.
+
+*Fix:* Use CURRENT drawdown (which recovers when portfolio recovers), not historical max.
+
+**Config 6B — The Harsh Fine (turnover cost = 0.5):**
+A trade with 10% turnover cost the agent -0.05 in reward. To break even, the trade needed to earn +0.05% return in one bar. Most bars have near-zero returns, so trading always looked like a losing proposition.
+
+*Fix:* Reduced from 0.5 to 0.05 (10x less punitive).
+
+**Config 6C — The Double Tax (Lagrangian turnover target = 50%):**
+On top of the turnover cost, a second penalty kicked in if annual turnover exceeded 50%. Two penalties for the same thing = double taxation on every trade.
+
+*Fix:* Raised target to 500% (5x annual turnover — still conservative for active trading).
+
+**Config 6D — No Curiosity (entropy = 0.01):**
+Entropy measures how "willing to try different actions" the agent is. At 0.01, the agent quickly locked into one action (FLAT) with no incentive to explore alternatives.
+
+*Fix:* Increased to 0.03 (3x more exploration).
+
+**Config 6E — The Couch Bonus (holding bonus = 0.0001):**
+A tiny reward for staying still. Small, but it tipped the already-biased scales further toward doing nothing.
+
+*Fix:* Removed entirely (set to 0.0).
+
+**Before/After:**
+
+```
+Before: 40 years, 0 trades, Sharpe = 400,000,000 (broken)
+After:  Trades happening, WR ~25%, PF ~0.18, turnover > 0
+```
+
+**Code location:** `alphago_trading_system.py` — Config class (lines 209-334), `_get_action_mask()` (line ~1884)
+
+---
+
+### 19.4 Training Budget (Fix 7): "Trying to Learn Piano in 5 Minutes"
+
+**What happened:** The system trained for only 150,000 total steps (3 iterations x 50k). This is like trying to learn piano with 5 minutes of practice — you can't learn anything meaningful.
+
+**Analogy:** PPO (the learning algorithm) needs to see thousands of trading scenarios to learn patterns. 150k steps means each of the 64 parallel environments only ran ~2,300 steps. With 5,000 steps per episode, that's less than half an episode per environment. The agent barely started exploring before training ended.
+
+**Fix:** Increased to 800,000 total steps (8 iterations x 100k). This gives the agent 5.3x more practice time — enough to see full episodes, make mistakes, and actually learn from them.
+
+| Parameter | Before | After |
+|-----------|--------|-------|
+| `n_iterations` | 3 | 8 |
+| `total_timesteps_per_iter` | 50,000 | 100,000 |
+| **Total training steps** | **150,000** | **800,000** |
+
+**Code location:** `alphago_trading_system.py` Config class (lines 233-234)
+
+---
+
+### 19.5 Local Optima Detection (Fix 8): "Stuck on a Hill"
+
+**What happened:** The RL agent can get "stuck" — it finds a strategy that's locally okay but not globally good. Like a hiker who climbs the nearest small hill and thinks they've reached the summit, when the real mountain is across the valley.
+
+**Analogy:** Imagine you're lost in a foggy mountain range. You can only feel the ground immediately around you (gradient). You walk uphill until you reach a peak. But in the fog, you can't see that there's a much taller peak nearby. You're stuck on a "local optimum."
+
+Three mechanisms were missing:
+
+**Fix 8A — Warm Restarts ("Jump Off the Hill"):**
+
+The learning rate (LR) controls how big each learning step is. Previously, the LR started high and decayed to near-zero over training (like your hiking steps getting smaller and smaller until you can't move). With warm restarts (SGDR), the LR periodically resets back to full speed — like teleporting back to the bottom and trying a different path up.
+
+Additionally, if the champion score doesn't improve for 2 consecutive iterations (plateau detected), the LR force-resets to give the optimizer a fresh chance.
+
+*Think of it as:* The LR is like a car's gear. Cosine decay = the car slows to a crawl and stops. Warm restarts = the car downshifts and accelerates again periodically to climb new hills.
+
+**Fix 8B — Entropy Floor ("Force Curiosity"):**
+
+If the agent's entropy (willingness to try different actions) drops below 0.3, the system automatically triples the entropy bonus. This forces the agent to start exploring again rather than rigidly sticking to one action.
+
+*Think of it as:* A thermostat for exploration. When curiosity drops below the minimum temperature (0.3), the heater kicks on at 3x power until the agent warms back up.
+
+**Fix 8C — Diagnostics Dashboard ("The Dashboard Gauges"):**
+
+Every iteration now prints:
+```
+Diagnostics: ent=0.847[OK] grad_norm=0.312 lr=3.00e-04 pl=0.0023 vl=0.0451 kl=0.0089
+Actions: [-1.0:12% -0.5:18% +0.0:35% +0.5:22% +1.0:13%]
+```
+
+What each gauge means:
+- **ent (entropy)**: How diverse are the agent's choices? OK = healthy, LOW = concerning, BOOSTED = recovery mode
+- **grad_norm**: Are gradients flowing? Near 0 = learning stalled. Very high = unstable
+- **lr**: Current learning rate. Should reset periodically (warm restarts)
+- **Actions**: What percentage of time each action is chosen. If one action > 80%, the agent is stuck
+
+The system also warns if it detects:
+- **Plateau**: Champion score hasn't improved for 2 iterations
+- **Action concentration**: One action chosen > 80% of the time (local optimum symptom)
+
+**Code location:** `alphago_trading_system.py` — Config (lines 209-225), `GPUPPOTrainer.update()`, `evaluate()`, `train()`
+
+---
+
+### 19.6 Configuration Changes Summary (Feb 18)
+
+```
+┌──────────────────────────────┬────────────┬────────────┬─────────────────────────────┐
+│ Parameter                    │ Before     │ After      │ Why                         │
+├──────────────────────────────┼────────────┼────────────┼─────────────────────────────┤
+│ n_iterations                 │ 3          │ 8          │ More training time           │
+│ total_timesteps_per_iter     │ 50,000     │ 100,000    │ More training time           │
+│ lr_schedule                  │ cosine     │ cosine_warm_restarts │ Escape local optima │
+│ lr_restart_mult              │ (n/a)      │ 2          │ Period doubles each restart  │
+│ ent_coef                     │ 0.01       │ 0.03       │ More exploration             │
+│ ent_floor                    │ (n/a)      │ 0.3        │ Auto-recovery threshold      │
+│ ent_boost_factor             │ (n/a)      │ 3.0        │ 3x boost when below floor    │
+│ plateau_patience             │ (n/a)      │ 2          │ Iterations before LR reset   │
+│ reward_turnover_cost         │ 0.5        │ 0.05       │ Was killing all trading      │
+│ reward_holding_bonus         │ 0.0001     │ 0.0        │ Was rewarding doing nothing  │
+│ target_turnover_frac         │ 0.50       │ 5.0        │ Was double-penalizing trades │
+│ dd_mask_threshold            │ 0.12       │ 0.20       │ Was masking too early        │
+└──────────────────────────────┴────────────┴────────────┴─────────────────────────────┘
+```
+
+### 19.7 Bug Count Summary
+
+| Session | Bugs Fixed | Category |
+|---------|-----------|----------|
+| Feb 17: Asymmetric Stops | 8 | Stop loss execution |
+| Feb 17: Zero-Trades (Pipeline) | 6 | Alpha warmup, thresholds |
+| **Feb 18: RL Engine** | **13** | **NaN (4), Speed (1), Policy (5), Training (1), Optima (3)** |
+| **Total** | **27** | |
 
 ---
 

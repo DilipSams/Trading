@@ -349,6 +349,7 @@ def print_quality_table(
 
     print(f"\n{HDR}")
     print(f"|{'L0 DATA QUALITY SUMMARY':^{W - 2}s}|")
+    print(f"|{'Checking data like a teacher grades homework: are there gaps, errors, or suspicious values?':^{W - 2}s}|")
     print(HDR)
 
     # Column header
@@ -359,6 +360,13 @@ def print_quality_table(
         f"{'Stale':>5s} {'ExtRet':>6s} {'Score':>6s} {'Verdict':>8s} |"
     )
     print(hdr_fmt)
+    defn_fmt = (
+        f"| {'(Ticker)':<14s} {'':>4s} {'(#days)':>7s} "
+        f"{'(first date)':>12s} {'(last date)':>12s} "
+        f"{'(gaps)':>6s} {'(dups)':>5s} {'(bad)':>5s} "
+        f"{'(flat)':>5s} {'(spike)':>6s} {'(/100)':>6s} {'(grade)':>8s} |"
+    )
+    print(defn_fmt)
     print(SEP)
 
     n_pass = n_warn = n_fail = 0

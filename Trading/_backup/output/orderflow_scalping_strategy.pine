@@ -1,0 +1,289 @@
+//@version=5
+strategy("Order Flow Scalping Strategy", overlay=true,
+         pyramiding=0, default_qty_type=strategy.percent_of_equity,
+         default_qty_value=100, initial_capital=10000,
+         commission_type=strategy.commission.percent, commission_value=0.04)
+
+// ==================== INPUTS ====================
+// Bubble Detection
+bubbleThreshold = input.int(200, "Volume Bubble Threshold (%)", minval=100, maxval=500,
+                           tooltip="Volume must be this % of average volume to be considered a 'bubble'")
+volumePeriod = input.int(20, "Volume Average Period", minval=10, maxval=50)
+
+// Range Detection
+rangeLength = input.int(20, "Range Detection Period", minval=10, maxval=50)
+rangeBreakout = input.float(0.5, "Breakout ATR Multiplier", minval=0.1, maxval=2.0)
+
+// Risk Management
+stopLossTicks = input.int(5, "Stop Loss (Ticks)", minval=1, maxval=20,
+                         tooltip="Stop loss behind the bubble")
+target1Mult = input.float(1.5, "Target 1 (R:R)", minval=0.5, maxval=5.0)
+target2Mult = input.float(3.0, "Target 2 (R:R)", minval=1.0, maxval=10.0)
+useBreakeven = input.bool(true, "Move to Breakeven on Impulse",
+                         tooltip="Move stop to BE when price moves 50% to target")
+
+// Filters
+useVolumeProfile = input.bool(true, "Use Volume Profile POC",
+                             tooltip="Target POC (Point of Control) instead of fixed R:R")
+minBarConfirmation = input.bool(true, "Require Candle Close Confirmation")
+
+// ==================== VARIABLES ====================
+var float entryPrice = na
+var float stopPrice = na
+var float target1Price = na
+var float target2Price = na
+var int barsSinceEntry = 0
+var bool movedToBE = false
+
+// ==================== CALCULATIONS ====================
+
+// 1. VOLUME ANALYSIS (Proxy for Order Flow Bubbles)
+avgVolume = ta.sma(volume, volumePeriod)
+volRatio = volume / avgVolume * 100
+isBigVolume = volRatio >= bubbleThreshold
+
+// Delta Volume (Buy vs Sell pressure approximation)
+// Green candle = more buying, Red candle = more selling
+buyVolume = close > open ? volume : 0
+sellVolume = close < open ? volume : 0
+volumeDelta = buyVolume - sellVolume
+
+// Classify the bubble type
+isBigGreenBubble = isBigVolume and close > open and volumeDelta > 0
+isBigRedBubble = isBigVolume and close < open and volumeDelta < 0
+
+// 2. RANGE DETECTION
+highestHigh = ta.highest(high, rangeLength)
+lowestLow = ta.lowest(low, rangeLength)
+rangeSize = highestHigh - lowestLow
+atr = ta.atr(14)
+
+// Range edges
+upperEdge = highestHigh - (atr * 0.2)
+lowerEdge = lowestLow + (atr * 0.2)
+
+// Are we at range edges?
+atUpperEdge = close >= upperEdge and close <= highestHigh
+atLowerEdge = close <= lowerEdge and close >= lowestLow
+inRange = close > lowerEdge and close < upperEdge
+
+// Breakout detection
+breakoutUp = close > highestHigh[1] + (atr * rangeBreakout)
+breakoutDown = close < lowestLow[1] - (atr * rangeBreakout)
+justBrokeOut = breakoutUp or breakoutDown
+
+// Pullback after breakout
+isPullbackUp = breakoutUp[1] and close < high[1] and close > upperEdge
+isPullbackDown = breakoutDown[1] and close > low[1] and close < lowerEdge
+
+// 3. VOLUME PROFILE (POC Approximation)
+// TradingView doesn't have native VP, so we approximate using VWAP bands
+vwapValue = ta.vwap(close)
+vwapDist = math.abs(close - vwapValue)
+
+// 4. ABSORPTION DETECTION (Big volume, small price move)
+priceChange = math.abs(close - open)
+priceChangePercent = (priceChange / open) * 100
+avgPriceChange = ta.sma(priceChange, volumePeriod)
+
+// Absorption = Big volume but price didn't move much
+isAbsorption = isBigVolume and priceChange < (avgPriceChange * 0.5)
+
+// Hidden Strength = Big RED bubble but price holds/rises (Condition A Long)
+hiddenStrength = isBigRedBubble and close >= open[1] and isAbsorption
+
+// Hidden Weakness = Big GREEN bubble but price fails to rise (Condition A Short)
+hiddenWeakness = isBigGreenBubble and close <= open[1] and isAbsorption
+
+// 5. AGGRESSION DETECTION (Big volume, big price move)
+isImpulsive = isBigVolume and priceChange > (avgPriceChange * 1.5)
+
+// Aggressive Buying = Big GREEN bubble + price jumps (Condition B Long)
+aggressiveBuying = isBigGreenBubble and close > high[1] and isImpulsive
+
+// Aggressive Selling = Big RED bubble + price drops (Condition B Short)
+aggressiveSelling = isBigRedBubble and close < low[1] and isImpulsive
+
+// ==================== ENTRY CONDITIONS ====================
+
+// LONG SETUP
+longSetup = (atLowerEdge or isPullbackUp) // At the right location
+
+// Long Entry Triggers
+longTriggerA = hiddenStrength  // Absorption (Trap)
+longTriggerB = aggressiveBuying // Aggression (Squeeze)
+longTrigger = longTriggerA or longTriggerB
+
+// Confirmation: Bar must close in our favor
+longConfirmed = minBarConfirmation ? (close > open and close > close[1]) : true
+
+longEntry = longSetup and longTrigger and longConfirmed and strategy.position_size == 0
+
+// SHORT SETUP
+shortSetup = (atUpperEdge or isPullbackDown) // At the right location
+
+// Short Entry Triggers
+shortTriggerA = hiddenWeakness  // Absorption (Trap)
+shortTriggerB = aggressiveSelling // Aggression (Squeeze)
+shortTrigger = shortTriggerA or shortTriggerB
+
+// Confirmation: Bar must close in our favor
+shortConfirmed = minBarConfirmation ? (close < open and close < close[1]) : true
+
+shortEntry = shortSetup and shortTrigger and shortConfirmed and strategy.position_size == 0
+
+// ==================== POSITION MANAGEMENT ====================
+
+// Calculate Stop Loss and Targets
+if (longEntry)
+    entryPrice := close
+    // Stop 1-2 ticks behind the bubble (using low of entry bar)
+    stopPrice := low - (syminfo.mintick * stopLossTicks)
+
+    risk = entryPrice - stopPrice
+
+    if (useVolumeProfile)
+        // Target POC (approximated by VWAP)
+        target1Price := vwapValue + (vwapDist * 0.5)
+        target2Price := highestHigh  // Previous high
+    else
+        target1Price := entryPrice + (risk * target1Mult)
+        target2Price := entryPrice + (risk * target2Mult)
+
+    barsSinceEntry := 0
+    movedToBE := false
+    strategy.entry("Long", strategy.long)
+
+if (shortEntry)
+    entryPrice := close
+    stopPrice := high + (syminfo.mintick * stopLossTicks)
+
+    risk = stopPrice - entryPrice
+
+    if (useVolumeProfile)
+        target1Price := vwapValue - (vwapDist * 0.5)
+        target2Price := lowestLow  // Previous low
+    else
+        target1Price := entryPrice - (risk * target1Mult)
+        target2Price := entryPrice - (risk * target2Mult)
+
+    barsSinceEntry := 0
+    movedToBE := false
+    strategy.entry("Short", strategy.short)
+
+// Track bars since entry
+if (strategy.position_size != 0)
+    barsSinceEntry += 1
+
+// Move to Breakeven on Impulsive Move ("Lazer" move)
+if (strategy.position_size > 0 and useBreakeven and not movedToBE)
+    // For longs: if price reached 50% to target
+    if (close >= entryPrice + ((target1Price - entryPrice) * 0.5))
+        stopPrice := entryPrice
+        movedToBE := true
+
+if (strategy.position_size < 0 and useBreakeven and not movedToBE)
+    // For shorts: if price reached 50% to target
+    if (close <= entryPrice - ((entryPrice - target1Price) * 0.5))
+        stopPrice := entryPrice
+        movedToBE := true
+
+// ==================== EXITS ====================
+
+// Stop Loss
+if (strategy.position_size > 0)
+    strategy.exit("Stop/Target1", "Long", stop=stopPrice, limit=target1Price, qty_percent=50)
+    strategy.exit("Target2", "Long", stop=stopPrice, limit=target2Price)
+
+if (strategy.position_size < 0)
+    strategy.exit("Stop/Target1", "Short", stop=stopPrice, limit=target1Price, qty_percent=50)
+    strategy.exit("Target2", "Short", stop=stopPrice, limit=target2Price)
+
+// ==================== PLOTTING ====================
+
+// Range visualization
+plot(upperEdge, "Upper Range Edge", color=color.new(color.red, 70), linewidth=1, style=plot.style_line)
+plot(lowerEdge, "Lower Range Edge", color=color.new(color.green, 70), linewidth=1, style=plot.style_line)
+plot(vwapValue, "POC (VWAP)", color=color.new(color.orange, 50), linewidth=2)
+
+// Volume bubbles
+plotshape(isBigGreenBubble, "Green Bubble", shape.circle, location.belowbar,
+          color=color.new(color.green, 50), size=size.small)
+plotshape(isBigRedBubble, "Red Bubble", shape.circle, location.abovebar,
+          color=color.new(color.red, 50), size=size.small)
+
+// Absorption signals
+plotshape(hiddenStrength, "Hidden Strength", shape.triangleup, location.belowbar,
+          color=color.new(color.lime, 0), size=size.small, text="HS")
+plotshape(hiddenWeakness, "Hidden Weakness", shape.triangledown, location.abovebar,
+          color=color.new(color.maroon, 0), size=size.small, text="HW")
+
+// Aggression signals
+plotshape(aggressiveBuying, "Aggressive Buying", shape.arrowup, location.belowbar,
+          color=color.new(color.aqua, 0), size=size.normal, text="BUY")
+plotshape(aggressiveSelling, "Aggressive Selling", shape.arrowdown, location.abovebar,
+          color=color.new(color.fuchsia, 0), size=size.normal, text="SELL")
+
+// Entry markers
+plotshape(longEntry, "Long Entry", shape.labelup, location.belowbar,
+          color=color.new(color.green, 0), textcolor=color.white, size=size.normal, text="LONG")
+plotshape(shortEntry, "Short Entry", shape.labeldown, location.abovebar,
+          color=color.new(color.red, 0), textcolor=color.white, size=size.normal, text="SHORT")
+
+// Active position levels
+var line stopLine = na
+var line target1Line = na
+var line target2Line = na
+
+if (strategy.position_size != 0 and barsSinceEntry == 1)
+    if not na(stopLine)
+        line.delete(stopLine)
+    if not na(target1Line)
+        line.delete(target1Line)
+    if not na(target2Line)
+        line.delete(target2Line)
+
+    stopLine := line.new(bar_index, stopPrice, bar_index + 10, stopPrice,
+                         color=color.red, width=2, style=line.style_dashed)
+    target1Line := line.new(bar_index, target1Price, bar_index + 10, target1Price,
+                           color=color.green, width=1, style=line.style_dotted)
+    target2Line := line.new(bar_index, target2Price, bar_index + 10, target2Price,
+                           color=color.lime, width=2, style=line.style_dotted)
+
+// Volume bar coloring
+volColor = isBigVolume ? (close > open ? color.new(color.lime, 30) : color.new(color.red, 30)) :
+           color.new(color.gray, 70)
+plot(volume, "Volume", color=volColor, style=plot.style_histogram)
+
+// Info table
+var table infoTable = table.new(position.top_right, 2, 6, border_width=1)
+if (barstate.islast)
+    table.cell(infoTable, 0, 0, "Metric", bgcolor=color.gray, text_color=color.white)
+    table.cell(infoTable, 1, 0, "Value", bgcolor=color.gray, text_color=color.white)
+
+    table.cell(infoTable, 0, 1, "Volume Ratio")
+    table.cell(infoTable, 1, 1, str.tostring(volRatio, "#.0") + "%",
+               text_color=isBigVolume ? color.lime : color.white)
+
+    table.cell(infoTable, 0, 2, "Position")
+    posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "NONE"
+    table.cell(infoTable, 1, 2, posText,
+               text_color=strategy.position_size > 0 ? color.lime :
+                         strategy.position_size < 0 ? color.red : color.white)
+
+    table.cell(infoTable, 0, 3, "P&L")
+    table.cell(infoTable, 1, 3, str.tostring(strategy.netprofit, "$#,###.##"),
+               text_color=strategy.netprofit > 0 ? color.lime : color.red)
+
+    table.cell(infoTable, 0, 4, "Win Rate")
+    winRate = strategy.wintrades / strategy.closedtrades * 100
+    table.cell(infoTable, 1, 4, str.tostring(winRate, "#.0") + "%",
+               text_color=winRate > 50 ? color.lime : color.red)
+
+    table.cell(infoTable, 0, 5, "Trades")
+    table.cell(infoTable, 1, 5, str.tostring(strategy.closedtrades))
+
+// ==================== ALERTS ====================
+alertcondition(longEntry, "Long Entry Signal", "🟢 LONG Entry: Hidden Strength or Aggressive Buying detected")
+alertcondition(shortEntry, "Short Entry Signal", "🔴 SHORT Entry: Hidden Weakness or Aggressive Selling detected")
+alertcondition(isBigVolume, "Volume Bubble Detected", "⚡ Large Volume Bubble ({{plot_0}}% of average)")

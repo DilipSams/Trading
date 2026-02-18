@@ -1,0 +1,82 @@
+
+[96m[1m==================================================================================[0m
+[96m[1m  [97mALPHA-TRADE v7.0 -- Institutional Architecture[0m
+[96m[1m  [2mL1->L2->L3->L4 | RL is one alpha of many | cfg:5db6c46eb289 | 2026-02-17 23:26[0m
+[96m[1m==================================================================================[0m
+  [2m[23:26:42][0m [95mG GPU 0: GeForce RTX 3090 | 24.0GB | SM8.6 | 82 SMs[0m
+  [2m[23:26:42][0m [95mG cuDNN benchmark: ON | TF32: ON | AMP: available[0m
+  [2m[23:26:42][0m [96mi PyTorch 2.7.1+cu118 | Device: cuda | AMP:ON[0m
+
+[2m--------------------------- [96m[1mINSTITUTIONAL PIPELINE[0m[2m ---------------------------[0m
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+  [2m[23:26:42][0m [92m+ Active alphas (12):[0m
+  [2m[23:26:42][0m [96mi     [OK] rl_ppo_mcts[0m
+  [2m[23:26:42][0m [96mi     [OK] trend_follow[0m
+  [2m[23:26:42][0m [96mi     [OK] mean_reversion[0m
+  [2m[23:26:42][0m [96mi     [OK] value[0m
+  [2m[23:26:42][0m [96mi     [OK] carry[0m
+  [2m[23:26:42][0m [96mi     [OK] calendar[0m
+  [2m[23:26:42][0m [96mi     [OK] vol_premium[0m
+  [2m[23:26:42][0m [96mi     [OK] amihud_liquidity[0m
+  [2m[23:26:42][0m [96mi     [OK] hurst_regime[0m
+  [2m[23:26:42][0m [96mi     [OK] short_term_reversal[0m
+  [2m[23:26:42][0m [96mi     [OK] vol_term_structure[0m
+  [2m[23:26:42][0m [96mi     [OK] volume_price_divergence[0m
+  [2m[23:26:42][0m [96mi L3 config: vol_target=15%  kelly=0.25  max_leverage=2.0x  dd_scale=[8%,15%][0m
+  [2m[23:26:42][0m [96mi L4 config: no_trade=0%  kill_loss=5%  slicing=TWAP--5[0m
+
+[2m-------------------------------- [96m[1mDATA LOADING[0m[2m --------------------------------[0m
+  [2m[23:26:42][0m [96mi Downloading 1 symbols...[0m
+  [2m[23:26:42][0m [96mi Found cached data from 2026-02-17 19:27:50 (4.0h ago)[0m
+
+  Use cached data? (Y/n):   [2m[23:26:42][0m [93m! Cache metadata error: EOF when reading a line, re-downloading...[0m
+  [2m[23:26:42][0m [96mi Downloading 1 symbols x 1 TFs = 1 jobs[0m
+  [96mDownload[0m [########################################] 100.0% (1/1) ETA:0s   
+  [2m[23:26:42][0m [96mi Cached data to data_cache\market_data_MSFT_1syms_1d.pkl[0m
+  [2m[23:26:42][0m [92m+ 1 datasets in 0.6s[0m
+  [2m[23:26:42][0m [96mi     1d:   1 syms     10,060 bars[0m
+  [2m[23:26:42][0m [92m+ Loaded 1 datasets[0m
+  [2m[23:26:42][0m [92m+   L0: Trading calendar loaded (NYSE), ingestion gate active (missing_data_policy=rolling_median)[0m
+
++======================================================================================================================+
+|                                               L0 DATA QUALITY SUMMARY                                                |
++======================================================================================================================+
+| Symbol           TF    Bars        Start          End  Miss%   Dup  OHLC Stale ExtRet  Score  Verdict |
++----------------------------------------------------------------------------------------------------------------------+
+| MSFT             1d  10,060   1986-03-13   2026-02-17   0.0%     0    26     3      1  99.4     PASS |
++----------------------------------------------------------------------------------------------------------------------+
+|  1 datasets  |  Avg Score: 99.4  |  PASS: 1   WARN: 0   FAIL: 0                                                      |
++======================================================================================================================+
+
+[2m---------------------------- [96m[1mFEATURE ENGINEERING[0m[2m ----------------------------[0m
+  [96mFeatures[0m [########################################] 100.0% (1/1) ETA:0s   
+  [2m[23:26:56][0m [92m+ 1 datasets | pools: train=0 val=0 holdout=1[0m
+  [2m[23:26:56][0m [96mi   bars: train=7,888 val=986 test=986[0m
+
+  [1m[96m=== DATA SPLIT SUMMARY ===[0m
+  Split ratios: Train=80% | Val=10% | Test/OOS=10%   Embargo=100 bars (configured, scaled per series)
+  Total data points: 9,860 across 1 symbol(s)
+
+  Symbol                 TF     Pool  Train Start   Train End  #Bars    Val Start     Val End  #Bars   Test Start    Test End  #Bars
+  ----------------------------------------------------------------------------------------------------------------------------------
+  MSFT_1d                1d  holdout   1986-03-13  2017-06-26  7,888   2017-11-16  2021-10-18    986   2022-03-14  2026-02-17    986
+  ----------------------------------------------------------------------------------------------------------------------------------
+  TOTAL                                1986-03-13  2017-06-26  7,888                             986   2022-03-14  2026-02-17    986
+
+  [2mTimeline (MSFT_1d):[0m
+  [2m  [TRAIN 2017-06-26] --embargo~100bars--> [VAL 2017-11-16..2021-10-18] --embargo~100bars--> [TEST/OOS 2022-03-14][0m
+
+
+[2m---------------------- [96m[1mTRAINING (PPO + MCTS Self-Play)[0m[2m ----------------------[0m
+  [2m[23:26:56][0m [96mi Pools | train:0 val:0 holdout:1[0m
+  [2m[23:26:56][0m [92m+ System ready | 8,598,279 params | AMP=ON | compile=OFF | n_envs=16[0m
+  [2m[23:26:56][0m [96mi Starting self-play training loop...[0m
+
+[96m[1m==================================================================================[0m
+[96m[1m  [97mALPHA-TRADE v3.0 GPU-PARALLEL TRAINING[0m
+[96m[1m  [2miters=1 steps/it=1,000 n_envs=16 AMP=ON cuda[0m
+[96m[1m==================================================================================[0m
+
+[2m------------------------------- [96m[1mITERATION 1/1[0m[2m -------------------------------[0m
+  [2m[23:26:57][0m [95mG GPU mem: 0.03GB[0m
+  [96mFeatures[0m [########################################] 100.0% (4/4) ETA:0s   

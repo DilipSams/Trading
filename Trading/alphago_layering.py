@@ -626,6 +626,10 @@ def print_data_split_summary(datasets, cfg):
            f"{'Test Start':>11s} {'Test End':>11s} {'#Bars':>6s}")
     sep = "  " + "-" * (len(hdr) - 2)
     print(hdr)
+    print(f"  {C.DIM}{'(Ticker)':<20s} {'':>4s}  {'(group)':>7s}  "
+          f"{'':>11s} {'(learn from)':>11s} {'':>6s}  "
+          f"{'':>11s} {'(tune with)':>11s} {'':>6s}  "
+          f"{'':>11s} {'(final exam)':>11s} {'':>6s}{C.RESET}")
     print(sep)
 
     # Aggregates
@@ -1319,6 +1323,8 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
     # ---- Print results ----
     if verbose >= 1:
         print(f"\n  {C.BOLD}{C.CYAN}=== WALK-FORWARD ALPHA VALIDATION (WS1A) ==={C.RESET}")
+        print(f"  {C.DIM}Testing each strategy on data it wasn't trained on (like a blind taste test).{C.RESET}")
+        print(f"  {C.DIM}If a strategy only works on data it's seen before, it's memorizing, not learning.{C.RESET}")
         print(f"  Datasets: {n_datasets_used}  |  "
               f"CV folds: {n_folds_total}  |  "
               f"Purge gap: {purge_gap} bars  |  "
@@ -1328,16 +1334,16 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
         # Build table data
         if HAS_TABLE_FORMATTER:
             table = TableFormatter(title="ALPHA VALIDATION RESULTS")
-            table.add_column('Alpha', width=22, align='left')
-            table.add_column('Verdict', width=10, align='center')
-            table.add_column('t-stat', width=9, align='right', format_spec='+.2f')
-            table.add_column('Sh(IS)', width=9, align='right', format_spec='+.2f')
-            table.add_column('Sh(OOS)', width=9, align='right', format_spec='+.3f')
-            table.add_column('Decay', width=8, align='right', format_spec='.2f')
-            table.add_column('DSR', width=7, align='right', format_spec='.2f')
-            table.add_column('PBO', width=7, align='right', format_spec='.2f')
-            table.add_column('n_IS', width=8, align='right')
-            table.add_column('n_OOS', width=8, align='right')
+            table.add_column('Alpha', align='left')
+            table.add_column('Verdict', align='center')
+            table.add_column('t-stat', align='right', format_spec='+.2f')
+            table.add_column('Sh(IS)', align='right', format_spec='+.2f')
+            table.add_column('Sh(OOS)', align='right', format_spec='+.3f')
+            table.add_column('Decay', align='right', format_spec='.2f')
+            table.add_column('DSR', align='right', format_spec='.2f')
+            table.add_column('PBO', align='right', format_spec='.2f')
+            table.add_column('n_IS', align='right')
+            table.add_column('n_OOS', align='right')
 
             n_pass = n_marginal = n_reject = n_other = 0
             for alpha_name in alpha_names:
@@ -1366,12 +1372,20 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
                 ])
 
             print("  " + table.render().replace("\n", "\n  "))
+            print(f"  {C.DIM}Column guide: Alpha=strategy name | Verdict=pass/fail grade | "
+                  f"t-stat=statistical confidence (higher=more reliable){C.RESET}")
+            print(f"  {C.DIM}Sh(IS)=performance on training data | Sh(OOS)=performance on unseen data "
+                  f"(this is the real test){C.RESET}")
+            print(f"  {C.DIM}Decay=how much performance drops on new data (lower=better) | "
+                  f"DSR=deflated Sharpe (adjusted for luck){C.RESET}")
+            print(f"  {C.DIM}PBO=probability it's overfitted (lower=better, like odds of a fluke) | "
+                  f"n=sample size{C.RESET}")
         else:
             # Fallback to old format if table_formatter not available
-            print(f"  {'Alpha':<22s}  {'Verdict':>10s} {'t-stat':>7s}  "
+            print(f"  {'Alpha':<26s}  {'Verdict':>10s} {'t-stat':>7s}  "
                   f"{'Sh(IS)':>7s} {'Sh(OOS)':>8s} {'Decay':>6s}  "
                   f"{'DSR':>5s} {'PBO':>5s}  {'n_IS':>6s} {'n_OOS':>6s}")
-            print(f"  {'-'*22}  {'-'*10} {'-'*7}  {'-'*7} {'-'*8} {'-'*6}  "
+            print(f"  {'-'*26}  {'-'*10} {'-'*7}  {'-'*7} {'-'*8} {'-'*6}  "
                   f"{'-'*5} {'-'*5}  {'-'*6} {'-'*6}")
 
             n_pass = n_marginal = n_reject = n_other = 0
@@ -1400,7 +1414,7 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
                 n_is = r.get('n_is', 0)
                 n_oos = r.get('n_oos', 0)
 
-                print(f"  {alpha_name:<22s}  {badge} {t_stat:>+6.2f}  "
+                print(f"  {alpha_name:<26s}  {badge} {t_stat:>+6.2f}  "
                       f"{sh_is:>+6.2f} {sh_oos:>+7.3f} {decay:>5.2f}  "
                       f"{dsr:>5.2f} {pbo:>5.2f}  {n_is:>6d} {n_oos:>6d}")
 
@@ -1440,7 +1454,7 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
                 # FIX #5: Flag negative IC alphas for signal flip
                 flip_flag = " [FLIP SIGNAL]" if hdata.get('flip_suggestion', False) else ""
 
-                print(f"    {name:<22s}: {old_v:>10s} -> {verdict_color}{new_v:>10s}{C.RESET} {change_symbol}  "
+                print(f"    {name:<26s}: {old_v:>10s} -> {verdict_color}{new_v:>10s}{C.RESET} {change_symbol}  "
                       f"(IC={best_ic:+.3f} t={best_t:+.2f} @ H={best_h}, native H={native_h}){flip_flag}")
 
             # Summary stats
@@ -1556,17 +1570,17 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
         if HAS_TABLE_FORMATTER:
             # Create table with horizon groups
             table = TableFormatter(title="MULTI-HORIZON IC PROFILING")
-            table.add_column('Alpha', width=24, align='left')
-            table.add_column('1-bar', width=20, align='center')
-            table.add_column('5-bar', width=20, align='center')
-            table.add_column('15-bar', width=20, align='center')
+            table.add_column('Alpha', align='left')
+            table.add_column('1-bar', align='center')
+            table.add_column('5-bar', align='center')
+            table.add_column('15-bar', align='center')
 
             # Add sub-header row (will be plain text spanning the column)
             table.add_row(['', 'IC     t     n', 'IC     t     n', 'IC     t     n'])
         else:
-            print(f"  {'Alpha':<22s}  {'1-bar':>18s}  {'5-bar':>18s}  {'15-bar':>18s}")
+            print(f"  {'Alpha':<26s}  {'1-bar':>18s}  {'5-bar':>18s}  {'15-bar':>18s}")
             print(f"  {'':<22s}  {'IC':>6s} {'t':>5s} {'n':>5s}  {'IC':>6s} {'t':>5s} {'n':>5s}  {'IC':>6s} {'t':>5s} {'n':>5s}")
-            print(f"  {'-'*22}  {'-'*18}  {'-'*18}  {'-'*18}")
+            print(f"  {'-'*26}  {'-'*18}  {'-'*18}  {'-'*18}")
 
         for alpha_name in alpha_names:
             h1 = horizon_ics[alpha_name][1]
@@ -1602,7 +1616,7 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
                 table.add_row([alpha_name, h1_str, h5_str, h15_str])
             else:
                 # Print with fixed column widths and visual separators (IC strings already contain color codes)
-                print(f"  {alpha_name:<22s}  "
+                print(f"  {alpha_name:<26s}  "
                       f"{ic1_str} {h1['t_stat']:>+5.1f} {h1['n']:>5d}  "
                       f"{ic5_str} {h5['t_stat']:>+5.1f} {h5['n']:>5d}  "
                       f"{ic15_str} {h15['t_stat']:>+5.1f} {h15['n']:>5d}")
@@ -1634,18 +1648,18 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
 
         if HAS_TABLE_FORMATTER:
             table = TableFormatter(title="ALPHA QUALITY METRICS")
-            table.add_column('Alpha', width=24, align='left')
-            table.add_column('ICIR', width=9, align='right')
-            table.add_column('IC_m', width=9, align='right')
-            table.add_column('IC_s', width=9, align='right')
-            table.add_column('Win', width=8, align='right')
-            table.add_column('HitRt', width=8, align='right')
-            table.add_column('n', width=7, align='right')
-            table.add_column('Persist', width=9, align='right')
-            table.add_column('MedP', width=7, align='right')
+            table.add_column('Alpha', align='left')
+            table.add_column('ICIR', align='right')
+            table.add_column('IC_m', align='right')
+            table.add_column('IC_s', align='right')
+            table.add_column('Win', align='right')
+            table.add_column('HitRt', align='right')
+            table.add_column('n', align='right')
+            table.add_column('Persist', align='right')
+            table.add_column('MedP', align='right')
         else:
-            print(f"  {'Alpha':<22s}  {'ICIR':>7s} {'IC_m':>7s} {'IC_s':>7s}  {'Win':>6s} {'HitRt':>6s} {'n':>5s}  {'Persist':>7s} {'MedP':>5s}")
-            print(f"  {'-'*22}  {'-'*7} {'-'*7} {'-'*7}  {'-'*6} {'-'*6} {'-'*5}  {'-'*7} {'-'*5}")
+            print(f"  {'Alpha':<26s}  {'ICIR':>7s} {'IC_m':>7s} {'IC_s':>7s}  {'Win':>6s} {'HitRt':>6s} {'n':>5s}  {'Persist':>7s} {'MedP':>5s}")
+            print(f"  {'-'*26}  {'-'*7} {'-'*7} {'-'*7}  {'-'*6} {'-'*6} {'-'*5}  {'-'*7} {'-'*5}")
 
         for alpha_name in alpha_names:
             r = reports.get(alpha_name, {})
@@ -1705,10 +1719,15 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
             if HAS_TABLE_FORMATTER:
                 table.add_row([alpha_name, icir_str, icir_m_str, icir_s_str, win_str, hr_str, n_str, p_str, pm_str])
             else:
-                print(f"  {alpha_name:<22s}  {icir_str} {icir_m_str} {icir_s_str}  {win_str} {hr_str} {n_str}  {p_str} {pm_str}")
+                print(f"  {alpha_name:<26s}  {icir_str} {icir_m_str} {icir_s_str}  {win_str} {hr_str} {n_str}  {p_str} {pm_str}")
 
         if HAS_TABLE_FORMATTER:
             print("  " + table.render().replace("\n", "\n  "))
+            print(f"  {C.DIM}Column guide: ICIR=consistency of predictions (like a batting average for forecasts){C.RESET}")
+            print(f"  {C.DIM}IC_m=average prediction accuracy | IC_s=how much accuracy varies | "
+                  f"Win=correct calls{C.RESET}")
+            print(f"  {C.DIM}HitRt=% of time direction was right (>53% is good) | "
+                  f"Persist=how long signals last (bars){C.RESET}")
         else:
             pass  # Already printed in loop above
 
@@ -2015,6 +2034,8 @@ def main():
         f"L1->L2->L3->L4 | RL is one alpha of many | cfg:{config_hash} | {datetime.now():%Y-%m-%d %H:%M}"
     )
     print_gpu_info()
+    tprint("This system combines multiple trading strategies (alphas) like a team of analysts,", "info")
+    tprint("then filters their ideas through risk controls before placing trades.", "info")
     if HAS_TORCH:
         tprint(f"PyTorch {torch.__version__} | Device: {DEVICE} | "
                f"AMP:{'ON' if cfg.use_amp else 'OFF'}", "info")
@@ -2023,6 +2044,8 @@ def main():
     # STEP 3: Build institutional pipeline
     # **********************************************************************
     print_divider("INSTITUTIONAL PIPELINE")
+    tprint("Setting up the assembly line: L1=signal generation, L2=combining signals,", "info")
+    tprint("L3=position sizing (how much to bet), L4=execution (when to actually trade).", "info")
 
     # Wire alert logging to file Ã¢â‚¬â€ keeps terminal clean, captures everything for analysis
     alert_log_path = os.path.join(cfg.output_dir, "alerts.jsonl")
@@ -2071,6 +2094,7 @@ def main():
     # STEP 4: Load data
     # **********************************************************************
     print_divider("DATA LOADING")
+    tprint("Loading historical price data (like looking at past stock charts) for training.", "info")
     data = {}
 
     if args.data_dir:
@@ -2169,6 +2193,8 @@ def main():
     # STEP 5: Feature engineering
     # **********************************************************************
     print_divider("FEATURE ENGINEERING")
+    tprint("Turning raw prices into useful signals (like converting temperature to 'hot/cold').", "info")
+    tprint("Splitting data into: Train (textbook), Validation (practice test), Test (final exam).", "info")
     datasets = prepare_datasets(data, cfg)
     if not datasets:
         tprint("No valid datasets!", "err")
@@ -2195,6 +2221,7 @@ def main():
 
         # -- Show base system's own evaluation (for comparison) --
         print_divider("BASE SYSTEM EVALUATION (v3.0 -- direct action)")
+        tprint("Testing the AI's raw trading ability (no risk filters, just its own decisions).", "info")
         base_results = system.final_eval()
 
     # **********************************************************************
@@ -2260,6 +2287,8 @@ def main():
     # STEP 7: Pipeline evaluation
     # **********************************************************************
     print_divider("PIPELINE EVALUATION (v7.0 -- L1->L2->L3->L4)")
+    tprint("Now testing with ALL safety layers active (risk limits, position sizing, trade filters).", "info")
+    tprint("This is the full production system, not just the raw AI.", "info")
 
     # FIX Ãƒâ€šÃ‚Â§5.5: Enforce HoldoutGuard ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â final evaluation is single-use.
     # The holdout test set (most recent 20% of each dataset) must be touched
@@ -2313,6 +2342,7 @@ def main():
     # -- v7.0 WS4: Institutional Backtest Report + Stress Testing --
     if HAS_BACKTEST_REPORT:
         print_divider("v7.0 INSTITUTIONAL REPORT (WS4)")
+        tprint("Generating a professional-grade report (the kind hedge funds show to investors).", "info")
 
         # FIX: Use ACTUAL per-bar returns collected during evaluation
         # (previously used np.random.randn proxy -- every metric was fabricated)
@@ -2420,12 +2450,14 @@ def main():
         base_profit_factor = base_results.get('avg_pf', 0.0)
 
         print(f"\n  {C.BOLD}{C.YELLOW}=== COMPARISON: Base v3.0 vs Pipeline v7.0 ==={C.RESET}")
+        print(f"  {C.DIM}Side-by-side: raw AI decisions vs. the full system with risk controls.{C.RESET}")
+        print(f"  {C.DIM}Like comparing a driver without seatbelts (v3.0) vs. with full safety gear (v7.0).{C.RESET}")
 
         if HAS_TABLE_FORMATTER:
             table = TableFormatter(title="BASE V3.0 VS PIPELINE V7.0")
-            table.add_column('Metric', width=24, align='left')
-            table.add_column('Base v3.0', width=16, align='right')
-            table.add_column('Pipeline v7.0', width=16, align='right')
+            table.add_column('Metric', align='left')
+            table.add_column('Base v3.0', align='right')
+            table.add_column('Pipeline v7.0', align='right')
 
             # Prepare colored strings
             base_pnl_c = C.GREEN if base_results.get('total_pnl', 0) > 0 else C.RED
@@ -2567,6 +2599,7 @@ def main():
     # STEP 8: Pipeline diagnostics
     # **********************************************************************
     print_divider("PIPELINE DIAGNOSTICS")
+    tprint("Under the hood: how many trades were attempted, blocked, or modified by safety filters.", "info")
     # Use lifetime stats for cross-symbol aggregates
     lt = pipeline.execution_engine.lifetime_stats
     total_decisions = lt['n_trades'] + lt['n_suppressed']
@@ -2610,14 +2643,15 @@ def main():
     lifecycle = pipeline.get_lifecycle_report()
     if lifecycle:
         print(f"\n  {C.BOLD}Alpha Lifecycle Health:{C.RESET}")
+        print(f"  {C.DIM}How healthy is each strategy? Like a doctor's checkup for your trading signals.{C.RESET}")
         if HAS_TABLE_FORMATTER:
             table = TableFormatter(title="ALPHA LIFECYCLE HEALTH")
-            table.add_column('Alpha', width=24, align='left')
-            table.add_column('HitRate', width=9, align='right')
-            table.add_column('AvgWt', width=8, align='right', format_spec='.1%')
-            table.add_column('WtVol', width=8, align='right', format_spec='.3f')
-            table.add_column('Turnover', width=10, align='right', format_spec='.1%')
-            table.add_column('SinceGood', width=11, align='right')
+            table.add_column('Alpha', align='left')
+            table.add_column('HitRate', align='right')
+            table.add_column('AvgWt', align='right', format_spec='.1%')
+            table.add_column('WtVol', align='right', format_spec='.3f')
+            table.add_column('Turnover', align='right', format_spec='.1%')
+            table.add_column('SinceGood', align='right')
 
             for name, health in lifecycle.items():
                 # Color hit rate: Green if >= 50%, Red if < 48%
@@ -2639,17 +2673,21 @@ def main():
                 ])
 
             print("  " + table.render().replace("\n", "\n  "))
+            print(f"  {C.DIM}HitRate=% correct direction | AvgWt=how much influence it has | "
+                  f"WtVol=weight stability{C.RESET}")
+            print(f"  {C.DIM}Turnover=how often it changes its mind | "
+                  f"SinceGood=bars since last good prediction{C.RESET}")
         else:
             # Fallback to old format
-            print(f"  {'Alpha':<22s}  {'HitRate':>7s}  {'AvgWt':>6s} {'WtVol':>6s}  "
+            print(f"  {'Alpha':<26s}  {'HitRate':>7s}  {'AvgWt':>6s} {'WtVol':>6s}  "
                   f"{'Turnover':>8s}  {'SinceGood':>9s}")
-            print(f"  {'-'*22}  {'-'*7}  {'-'*6} {'-'*6}  {'-'*8}  {'-'*9}")
+            print(f"  {'-'*26}  {'-'*7}  {'-'*6} {'-'*6}  {'-'*8}  {'-'*9}")
             for name, health in lifecycle.items():
                 hr_color = C.GREEN if health['hit_rate'] >= 0.50 else (
                     C.RED if health['hit_rate'] < 0.48 else C.RESET
                 )
                 decay_warn = " " if health['bars_since_good'] > 50 else ""
-                print(f"  {name:<22s}  {hr_color}{health['hit_rate']:>6.1%}{C.RESET}  "
+                print(f"  {name:<26s}  {hr_color}{health['hit_rate']:>6.1%}{C.RESET}  "
                       f"{health['avg_weight']:>6.1%} {health['weight_vol']:>6.3f}  "
                       f"{health['turnover_share']:>7.1%}  "
                       f"{health['bars_since_good']:>8d}{decay_warn}")
@@ -2658,6 +2696,7 @@ def main():
     attr = pipeline.get_attribution_report()
     if attr.get('n_bars', 0) > 0:
         print(f"\n  {C.BOLD}PnL Attribution (paper vs realized):{C.RESET}")
+        print(f"  {C.DIM}Where did the money go? Breaking down profit into: raw signals, costs, and filters.{C.RESET}")
         print(f"  Gross alpha PnL:      {attr['gross_alpha_pnl']:>+.6f}")
         print(f"  Realized PnL:         {attr['realized_pnl']:>+.6f}")
         print(f"  Cost drag:            {attr['cost_drag']:>+.6f}")

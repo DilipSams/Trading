@@ -207,17 +207,22 @@ class Config:
     obs_dim: int = 0
     # PPO
     learning_rate: float = 3e-4
-    lr_schedule: str = "cosine"
+    lr_schedule: str = "cosine_warm_restarts"  # "cosine" or "cosine_warm_restarts"
+    lr_restart_period: int = 0                 # T_0 for warm restarts (0 = auto: per-iteration)
+    lr_restart_mult: int = 2                   # T_mult: period doubles each restart (SGDR)
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.03
+    ent_floor: float = 0.3                     # Entropy floor — boost ent_coef if entropy drops below
+    ent_boost_factor: float = 3.0              # Multiply ent_coef by this when below floor
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_steps: int = 2048
     batch_size: int = 4096              # GPU-optimized: 8x larger (was 512)
     n_epochs: int = 10
     target_kl: float = 0.03
+    plateau_patience: int = 2                  # Reset LR if champion score stalls for N iterations
     # Risk Head (auxiliary loss -- predicts forward realized volatility)
     risk_coef: float = 0.1              # Weight of risk auxiliary loss in PPO
     risk_horizon: int = 20              # N bars forward for realized vol target
@@ -229,9 +234,9 @@ class Config:
     use_multi_gpu: bool = True
     n_envs: int = 64                    # GPU-optimized: 4x more parallel (was 16)
     pin_memory: bool = True
-    # Self-Play (v7.0 optimal: 3 iterations × 50k steps = 150k total)
-    n_iterations: int = 3
-    total_timesteps_per_iter: int = 50_000
+    # Self-Play (increased budget: 8 iterations × 100k steps = 800k total)
+    n_iterations: int = 8
+    total_timesteps_per_iter: int = 100_000
     champion_margin: float = 0.1        # Additive margin (was multiplicative -- broken on negatives)
     # MCTS
     mcts_rollouts: int = 32
@@ -248,8 +253,8 @@ class Config:
     # Reward (stationary base + auxiliary penalties)
     reward_scale: float = 100.0           # Scale log-returns to useful range
     reward_drawdown_penalty: float = 2.0  # Continuous quadratic DD penalty
-    reward_turnover_cost: float = 0.5     # Proportional to dollar turnover
-    reward_holding_bonus: float = 0.0001  # Small bonus for holding (anti-churn)
+    reward_turnover_cost: float = 0.05    # Proportional to dollar turnover (was 0.5 — caused zero trades)
+    reward_holding_bonus: float = 0.0     # Removed: was rewarding FLAT, contributing to zero trades
     cvar_quantile: float = 0.05
     reward_cvar_penalty: float = 0.5
     reward_soft_clip_scale: float = 3.0   # tanh(reward/scale) soft clip
@@ -296,7 +301,7 @@ class Config:
     # --- Constrained RL (Lagrangian) ---
     use_lagrangian: bool = True            # Enable constraint multipliers
     target_dd: float = 0.15               # Max drawdown target
-    target_turnover_frac: float = 0.50    # Annual turnover fraction target
+    target_turnover_frac: float = 5.0     # Annual turnover fraction target (was 0.50 — too restrictive)
     target_cvar: float = 0.02             # CVaR constraint target
     lagrangian_lr: float = 0.01           # Multiplier learning rate
     # --- Validation methodology ---
@@ -326,7 +331,7 @@ class Config:
         "1d":252,"5d":52,"1wk":52,"1mo":12})
     # --- Action masking (#8) ---
     use_action_masking: bool = True        # Restrict actions when near ruin/max DD
-    dd_mask_threshold: float = 0.12        # DD level to start masking risky actions
+    dd_mask_threshold: float = 0.20        # DD level to start masking risky actions (was 0.12 — too aggressive)
     # Synthetic
     n_synthetic_regimes: int = 4
     synthetic_bars_per_regime: int = 500
@@ -1881,7 +1886,8 @@ class TradingEnv(gym.Env):
             mask[2] = 1.0  # FLAT
             return mask
 
-        dd = self.max_dd
+        # Use CURRENT drawdown (not historical max) so masking relaxes after recovery
+        dd = (self.peak_value - self._portfolio_value()) / (self.peak_value + 1e-10)
         if dd >= self.cfg.dd_mask_threshold:
             # Restrict to FLAT + reduced positions only
             # Mask out full-size actions (FULL_SHORT=0, FULL_LONG=4)
@@ -2423,7 +2429,14 @@ class GPUPPOTrainer:
         fused = HAS_CUDA
         self.opt = optim.AdamW(net.parameters(), lr=cfg.learning_rate, weight_decay=1e-5, fused=fused)
         ts = cfg.n_iterations * cfg.total_timesteps_per_iter // cfg.n_steps
-        self.sched = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=max(ts, 1), eta_min=1e-6) if cfg.lr_schedule == "cosine" else None
+        if cfg.lr_schedule == "cosine_warm_restarts":
+            t0 = cfg.lr_restart_period if cfg.lr_restart_period > 0 else max(cfg.total_timesteps_per_iter // cfg.n_steps, 1)
+            self.sched = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.opt, T_0=t0, T_mult=cfg.lr_restart_mult, eta_min=1e-6)
+        elif cfg.lr_schedule == "cosine":
+            self.sched = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=max(ts, 1), eta_min=1e-6)
+        else:
+            self.sched = None
         self.use_amp = cfg.use_amp and HAS_AMP
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp) if self.use_amp else None
         self.gs = 0
@@ -2442,6 +2455,9 @@ class GPUPPOTrainer:
         with torch.no_grad():
             for step in range(ns):
                 ot = torch.FloatTensor(obs).to(DEVICE, non_blocking=self.cfg.pin_memory)
+                # Sanitize observations before forward pass
+                if not torch.isfinite(ot).all():
+                    ot = torch.nan_to_num(ot, nan=0.0, posinf=1.0, neginf=-1.0)
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                     acts, lps, _, vals, _ = self.net.get_action_and_value(ot)
 
@@ -2487,15 +2503,19 @@ class GPUPPOTrainer:
 
     def update(self, buf):
         self.net.train()
-        tpl = tvl = te = tkl = trl = 0; nu = 0
+        tpl = tvl = te = tkl = trl = 0; nu = 0; tgn = 0
         last_turn_f = last_dd_f = last_cv_e = None
+        # Dynamic entropy coefficient — boost if entropy collapsed below floor
+        ent_coef = self.cfg.ent_coef
+        if hasattr(self, '_last_avg_entropy') and self._last_avg_entropy < self.cfg.ent_floor:
+            ent_coef = self.cfg.ent_coef * self.cfg.ent_boost_factor
         for ep in range(self.cfg.n_epochs):
             for st, ac, olp, ret, adv, risk_tgt, turn_f, dd_f, cv_e in buf.to_gpu_batches(self.cfg.batch_size):
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                     _, nlp, ent, val, risk_pred = self.net.get_action_and_value(st, ac)
 
                     # PPO policy loss
-                    ratio = torch.exp(nlp - olp)
+                    ratio = torch.exp(torch.clamp(nlp - olp, -5.0, 5.0))
                     s1 = ratio * adv
                     s2 = torch.clamp(ratio, 1 - self.cfg.clip_range, 1 + self.cfg.clip_range) * adv
                     pl = -torch.min(s1, s2).mean()
@@ -2503,7 +2523,7 @@ class GPUPPOTrainer:
                     # Value loss
                     vl = F.mse_loss(val, ret)
 
-                    # Entropy loss
+                    # Entropy loss (uses dynamic ent_coef)
                     el = -ent.mean()
 
                     # Risk head auxiliary loss
@@ -2511,7 +2531,7 @@ class GPUPPOTrainer:
 
                     # Base loss
                     loss = (pl + self.cfg.vf_coef * vl
-                            + self.cfg.ent_coef * el
+                            + ent_coef * el
                             + self.cfg.risk_coef * risk_loss)
 
                     # Lagrangian constraint penalties (3A)
@@ -2525,24 +2545,33 @@ class GPUPPOTrainer:
                         loss = loss + lag_pen
                     last_turn_f = turn_f; last_dd_f = dd_f; last_cv_e = cv_e
 
+                # Skip update if loss is non-finite (prevents NaN from corrupting weights)
+                if not torch.isfinite(loss):
+                    tprint("Non-finite PPO loss — skipping update", "warn")
+                    continue
+
                 self.opt.zero_grad(set_to_none=True)
                 if self.scaler:
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.opt)
-                    nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
+                    gn = nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
                     self.scaler.step(self.opt); self.scaler.update()
                 else:
                     loss.backward()
-                    nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
+                    gn = nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
                     self.opt.step()
 
                 with torch.no_grad():
                     akl = (olp - nlp).mean().item()
                 tpl += pl.item(); tvl += vl.item(); te += ent.mean().item()
                 tkl += akl; trl += risk_loss.item(); nu += 1
+                tgn += gn.item() if torch.is_tensor(gn) else gn
 
             if nu > 0 and abs(tkl / nu) > self.cfg.target_kl:
                 break
+
+        # Track average entropy for dynamic boost
+        self._last_avg_entropy = te / max(nu, 1)
 
         # Update Lagrangian multipliers (projected gradient ascent)
         if self.cfg.use_lagrangian and nu > 0 and last_turn_f is not None:
@@ -2569,8 +2598,10 @@ class GPUPPOTrainer:
         if self.sched:
             self.sched.step()
         self.gs += buf.ptr * buf.ne
+        cur_lr = self.opt.param_groups[0]['lr']
         return {"pl": tpl / max(nu, 1), "vl": tvl / max(nu, 1), "ent": te / max(nu, 1),
-                "kl": tkl / max(nu, 1), "risk_loss": trl / max(nu, 1), "nu": nu}
+                "kl": tkl / max(nu, 1), "risk_loss": trl / max(nu, 1), "nu": nu,
+                "grad_norm": tgn / max(nu, 1), "lr": cur_lr, "ent_coef_used": ent_coef}
 
     def distill_mcts(self, states, mcts_policies):
         """
@@ -2594,7 +2625,7 @@ class GPUPPOTrainer:
         else:
             target = torch.clamp(target_raw, min=1e-6)
 
-        total_loss = 0.0
+        total_loss = 0.0; valid_steps = 0
         N = len(states)
         bs = min(self.cfg.batch_size, N)
         n_steps = min(5, max(1, N // bs + 1))
@@ -2605,6 +2636,8 @@ class GPUPPOTrainer:
                 logits, _, _ = self.net.forward(st[ix])
                 log_probs = F.log_softmax(logits, dim=-1)
                 kl_loss = F.kl_div(log_probs, target[ix], reduction='batchmean')
+                if not torch.isfinite(kl_loss):
+                    continue  # Skip non-finite KL loss
                 loss = self.cfg.mcts_kl_coef * kl_loss
             self.opt.zero_grad(set_to_none=True)
             if self.scaler:
@@ -2616,8 +2649,8 @@ class GPUPPOTrainer:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
                 self.opt.step()
-            total_loss += kl_loss.item()
-        return total_loss / max(n_steps, 1)
+            total_loss += kl_loss.item(); valid_steps += 1
+        return total_loss / max(valid_steps, 1)
 
     def train_iteration(self, venv, total_steps):
         rws = []; ls = []; done = 0; spc = self.cfg.n_steps
@@ -2625,7 +2658,14 @@ class GPUPPOTrainer:
             ro = self.collect_rollouts(venv, spc)
             ui = self.update(ro["buffer"])
             rws.extend(ro["episode_rewards"]); ls.append(ui); done += ro["steps"]
-        return {"mean_reward": np.mean(rws) if rws else 0, "n_episodes": len(rws), "steps": done}
+        # Aggregate update metrics across all PPO updates in this iteration
+        avg_metrics = {}
+        if ls:
+            for k in ls[0]:
+                vals = [d[k] for d in ls if k in d]
+                avg_metrics[k] = np.mean(vals) if vals else 0
+        return {"mean_reward": np.mean(rws) if rws else 0, "n_episodes": len(rws),
+                "steps": done, "update_metrics": avg_metrics}
 
 
 # ============================================================================
@@ -2646,13 +2686,51 @@ class ValidationFramework:
             a,_,_,_,_=net.get_action_and_value(st)
             obs,_,t,tr,info=env.step(a.item());done=t or tr
         return info
+    @torch.no_grad()
+    def _batched_eval(self, net, fold_data_list, sym):
+        """Evaluate multiple (feat, prices) segments simultaneously via batched GPU inference."""
+        cfg_local = copy.copy(self.cfg)
+        if getattr(self.cfg, "validate_delay", False):
+            cfg_local.trade_at_next_open = True
+        envs = []
+        for feat, prices in fold_data_list:
+            if len(feat) < self.cfg.window_size + 50:
+                continue
+            envs.append(TradingEnv(feat, prices, cfg_local, sym, True))
+        if not envs:
+            return []
+        venv = VectorizedEnvs(envs)
+        obs = venv.reset()
+        done_flags = np.zeros(venv.n, dtype=bool)
+        results = [None] * venv.n
+        net.eval()
+        while not done_flags.all():
+            ot = torch.FloatTensor(obs).to(DEVICE)
+            acts, _, _, _, _ = net.get_action_and_value(ot)
+            actions = acts.cpu().numpy()
+            actions[done_flags] = 2  # FLAT for already-done envs
+            obs, _, dones, infos = venv.step(actions)
+            for i in range(venv.n):
+                if dones[i] and results[i] is None:
+                    results[i] = infos[i]
+                    done_flags[i] = True
+        for i in range(venv.n):
+            if results[i] is None:
+                results[i] = {"sharpe_ratio": 0, "net_pnl": 0}
+        return results
     def walk_forward(self,net,feat,prices,sym="SYM"):
-        n=len(feat);seg=n//(self.cfg.walk_forward_windows+1);res=[]
+        n=len(feat);seg=n//(self.cfg.walk_forward_windows+1)
+        fold_data=[]
         for w in range(self.cfg.walk_forward_windows):
             ts,te=seg*(w+1),min(seg*(w+2),n)
-            if te-ts<self.cfg.window_size+50: continue
-            r=self._eval(net,feat[ts:te],prices[ts:te],sym)
-            seg_pnl = r.get("net_pnl", 0)
+            if te-ts>=self.cfg.window_size+50:
+                fold_data.append((feat[ts:te],prices[ts:te]))
+        if not fold_data: return {"valid":False}
+        # Batch all folds into single GPU pass per timestep
+        fold_results=self._batched_eval(net,fold_data,sym)
+        res=[]
+        for r in fold_results:
+            seg_pnl=r.get("net_pnl",0)
             res.append({"pnl":seg_pnl,"sharpe":r.get("sharpe_ratio",0)})
         if not res: return {"valid":False}
         pnls=[r["pnl"] for r in res]
@@ -2946,6 +3024,7 @@ class AlphaTradeSystem:
     @torch.no_grad()
     def evaluate(self,net,datasets,label="eval"):
         net.eval();pnls=[];tds=[];wrs=[];pfs=[];dds=[];shs=[];ps={}
+        act_counts = np.zeros(self.cfg.n_actions, dtype=np.int64)  # Action distribution tracking
         for d in datasets:
             env=TradingEnv(d.features_test,d.prices_test,self.cfg,d.symbol,True)
             obs,_=env.reset();done=False
@@ -2963,7 +3042,9 @@ class AlphaTradeSystem:
                         a = torch.argmax(logits, dim=-1)
                     else:
                         a,_,_,_,_=net.get_action_and_value(st)
-                obs,_,t,tr,info=env.step(a.item());done=t or tr
+                act_val = a.item()
+                act_counts[act_val] += 1
+                obs,_,t,tr,info=env.step(act_val);done=t or tr
             pnls.append(info["net_pnl"]);tds.append(info["total_trades"])
             wrs.append(info["win_rate"]);pfs.append(info["profit_factor"])
             dds.append(info["max_drawdown"]);shs.append(info.get("sharpe_ratio",0))
@@ -3025,33 +3106,62 @@ class AlphaTradeSystem:
         aw = np.mean([wrs[i] for i in ac]) if ac else 0
         ap = np.mean([pfs[i] for i in ac]) if ac else 0
 
+        # Action distribution summary
+        total_acts = act_counts.sum()
+        act_dist = act_counts / max(total_acts, 1)
+        act_labels = [f"{t:+.1f}" for t in self.cfg.action_targets]  # e.g. "-1.0", "-0.5", "0.0", "+0.5", "+1.0"
+        act_str = " ".join(f"{l}:{d:.0%}" for l, d in zip(act_labels, act_dist))
+        dominant_act = int(np.argmax(act_counts))
+        if act_dist[dominant_act] > 0.80:
+            tprint(f"Action concentration WARNING: {act_labels[dominant_act]} = {act_dist[dominant_act]:.0%} "
+                   f"(possible local optimum)", "warn")
+
         return {"label":label,"total_pnl":sum(pnls),"avg_pnl":np.mean(pnls) if pnls else 0,
                 "total_trades":sum(tds),"avg_wr":aw,"avg_pf":ap,
                 "avg_dd":float(np.mean(dds_arr)),"dd_q75":dd_q75,"dd_max":dd_max,
                 "avg_sh":ash_all,"sp":sp,"st":len(datasets),"breadth":br*100,"score":sc,
-                "per_sym":ps}
+                "per_sym":ps,"act_dist":act_str}
 
     def _pe(self,r,it):
         pc=C.GREEN if r["total_pnl"]>0 else C.RED
         print(f"\n  {C.BOLD}{C.CYAN}--- It {it} | {r['label']} ---{C.RESET}")
+        if not getattr(self, '_pe_legend_shown', False):
+            print(f"  {C.DIM}P&L=profit/loss | WR=win rate | PF=profit factor (wins/losses) | "
+                  f"Sh=Sharpe (return per unit risk){C.RESET}")
+            print(f"  {C.DIM}DD=max drawdown (worst dip) | Br=breadth (passed/total symbols) | "
+                  f"Score=overall grade{C.RESET}")
+            self._pe_legend_shown = True
         print(f"  P&L:{pc}${r['total_pnl']:>+12,.2f}{C.RESET} (${r['avg_pnl']:>+,.2f}/sym)")
         print(f"  WR:{r['avg_wr']:>5.1f}% PF:{r['avg_pf']:.2f} Sh:{r['avg_sh']:.2f} "
               f"DD:{r['avg_dd']:.1f}% Br:{r['sp']}/{r['st']}")
         print(f"  Score:{C.BOLD}{r['score']:>+.2f}{C.RESET}")
+        if "act_dist" in r:
+            print(f"  Actions: [{r['act_dist']}]")
 
     def train(self):
         print_box("ALPHA-TRADE v3.0 GPU-PARALLEL TRAINING",
                    f"iters={self.cfg.n_iterations} steps/it={self.cfg.total_timesteps_per_iter:,} "
                    f"n_envs={self.cfg.n_envs} AMP={'ON' if self.cfg.use_amp else 'OFF'} {DEVICE}")
+        tprint("The AI is learning to trade by practicing on historical data (like a flight simulator).", "info")
+        tprint("Each iteration: practice trades -> grade performance -> improve strategy -> repeat.", "info")
         np.random.seed(42);torch.manual_seed(42)
         if HAS_CUDA: torch.cuda.manual_seed_all(42)
         for it in range(1,self.cfg.n_iterations+1):
             t0=time.time(); print_divider(f"ITERATION {it}/{self.cfg.n_iterations}")
+            if it == 1:
+                tprint("Each iteration = one full round of practice. The AI plays thousands of trading", "info")
+                tprint("scenarios, learns from wins and losses, then tries to beat its previous best.", "info")
             if HAS_CUDA: tprint(f"GPU mem: {torch.cuda.memory_allocated()/1024**3:.2f}GB","gpu")
             # Clone champion
             raw=unwrap_net(self.champ); cnet=build_network(self.cfg)
             unwrap_net(cnet).load_state_dict(raw.state_dict())
             trainer=GPUPPOTrainer(cnet,self.cfg)
+            # Plateau LR reset: bump LR back to initial to escape basin
+            if getattr(self, '_plateau_lr_reset', False):
+                for pg in trainer.opt.param_groups:
+                    pg['lr'] = self.cfg.learning_rate
+                tprint(f"LR reset to {self.cfg.learning_rate:.2e} (plateau escape)", "warn")
+                self._plateau_lr_reset = False
             # Select envs (STANDARD PPO PRACTICE - Use ALL available datasets)
             # Research: PPO is on-policy and benefits from using all environments in parallel
             # The "static" behavior (same envs each iteration) is correct for PPO
@@ -3070,6 +3180,24 @@ class AlphaTradeSystem:
             venv=self._vec(sel); res=trainer.train_iteration(venv,self.cfg.total_timesteps_per_iter)
             tt=time.time()-t0; tp=res["steps"]/tt
             tprint(f"Done: {tt:.1f}s | {tp:,.0f} steps/s | reward:{res['mean_reward']:+.4f}","ok")
+            # --- Per-iteration diagnostics dashboard ---
+            um = res.get("update_metrics", {})
+            if um:
+                if it == 1:
+                    tprint("Diagnostics key: ent=exploration level (higher=more adventurous), "
+                           "grad_norm=learning speed,", "info")
+                    tprint("  lr=step size, pl=policy loss (lower=better decisions), "
+                           "vl=value loss (lower=better predictions)", "info")
+                avg_ent = um.get("ent", 0)
+                avg_gn = um.get("grad_norm", 0)
+                cur_lr = um.get("lr", self.cfg.learning_rate)
+                ent_coef_used = um.get("ent_coef_used", self.cfg.ent_coef)
+                ent_status = "OK" if avg_ent >= self.cfg.ent_floor else "LOW"
+                if ent_coef_used > self.cfg.ent_coef:
+                    ent_status = "BOOSTED"
+                tprint(f"Diagnostics: ent={avg_ent:.3f}[{ent_status}] grad_norm={avg_gn:.3f} "
+                       f"lr={cur_lr:.2e} pl={um.get('pl',0):.4f} vl={um.get('vl',0):.4f} "
+                       f"kl={um.get('kl',0):.4f}", "info")
             # MCTS -- Forward simulation + distillation into policy (point #5)
             if self.cfg.mcts_rollouts>0 and it>1:
                 tprint(f"MCTS planning + distillation ({self.cfg.mcts_rollouts} rollouts) [PARALLEL]...","info")
@@ -3150,8 +3278,18 @@ class AlphaTradeSystem:
                 if all_mcts_states:
                     states_arr=np.array(all_mcts_states)
                     policies_arr=np.array(all_mcts_policies)
-                    kl_loss=trainer.distill_mcts(states_arr, policies_arr)
-                    tprint(f"MCTS distilled: {len(states_arr)} states, KL={kl_loss:.4f}","ok")
+                    # Filter out NaN/Inf policy rows before distillation
+                    valid_mask=np.isfinite(policies_arr).all(axis=1) & np.isfinite(states_arr).all(axis=1)
+                    if not valid_mask.all():
+                        n_bad=(~valid_mask).sum()
+                        tprint(f"MCTS: filtering {n_bad}/{len(valid_mask)} invalid rows","warn")
+                        states_arr=states_arr[valid_mask]
+                        policies_arr=policies_arr[valid_mask]
+                    if len(states_arr)>0:
+                        kl_loss=trainer.distill_mcts(states_arr, policies_arr)
+                        tprint(f"MCTS distilled: {len(states_arr)} states, KL={kl_loss:.4f}","ok")
+                    else:
+                        tprint("MCTS: all policy rows invalid after filtering","warn")
                 else:
                     tprint("MCTS: no states collected","warn")
             # Eval
@@ -3163,24 +3301,32 @@ class AlphaTradeSystem:
                 np.random.shuffle(val_sel)
                 val_sel = val_sel[:min(self.cfg.val_k + 3, len(val_sel))]
 
-                # Validate on K symbols -- require pass ratio (not just first one)
+                # Validate on K symbols -- require pass ratio (batched + threaded)
                 val_passes = 0
                 val_tested = 0
-                for d in val_sel:
-                    if d.n_test <= self.cfg.window_size + 100:
-                        continue
-                    val_tested += 1
-                    vr = self.val_fw.full_validation(
-                        unwrap_net(cnet), d.features_test, d.prices_test,
-                        d.symbol, n_trials=max(it, 1)
-                    )
-                    if vr.get("passed", False):
-                        val_passes += 1
-                    else:
-                        reasons = vr.get("fail_reasons", [])
-                        tprint(f"Val FAILED ({d.symbol}): {'; '.join(reasons)}", "warn")
-                    if val_tested >= self.cfg.val_k:
-                        break
+                val_candidates = [d for d in val_sel if d.n_test > self.cfg.window_size + 100][:self.cfg.val_k]
+                import time as _time; _val_t0=_time.time()
+                if val_candidates:
+                    unet = unwrap_net(cnet)
+                    def _val_sym(d):
+                        return (d.symbol, self.val_fw.full_validation(
+                            unet, d.features_test, d.prices_test,
+                            d.symbol, n_trials=max(it, 1)))
+                    with ThreadPoolExecutor(max_workers=min(3, len(val_candidates))) as ex:
+                        futs = [ex.submit(_val_sym, d) for d in val_candidates]
+                        for fut in as_completed(futs):
+                            try:
+                                sym_name, vr = fut.result()
+                            except Exception as e:
+                                tprint(f"Val thread error: {e}", "warn")
+                                continue
+                            val_tested += 1
+                            if vr.get("passed", False):
+                                val_passes += 1
+                            else:
+                                reasons = vr.get("fail_reasons", [])
+                                tprint(f"Val FAILED ({sym_name}): {'; '.join(reasons)}", "warn")
+                tprint(f"Validation completed in {_time.time()-_val_t0:.1f}s ({val_tested} symbols)", "ok")
 
                 if val_tested > 0:
                     pass_ratio = val_passes / val_tested
@@ -3220,7 +3366,18 @@ class AlphaTradeSystem:
                 torch.save(unwrap_net(cnet).state_dict(),self.bp)
             else: tprint(f"Rejected: {er['score']:+.2f} vs {self.cs+self.cfg.champion_margin:+.2f}","warn")
             self.hist.append({"it":it,"score":er["score"],"champ":self.cs,"time":tt,"tput":tp,
-                              **{k:v for k,v in er.items() if k!="per_sym"}})
+                              **{k:v for k,v in er.items() if k!="per_sym"},
+                              **({"ent": um.get("ent",0), "grad_norm": um.get("grad_norm",0),
+                                  "lr": um.get("lr",0)} if um else {})})
+            # --- Plateau detection + LR warm restart trigger ---
+            pat = self.cfg.plateau_patience
+            if len(self.hist) >= pat + 1:
+                recent_champ_scores = [h["champ"] for h in self.hist[-(pat+1):]]
+                if recent_champ_scores[-1] <= recent_champ_scores[0]:
+                    tprint(f"Plateau detected: champion score unchanged for {pat} iterations "
+                           f"({recent_champ_scores[0]:+.2f} -> {recent_champ_scores[-1]:+.2f})", "warn")
+                    # Force LR reset on the NEXT iteration's trainer
+                    self._plateau_lr_reset = True
             if HAS_CUDA: torch.cuda.empty_cache()
         self._save()
         return self.champ
@@ -3302,6 +3459,7 @@ class AlphaTradeSystem:
 
     def final_eval(self):
         print_divider("FINAL EVALUATION")
+        tprint("Final exam: testing the champion model on data it has NEVER seen before.", "info")
         # 5A: Evaluate on holdout set (never used in training or champion selection)
         eval_set = self.holdout_ds if self.holdout_ds else self.ds
         eval_label = "Champion (Holdout)" if self.holdout_ds else "Champion (Final)"
@@ -3313,6 +3471,7 @@ class AlphaTradeSystem:
                 tprint(f"  {d.symbol}: {s}","ok" if s=="PASSED" else "warn");break
         # Run detailed decision analysis
         print_divider("DECISION ANALYSIS")
+        tprint("Replaying every trade to understand WHY the AI bought/sold (like a post-game review).", "info")
         self.run_detailed_analysis()
         return r
 
@@ -3642,9 +3801,12 @@ class AlphaTradeSystem:
         print(f"\n  {C.BOLD}{C.CYAN}{'='*96}{C.RESET}")
         print(f"  {C.BOLD}{C.WHITE}  TRADE DECISION LOG -- {len(trades)} Trades across {len(summaries)} Symbols{C.RESET}")
         print(f"  {C.BOLD}{C.CYAN}{'='*96}{C.RESET}")
+        print(f"  {C.DIM}  Every trade the AI made, with its reasoning -- like reading a trader's journal.{C.RESET}")
 
         # Per-symbol summary table
         print(f"\n  {C.BOLD}  SYMBOL SUMMARY:{C.RESET}")
+        print(f"  {C.DIM}TF=timeframe | Win%=percentage of profitable trades | "
+              f"P&L=total profit/loss | AvgHold=average trade duration{C.RESET}")
         print(f"  {'Symbol':<18s} {'TF':>4s} {'Trades':>6s} {'Win%':>6s} {'P&L':>12s} {'AvgHold':>8s}")
         print(f"  {'-'*60}")
         for s in sorted(summaries, key=lambda x: x["total_pnl"], reverse=True):
@@ -3659,6 +3821,8 @@ class AlphaTradeSystem:
         print(f"\n  {C.BOLD}  TOP {n_show} TRADES (by absolute P&L):{C.RESET}")
         print(f"  {'#':>3s} {'Symbol':<15s} {'TF':>4s} {'Entry':>12s} {'Exit':>12s} "
               f"{'Action':>10s} {'P&L':>10s} {'Bars':>5s} {'Result':>6s} {'Entry Reason'}")
+        print(f"  {C.DIM}  Entry/Exit=when trade started/ended | P&L=profit or loss | "
+              f"Bars=how long held | Entry Reason=why the AI traded{C.RESET}")
         print(f"  {'-'*120}")
 
         for i, t in enumerate(sorted_trades[:n_show]):

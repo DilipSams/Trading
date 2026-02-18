@@ -1,0 +1,65 @@
+C:\Users\dilip\AppData\Local\Programs\Python\Python310\lib\site-packages\numpy\core\_methods.py:206: RuntimeWarning: Degrees of freedom <= 0 for slice
+  ret = _var(a, axis=axis, dtype=dtype, out=out, ddof=ddof,
+C:\Users\dilip\AppData\Local\Programs\Python\Python310\lib\site-packages\numpy\core\_methods.py:163: RuntimeWarning: invalid value encountered in divide
+  arrmean = um.true_divide(arrmean, div, out=arrmean,
+C:\Users\dilip\AppData\Local\Programs\Python\Python310\lib\site-packages\numpy\core\_methods.py:198: RuntimeWarning: invalid value encountered in scalar divide
+  ret = ret.dtype.type(ret / rcount)
+C:\Users\dilip\AppData\Local\Programs\Python\Python310\lib\site-packages\numpy\core\fromnumeric.py:3787: RuntimeWarning: Degrees of freedom <= 0 for slice
+  return _methods._var(a, axis=axis, dtype=dtype, out=out, ddof=ddof,
+C:\Users\dilip\AppData\Local\Programs\Python\Python310\lib\site-packages\numpy\core\fromnumeric.py:3504: RuntimeWarning: Mean of empty slice.
+  return _methods._mean(a, axis=axis, dtype=dtype,
+C:\Users\dilip\AppData\Local\Programs\Python\Python310\lib\site-packages\numpy\core\_methods.py:129: RuntimeWarning: invalid value encountered in scalar divide
+  ret = ret.dtype.type(ret / rcount)
+================================================================================
+  QUICK TRADE TEST - Verifying Bug Fixes
+================================================================================
+
+[OK] Bug fixes applied:
+   - no_trade_threshold: 0.001 (was 0.005)
+   - trend_slow_window: 60 (was 126)
+   - value_lookback: 60 (was 252)
+   - calendar_warmup: 60 (was 252)
+
+[DATA] Loading MSFT data...
+   Loaded 1257 bars from 2020-01-02 00:00:00 to 2024-12-30 00:00:00
+
+[PIPELINE] Building pipeline with 12 alphas...
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+   Pipeline initialized with 12 alphas
+
+[RUN] Running backtest for 200 bars...
+[ENSEMBLE WARNING #1] No active alphas - all in warmup or confidence=0
+[SUPPRESS #1] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[ENSEMBLE WARNING #2] No active alphas - all in warmup or confidence=0
+[SUPPRESS #2] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[ENSEMBLE WARNING #3] No active alphas - all in warmup or confidence=0
+[SUPPRESS #3] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[ENSEMBLE WARNING #4] No active alphas - all in warmup or confidence=0
+[SUPPRESS #4] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[ENSEMBLE WARNING #5] No active alphas - all in warmup or confidence=0
+[SUPPRESS #5] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[SUPPRESS #6] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[SUPPRESS #7] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[SUPPRESS #8] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[SUPPRESS #9] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+[SUPPRESS #10] target=0.0000, current=0.0000, delta=0.0000, threshold=0.0007, vol=15.00%
+   Bar  10:  0/12 alphas active, mu_hat=+0.0000, target=+0.000, position=+0.000
+   Bar  30:  0/12 alphas active, mu_hat=+0.0000, target=+0.000, position=+0.000
+   Bar  50:  1/12 alphas active, mu_hat=-0.0073, target=-0.083, position=-0.083
+   Bar  70:  1/12 alphas active, mu_hat=+0.0047, target=-0.041, position=-0.041
+   Bar 100:  0/12 alphas active, mu_hat=+0.0000, target=+0.000, position=+0.000
+Traceback (most recent call last):
+  File "D:\Experiments\Trading\quick_trade_test.py", line 133, in <module>
+    success = main()
+  File "D:\Experiments\Trading\quick_trade_test.py", line 63, in main
+    result = pipeline.step(
+  File "D:\Experiments\Trading\.\alphago_architecture.py", line 5260, in step
+    mu_hat, sigma_hat, l2_diag = self._ensemble.combine(
+  File "D:\Experiments\Trading\.\alphago_architecture.py", line 3624, in combine
+    signals = self.regime_gating.adjust_signals(signals, regime_probs)
+  File "D:\Experiments\Trading\.\alphago_architecture.py", line 3582, in adjust_signals
+    adjusted[name] = AlphaSignal(
+  File "<string>", line 10, in __init__
+  File "D:\Experiments\Trading\.\alphago_architecture.py", line 187, in __post_init__
+    assert 0.0 <= self.confidence <= 1.0, f"confidence must be in [0,1], got {self.confidence}"
+AssertionError: confidence must be in [0,1], got nan

@@ -1,0 +1,17 @@
+================================================================================
+  QUICK TRADE TEST - Verifying Bug Fixes
+================================================================================
+
+[OK] Bug fixes applied:
+   - no_trade_threshold: 0.001 (was 0.005)
+   - trend_slow_window: 60 (was 126)
+   - value_lookback: 60 (was 252)
+   - calendar_warmup: 60 (was 252)
+
+[DATA] Loading MSFT data...
+Traceback (most recent call last):
+  File "D:\Experiments\Trading\quick_trade_test.py", line 135, in <module>
+    success = main()
+  File "D:\Experiments\Trading\quick_trade_test.py", line 31, in main
+    datasets = download_data(['MSFT'], base_cfg, use_cache=True)
+TypeError: download_data() got an unexpected keyword argument 'use_cache'

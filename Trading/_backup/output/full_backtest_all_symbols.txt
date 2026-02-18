@@ -1,0 +1,1567 @@
+
+[96m[1m==================================================================================[0m
+[96m[1m  [97mALPHA-TRADE v7.0 -- Institutional Architecture[0m
+[96m[1m  [2mL1->L2->L3->L4 | RL is one alpha of many | cfg:5db6c46eb289 | 2026-02-17 23:27[0m
+[96m[1m==================================================================================[0m
+  [2m[23:27:09][0m [95mG GPU 0: GeForce RTX 3090 | 24.0GB | SM8.6 | 82 SMs[0m
+  [2m[23:27:09][0m [95mG cuDNN benchmark: ON | TF32: ON | AMP: available[0m
+  [2m[23:27:09][0m [96mi PyTorch 2.7.1+cu118 | Device: cuda | AMP:ON[0m
+
+[2m--------------------------- [96m[1mINSTITUTIONAL PIPELINE[0m[2m ---------------------------[0m
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+  [2m[23:27:09][0m [92m+ Active alphas (12):[0m
+  [2m[23:27:09][0m [96mi     [OK] rl_ppo_mcts[0m
+  [2m[23:27:09][0m [96mi     [OK] trend_follow[0m
+  [2m[23:27:09][0m [96mi     [OK] mean_reversion[0m
+  [2m[23:27:09][0m [96mi     [OK] value[0m
+  [2m[23:27:09][0m [96mi     [OK] carry[0m
+  [2m[23:27:09][0m [96mi     [OK] calendar[0m
+  [2m[23:27:09][0m [96mi     [OK] vol_premium[0m
+  [2m[23:27:09][0m [96mi     [OK] amihud_liquidity[0m
+  [2m[23:27:09][0m [96mi     [OK] hurst_regime[0m
+  [2m[23:27:09][0m [96mi     [OK] short_term_reversal[0m
+  [2m[23:27:09][0m [96mi     [OK] vol_term_structure[0m
+  [2m[23:27:09][0m [96mi     [OK] volume_price_divergence[0m
+  [2m[23:27:09][0m [96mi L3 config: vol_target=15%  kelly=0.25  max_leverage=2.0x  dd_scale=[8%,15%][0m
+  [2m[23:27:09][0m [96mi L4 config: no_trade=0%  kill_loss=5%  slicing=TWAP--5[0m
+
+[2m-------------------------------- [96m[1mDATA LOADING[0m[2m --------------------------------[0m
+  [2m[23:27:09][0m [96mi Downloading 50 symbols...[0m
+  [2m[23:27:09][0m [96mi Found cached data from 2026-02-17 23:05:58 (0.4h ago)[0m
+
+  Use cached data? (Y/n):   [2m[23:27:09][0m [93m! Cache metadata error: EOF when reading a line, re-downloading...[0m
+  [2m[23:27:09][0m [96mi Downloading 50 symbols x 1 TFs = 50 jobs[0m
+  [96mDownload[0m [########################################] 100.0% (50/50) ETA:0s   
+  [2m[23:27:15][0m [96mi Cached data to data_cache\market_data_AAPL_ABT_ADBE_50syms_1d.pkl[0m
+  [2m[23:27:15][0m [92m+ 50 datasets in 6.1s[0m
+  [2m[23:27:15][0m [96mi     1d:  50 syms    513,552 bars[0m
+  [2m[23:27:15][0m [92m+ Loaded 50 datasets[0m
+  [2m[23:27:15][0m [92m+   L0: Trading calendar loaded (NYSE), ingestion gate active (missing_data_policy=rolling_median)[0m
+
++======================================================================================================================+
+|                                               L0 DATA QUALITY SUMMARY                                                |
++======================================================================================================================+
+| Symbol           TF    Bars        Start          End  Miss%   Dup  OHLC Stale ExtRet  Score  Verdict |
++----------------------------------------------------------------------------------------------------------------------+
+| TSLA             1d   3,933   2010-06-29   2026-02-17   0.0%     0     0     2      0 100.0     PASS |
+| GOOGL            1d   5,408   2004-08-19   2026-02-17   0.0%     0     0     2      0 100.0     PASS |
+| META             1d   3,456   2012-05-18   2026-02-17   0.0%     0     0     2      0 100.0     PASS |
+| BLK              1d   6,634   1999-10-01   2026-02-17   0.0%     0    37     3      0  99.3     WARN |
+| MA               1d   4,963   2006-05-25   2026-02-17   0.0%     0     0     2      0 100.0     PASS |
+| PYPL             1d   2,671   2015-07-06   2026-02-17   0.0%     0     0     2      0 100.0     PASS |
+| AVGO             1d   4,158   2009-08-06   2026-02-17   0.0%     0     0     2      0 100.0     PASS |
+| QQQ              1d   6,777   1999-03-10   2026-02-17   0.0%     0     3     3      0  99.9     PASS |
+| V                1d   4,507   2008-03-19   2026-02-17   0.0%     0     2     2      0 100.0     PASS |
+| NVDA             1d   6,809   1999-01-22   2026-02-17   0.0%     0     0     3      6  99.7     PASS |
+| SPY              1d   8,319   1993-01-29   2026-02-17   0.0%     0    26     3      0  99.5     PASS |
+| COF              1d   7,864   1994-11-16   2026-02-17   0.0%     0    20     4      1  99.5     PASS |
+| DIA              1d   7,063   1998-01-20   2026-02-17   0.0%     0    15     2      0  99.7     PASS |
+| AMZN             1d   7,234   1997-05-15   2026-02-17   0.0%     0     0     3      3  99.8     PASS |
+| AMD              1d  11,574   1980-03-17   2026-02-17   0.0%     0     0     5      4  99.8     PASS |
+| ADBE             1d   9,954   1986-08-13   2026-02-17   0.0%     0     0     6      2  99.9     PASS |
+| MS               1d   8,303   1993-02-23   2026-02-17   0.0%     0    15     3      2  99.6     PASS |
+| AAPL             1d  11,386   1980-12-12   2026-02-17   0.0%     0    22     4      2  99.5     PASS |
+| COST             1d   9,979   1986-07-09   2026-02-17   0.0%     0    50     5      0  99.0     WARN |
+| GS               1d   6,739   1999-05-04   2026-02-17   0.0%     0     5     2      0  99.9     PASS |
+| UNH              1d  10,413   1984-10-17   2026-02-17   0.0%     0    15    17      2  96.1     PASS |
+| MSFT             1d  10,060   1986-03-13   2026-02-17   0.0%     0    37     3      1  99.2     PASS |
+| WMT              1d  13,480   1972-08-25   2026-02-17   0.0%     0   256     6      0  94.9     WARN |
+| CRM              1d   5,448   2004-06-23   2026-02-17   0.0%     0     0     2      0 100.0     PASS |
+| ABT              1d  11,574   1980-03-17   2026-02-17   0.0%     0    39     3      0  99.2     PASS |
+| PEP              1d  13,540   1972-06-01   2026-02-17   0.0%     0   166     8      0  96.7     WARN |
+| JPM              1d  11,574   1980-03-17   2026-02-17   0.0%     0    49     6      0  99.0     PASS |
+| SBUX             1d   8,469   1992-06-26   2026-02-17   0.0%     0     7     4      0  99.9     PASS |
+| BAC              1d  13,360   1973-02-21   2026-02-17   0.0%     0   195    13      2  94.5     WARN |
+| NKE              1d  11,394   1980-12-02   2026-02-17   0.0%     0    59     8      0  98.8     WARN |
+| AXP              1d  13,540   1972-06-01   2026-02-17   0.0%     0   168     4      0  96.6     WARN |
+| JNJ              1d  16,139   1962-01-02   2026-02-17   0.0%     0   251     4      0  95.0     WARN |
+| NFLX             1d   5,972   2002-05-23   2026-02-17   0.0%     0     0     3      5  99.8     PASS |
+| ORCL             1d  10,061   1986-03-12   2026-02-17   0.0%     0     8     5      4  99.6     PASS |
+| HD               1d  11,191   1981-09-22   2026-02-17   0.0%     0   235    22      1  89.2     WARN |
+| LOW              1d  11,574   1980-03-17   2026-02-17   0.0%     0   169     5      2  96.5     WARN |
+| PFE              1d  13,540   1972-06-01   2026-02-17   0.0%     0    95    18      0  94.1     WARN |
+| MRK              1d  16,139   1962-01-02   2026-02-17   0.0%     0   117     4      0  97.7     WARN |
+| KO               1d  16,139   1962-01-02   2026-02-17   0.0%     0   118     5      0  97.6     WARN |
+| PG               1d  16,139   1962-01-02   2026-02-17   0.0%     0   112     5      1  97.7     WARN |
+| EOG              1d   9,159   1989-10-04   2026-02-17   0.0%     0    97     6      1  98.0     WARN |
+| INTC             1d  11,574   1980-03-17   2026-02-17   0.0%     0    96     5      0  98.1     WARN |
+| CVX              1d  16,139   1962-01-02   2026-02-17   0.0%     0   123     5      0  97.5     WARN |
+| XOM              1d  16,139   1962-01-02   2026-02-17   0.0%     0   130     5      0  97.4     WARN |
+| SLB              1d  11,121   1981-12-31   2026-02-17   0.0%     0    35     5      0  99.3     PASS |
+| MCD              1d  15,004   1966-07-05   2026-02-17   0.0%     0    95     5      2  98.0     WARN |
+| COP              1d  11,121   1981-12-31   2026-02-17   0.0%     0    88     6      0  98.2     WARN |
+| DE               1d  13,540   1972-06-01   2026-02-17   0.0%     0   123     5      0  97.5     WARN |
+| CAT              1d  16,139   1962-01-02   2026-02-17   0.0%     0    78     8      0  98.4     PASS |
+| DIS              1d  16,139   1962-01-02   2026-02-17   0.0%     0   138     5      0  97.2     WARN |
++----------------------------------------------------------------------------------------------------------------------+
+|  50 datasets  |  Avg Score: 98.3  |  PASS: 28   WARN: 22   FAIL: 0                                                   |
++======================================================================================================================+
+
+[2m---------------------------- [96m[1mFEATURE ENGINEERING[0m[2m ----------------------------[0m
+  [96mFeatures[0m [################........................]  40.0% (20/50) ETA:4.5m     [96mFeatures[0m [################################........]  80.0% (40/50) ETA:2.1m     [96mFeatures[0m [########################################] 100.0% (50/50) ETA:0s   
+  [2m[23:38:36][0m [92m+ 50 datasets | pools: train=40 val=5 holdout=5[0m
+  [2m[23:38:36][0m [96mi   bars: train=402,858 val=50,335 test=50,399[0m
+
+  [1m[96m=== DATA SPLIT SUMMARY ===[0m
+  Split ratios: Train=80% | Val=10% | Test/OOS=10%   Embargo=100 bars (configured, scaled per series)
+  Total data points: 503,592 across 50 symbol(s)
+
+  Symbol                 TF     Pool  Train Start   Train End  #Bars    Val Start     Val End  #Bars   Test Start    Test End  #Bars
+  ----------------------------------------------------------------------------------------------------------------------------------
+  TSLA_1d                1d    train   2010-06-29  2022-05-06  2,986   2022-09-30  2024-03-26    373   2024-08-20  2026-02-17    374
+  GOOGL_1d               1d    train   2004-08-19  2021-03-08  4,166   2021-07-30  2023-08-23    520   2024-01-18  2026-02-17    522
+  META_1d                1d      val   2012-05-18  2022-09-22  2,604   2023-02-16  2024-06-03    325   2024-10-25  2026-02-17    327
+  BLK_1d                 1d      val   1999-10-01  2020-03-17  5,147   2020-08-10  2023-02-28    643   2023-07-25  2026-02-17    644
+  MA_1d                  1d    train   2006-05-25  2021-07-14  3,810   2021-12-06  2023-10-26    476   2024-03-22  2026-02-17    477
+  PYPL_1d                1d      val   2015-07-06  2023-06-26  2,008   2023-10-19  2024-10-17    251   2025-02-14  2026-02-17    252
+  AVGO_1d                1d    train   2009-08-06  2022-03-03  3,166   2022-07-28  2024-02-22    395   2024-07-18  2026-02-17    397
+  QQQ_1d                 1d    train   1999-03-10  2020-02-04  5,261   2020-06-29  2023-02-06    657   2023-07-03  2026-02-17    659
+  V_1d                   1d    train   2008-03-19  2021-11-19  3,445   2022-04-18  2024-01-02    430   2024-05-28  2026-02-17    432
+  NVDA_1d                1d    train   1999-01-22  2020-01-27  5,287   2020-06-19  2023-02-01    660   2023-06-28  2026-02-17    662
+  SPY_1d                 1d    train   1993-01-29  2018-11-09  6,495   2019-04-09  2022-06-27    811   2022-11-17  2026-02-17    813
+  COF_1d                 1d  holdout   1994-11-16  2019-03-26  6,131   2019-08-19  2022-08-31    766   2023-01-26  2026-02-17    767
+  DIA_1d                 1d    train   1998-01-20  2019-11-11  5,490   2020-04-07  2022-12-23    686   2023-05-22  2026-02-17    687
+  AMZN_1d                1d    train   1997-05-15  2019-09-24  5,627   2020-02-19  2022-11-30    703   2023-04-27  2026-02-17    704
+  AMD_1d                 1d    train   1980-03-17  2016-04-13  9,099   2016-09-06  2021-03-12  1,137   2021-08-05  2026-02-17  1,138
+  ADBE_1d                1d    train   1986-08-13  2017-07-26  7,803   2017-12-18  2021-11-01    975   2022-03-28  2026-02-17    976
+  MS_1d                  1d    train   1993-02-23  2018-11-14  6,482   2019-04-12  2022-06-29    810   2022-11-21  2026-02-17    811
+  AAPL_1d                1d      val   1980-12-12  2016-06-06  8,948   2016-10-27  2021-04-08  1,118   2021-08-31  2026-02-17  1,120
+  COST_1d                1d      val   1986-07-09  2017-07-19  7,823   2017-12-11  2021-10-27    977   2022-03-23  2026-02-17    979
+  GS_1d                  1d    train   1999-05-04  2020-02-14  5,231   2020-07-10  2023-02-10    653   2023-07-10  2026-02-17    655
+  UNH_1d                 1d  holdout   1984-10-17  2017-03-15  8,170   2017-08-08  2021-08-26  1,021   2022-01-20  2026-02-17  1,022
+  MSFT_1d                1d    train   1986-03-13  2017-06-26  7,888   2017-11-16  2021-10-18    986   2022-03-14  2026-02-17    986
+  WMT_1d                 1d    train   1972-08-25  2014-10-07 10,624   2015-03-04  2020-06-10  1,328   2020-11-02  2026-02-17  1,328
+  CRM_1d                 1d  holdout   2004-06-23  2021-02-24  4,198   2021-07-20  2023-08-17    524   2024-01-11  2026-02-17    526
+  ABT_1d                 1d    train   1980-03-17  2016-04-13  9,099   2016-09-06  2021-03-12  1,137   2021-08-05  2026-02-17  1,138
+  PEP_1d                 1d    train   1972-06-01  2014-09-19 10,672   2015-02-13  2020-06-02  1,334   2020-10-23  2026-02-17  1,334
+  JPM_1d                 1d    train   1980-03-17  2016-04-13  9,099   2016-09-06  2021-03-12  1,137   2021-08-05  2026-02-17  1,138
+  SBUX_1d                1d    train   1992-06-26  2018-09-28  6,615   2019-02-26  2022-06-03    826   2022-10-27  2026-02-17    828
+  BAC_1d                 1d    train   1973-02-21  2014-11-10 10,528   2015-04-08  2020-06-26  1,316   2020-11-18  2026-02-17  1,316
+  NKE_1d                 1d    train   1980-12-02  2016-06-03  8,955   2016-10-26  2021-04-08  1,119   2021-08-31  2026-02-17  1,120
+  AXP_1d                 1d    train   1972-06-01  2014-09-19 10,672   2015-02-13  2020-06-02  1,334   2020-10-23  2026-02-17  1,334
+  JNJ_1d                 1d    train   1962-01-02  2012-08-23 12,751   2013-01-22  2019-05-20  1,593   2019-10-11  2026-02-17  1,595
+  NFLX_1d                1d    train   2002-05-23  2020-09-23  4,617   2021-02-18  2023-06-02    577   2023-10-26  2026-02-17    578
+  ORCL_1d                1d    train   1986-03-12  2017-06-23  7,888   2017-11-15  2021-10-15    986   2022-03-11  2026-02-17    987
+  HD_1d                  1d    train   1981-09-22  2016-08-01  8,792   2016-12-22  2021-05-06  1,099   2021-09-29  2026-02-17  1,100
+  LOW_1d                 1d    train   1980-03-17  2016-04-13  9,099   2016-09-06  2021-03-12  1,137   2021-08-05  2026-02-17  1,138
+  PFE_1d                 1d    train   1972-06-01  2014-09-19 10,672   2015-02-13  2020-06-02  1,334   2020-10-23  2026-02-17  1,334
+  MRK_1d                 1d  holdout   1962-01-02  2012-08-23 12,751   2013-01-22  2019-05-20  1,593   2019-10-11  2026-02-17  1,595
+  KO_1d                  1d    train   1962-01-02  2012-08-23 12,751   2013-01-22  2019-05-20  1,593   2019-10-11  2026-02-17  1,595
+  PG_1d                  1d    train   1962-01-02  2012-08-23 12,751   2013-01-22  2019-05-20  1,593   2019-10-11  2026-02-17  1,595
+  EOG_1d                 1d  holdout   1989-10-04  2018-03-14  7,167   2018-08-07  2022-02-24    895   2022-07-21  2026-02-17    897
+  INTC_1d                1d    train   1980-03-17  2016-04-13  9,099   2016-09-06  2021-03-12  1,137   2021-08-05  2026-02-17  1,138
+  CVX_1d                 1d    train   1962-01-02  2012-08-23 12,751   2013-01-22  2019-05-20  1,593   2019-10-11  2026-02-17  1,595
+  XOM_1d                 1d    train   1962-01-02  2012-08-23 12,751   2013-01-22  2019-05-20  1,593   2019-10-11  2026-02-17  1,595
+  SLB_1d                 1d    train   1981-12-31  2016-08-19  8,736   2017-01-13  2021-05-17  1,092   2021-10-08  2026-02-17  1,093
+  MCD_1d                 1d    train   1966-07-05  2013-07-23 11,843   2013-12-13  2019-10-30  1,480   2020-03-26  2026-02-17  1,481
+  COP_1d                 1d    train   1981-12-31  2016-08-19  8,736   2017-01-13  2021-05-17  1,092   2021-10-08  2026-02-17  1,093
+  DE_1d                  1d    train   1972-06-01  2014-09-19 10,672   2015-02-13  2020-06-02  1,334   2020-10-23  2026-02-17  1,334
+  CAT_1d                 1d    train   1962-01-02  2012-08-23 12,751   2013-01-22  2019-05-20  1,593   2019-10-11  2026-02-17  1,595
+  DIS_1d                 1d    train   1962-01-02  2012-08-23 12,751   2013-01-22  2019-05-20  1,593   2019-10-11  2026-02-17  1,595
+  ----------------------------------------------------------------------------------------------------------------------------------
+  TOTAL                                1962-01-02  2023-06-26 402,858                          50,335   2019-10-11  2026-02-17 50,399
+
+  [2mTimeline (TSLA_1d):[0m
+  [2m  [TRAIN 2022-05-06] --embargo~100bars--> [VAL 2022-09-30..2024-03-26] --embargo~100bars--> [TEST/OOS 2024-08-20][0m
+
+
+[2m---------------------- [96m[1mTRAINING (PPO + MCTS Self-Play)[0m[2m ----------------------[0m
+  [2m[23:38:36][0m [96mi Pools | train:40 val:5 holdout:5[0m
+  [2m[23:38:36][0m [92m+ System ready | 8,598,279 params | AMP=ON | compile=OFF | n_envs=16[0m
+  [2m[23:38:37][0m [96mi DriftMonitor: 3180 obs dims tracked (from 2500 samples)[0m
+  [2m[23:38:37][0m [96mi Starting self-play training loop...[0m
+
+[96m[1m==================================================================================[0m
+[96m[1m  [97mALPHA-TRADE v3.0 GPU-PARALLEL TRAINING[0m
+[96m[1m  [2miters=1 steps/it=1,000 n_envs=16 AMP=ON cuda[0m
+[96m[1m==================================================================================[0m
+
+[2m------------------------------- [96m[1mITERATION 1/1[0m[2m -------------------------------[0m
+  [2m[23:38:38][0m [95mG GPU mem: 0.03GB[0m
+  [96mFeatures[0m [########################################] 100.0% (4/4) ETA:0s   
+  [2m[23:38:42][0m [92m+ 4 datasets | pools: train=0 val=0 holdout=4[0m
+  [2m[23:38:42][0m [96mi   bars: train=1,000 val=440 test=440[0m
+  [2m[23:38:42][0m [96mi 20 envs x 16 parallel = 320 total[0m
+  [2m[23:38:42][0m [96mi PPO training (1,000 steps)...[0m
+  [2m[23:39:09][0m [92m+ Done: 30.5s | 1,075 steps/s | reward:+11.6123[0m
+
+  [1m[96m--- It 1 | Challenger (it 1) ---[0m
+  P&L:[92m$ +455,388.61[0m ($+9,107.77/sym)
+  WR: 32.4% PF:0.44 Sh:1.10 DD:6.7% Br:44/50
+  Score:[1m+8.30[0m
+  [2m[23:41:02][0m [93m! Val FAILED (META_1d): walk_forward invalid[0m
+  [2m[23:41:02][0m [93m! Val FAILED (BLK_1d): walk_forward invalid[0m
+  [2m[23:41:07][0m [93m! Val FAILED (AAPL_1d): walk-forward consistency 20.0% < 40.0%; permutation test p=0.990; placebo(feature shuffle) pnl=10546 > 0.0[0m
+  [2m[23:41:07][0m [93m! Val gate: 0/3 passed (0% < 50%)[0m
+  [2m[23:41:07][0m [93m! Rejected: +8.30 vs -inf[0m
+  [2m[23:41:07][0m [92m+ Report: C:\Users\dilip\alpha_trade_v2_results\training_report.json[0m
+
+[2m--------------- [96m[1mBASE SYSTEM EVALUATION (v3.0 -- direct action)[0m[2m ---------------[0m
+
+[2m------------------------------ [96m[1mFINAL EVALUATION[0m[2m ------------------------------[0m
+
+  [1m[96m--- It 1 | Champion (Holdout) ---[0m
+  P&L:[92m$  +76,072.62[0m ($+15,214.52/sym)
+  WR: 29.7% PF:13423601487581.53 Sh:1.36 DD:7.3% Br:5/5
+  Score:[1m+16.43[0m
+  [2m[23:41:18][0m [93m!   COF_1d: FAILED[0m
+
+[2m----------------------------- [96m[1mDECISION ANALYSIS[0m[2m -----------------------------[0m
+  [2m[23:41:18][0m [96mi Analyzing decisions for 50 datasets...[0m
+  [96mAnalyzing[0m [################........................]  40.0% (20/50) ETA:45s     [96mAnalyzing[0m [################################........]  80.0% (40/50) ETA:21s     [96mAnalyzing[0m [########################################] 100.0% (50/50) ETA:0s   D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 39 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 36 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1764) = 42.0. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 41 features > sqrt(252) = 15.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(504) = 22.4. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(756) = 27.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1008) = 31.7. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1260) = 35.5. Reduce features or add dimensionality reduction.
+  warnings.warn(
+D:\Experiments\Trading\.\alphago_architecture.py:2190: UserWarning: Feature discipline violation: 43 features > sqrt(1512) = 38.9. Reduce features or add dimensionality reduction.
+  warnings.warn(
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (BLK_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1999-10-01 ->  1999-12-30     63      26   2000-02-08 ->  2003-03-25    784
+     1   1999-10-01 ->  2003-03-25    873      26   2003-05-02 ->  2009-08-28  1,594
+     2   1999-10-01 ->  2006-06-12  1,683      26   2006-07-20 ->  2016-02-05  2,404
+     3   1999-10-01 ->  2009-08-28  2,493      26   2009-10-07 ->  2016-02-11  1,598
+     4   1999-10-01 ->  2012-11-15  3,303      26   2012-12-26 ->  2016-02-11    788
+    HO                                              2016-02-12 ->  2020-03-17  1,030  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (PEP_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1972-06-01 ->  1972-08-29     63      26   1972-10-06 ->  1979-05-17  1,668
+     1   1972-06-01 ->  1979-05-17  1,757      26   1979-06-26 ->  1992-10-09  3,362
+     2   1972-06-01 ->  1986-01-29  3,451      26   1986-03-10 ->  2006-03-22  5,056
+     3   1972-06-01 ->  1992-10-09  5,145      26   1992-11-17 ->  2006-03-28  3,366
+     4   1972-06-01 ->  1999-06-25  6,839      26   1999-08-04 ->  2006-03-28  1,672
+    HO                                              2006-03-29 ->  2014-09-19  2,135  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (DIA_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1998-01-20 ->  1998-04-20     63      26   1998-05-28 ->  2001-09-27    839
+     1   1998-01-20 ->  2001-09-27    928      26   2001-11-05 ->  2008-08-12  1,704
+     2   1998-01-20 ->  2005-03-07  1,793      26   2005-04-14 ->  2015-06-26  2,569
+     3   1998-01-20 ->  2008-08-12  2,658      26   2008-09-19 ->  2015-07-02  1,708
+     4   1998-01-20 ->  2012-01-18  3,523      26   2012-02-27 ->  2015-07-02    843
+    HO                                              2015-07-06 ->  2019-11-11  1,098  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (BAC_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1973-02-21 ->  1973-05-21     63      26   1973-06-28 ->  1979-12-31  1,645
+     1   1973-02-21 ->  1979-12-31  1,734      26   1980-02-07 ->  1993-03-19  3,316
+     2   1973-02-21 ->  1986-08-11  3,405      26   1986-09-18 ->  2006-06-23  4,987
+     3   1973-02-21 ->  1993-03-19  5,076      26   1993-04-28 ->  2006-06-29  3,320
+     4   1973-02-21 ->  1999-10-29  6,747      26   1999-12-08 ->  2006-06-29  1,649
+    HO                                              2006-06-30 ->  2014-11-10  2,106  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (ADBE_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1986-08-13 ->  1986-11-10     63      26   1986-12-18 ->  1991-09-30  1,209
+     1   1986-08-13 ->  1991-09-30  1,298      26   1991-11-06 ->  2001-07-11  2,444
+     2   1986-08-13 ->  1996-08-16  2,533      26   1996-09-25 ->  2011-05-06  3,679
+     3   1986-08-13 ->  2001-07-11  3,768      26   2001-08-17 ->  2011-05-12  2,448
+     4   1986-08-13 ->  2006-06-12  5,003      26   2006-07-20 ->  2011-05-12  1,213
+    HO                                              2011-05-13 ->  2017-07-26  1,561  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (LOW_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1980-03-17 ->  1980-06-13     63      26   1980-07-23 ->  1986-02-28  1,417
+     1   1980-03-17 ->  1986-02-28  1,506      26   1986-04-09 ->  1997-07-29  2,860
+     2   1980-03-17 ->  1991-11-12  2,949      26   1991-12-20 ->  2009-01-16  4,303
+     3   1980-03-17 ->  1997-07-29  4,392      26   1997-09-05 ->  2009-01-20  2,861
+     4   1980-03-17 ->  2003-04-25  5,835      26   2003-06-04 ->  2009-01-20  1,418
+    HO                                              2009-01-21 ->  2016-04-13  1,820  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (MA_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2006-05-25 ->  2006-08-23     63      26   2006-10-02 ->  2009-01-07    571
+     1   2006-05-25 ->  2009-01-07    660      26   2009-02-17 ->  2013-10-04  1,168
+     2   2006-05-25 ->  2011-05-20  1,257      26   2011-06-29 ->  2018-07-03  1,765
+     3   2006-05-25 ->  2013-10-04  1,854      26   2013-11-12 ->  2018-07-03  1,168
+     4   2006-05-25 ->  2016-02-19  2,451      26   2016-03-30 ->  2018-07-03    571
+    HO                                              2018-07-05 ->  2021-07-14    762  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (CRM_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2004-06-23 ->  2004-09-21     63      26   2004-10-28 ->  2007-05-04    633
+     1   2004-06-23 ->  2007-05-04    722      26   2007-06-13 ->  2012-07-26  1,292
+     2   2004-06-23 ->  2009-12-14  1,381      26   2010-01-25 ->  2017-10-20  1,951
+     3   2004-06-23 ->  2012-07-26  2,040      26   2012-09-04 ->  2017-10-20  1,292
+     4   2004-06-23 ->  2015-03-12  2,699      26   2015-04-21 ->  2017-10-20    633
+    HO                                              2017-10-23 ->  2021-02-24    840  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (AXP_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1972-06-01 ->  1972-08-29     63      26   1972-10-06 ->  1979-05-17  1,668
+     1   1972-06-01 ->  1979-05-17  1,757      26   1979-06-26 ->  1992-10-09  3,362
+     2   1972-06-01 ->  1986-01-29  3,451      26   1986-03-10 ->  2006-03-22  5,056
+     3   1972-06-01 ->  1992-10-09  5,145      26   1992-11-17 ->  2006-03-28  3,366
+     4   1972-06-01 ->  1999-06-25  6,839      26   1999-08-04 ->  2006-03-28  1,672
+    HO                                              2006-03-29 ->  2014-09-19  2,135  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (AAPL_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1980-12-12 ->  1981-03-13     63      26   1981-04-22 ->  1986-10-22  1,393
+     1   1980-12-12 ->  1986-10-22  1,482      26   1986-12-01 ->  1998-01-13  2,812
+     2   1980-12-12 ->  1992-06-03  2,901      26   1992-07-13 ->  2009-04-27  4,231
+     3   1980-12-12 ->  1998-01-13  4,320      26   1998-02-23 ->  2009-04-27  2,812
+     4   1980-12-12 ->  2003-09-05  5,739      26   2003-10-14 ->  2009-04-27  1,393
+    HO                                              2009-04-28 ->  2016-06-06  1,790  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (INTC_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1980-03-17 ->  1980-06-13     63      26   1980-07-23 ->  1986-02-28  1,417
+     1   1980-03-17 ->  1986-02-28  1,506      26   1986-04-09 ->  1997-07-29  2,860
+     2   1980-03-17 ->  1991-11-12  2,949      26   1991-12-20 ->  2009-01-16  4,303
+     3   1980-03-17 ->  1997-07-29  4,392      26   1997-09-05 ->  2009-01-20  2,861
+     4   1980-03-17 ->  2003-04-25  5,835      26   2003-06-04 ->  2009-01-20  1,418
+    HO                                              2009-01-21 ->  2016-04-13  1,820  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (COF_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1994-11-16 ->  1995-02-15     63      26   1995-03-27 ->  1998-12-15    942
+     1   1994-11-16 ->  1998-12-15  1,031      26   1999-01-26 ->  2006-08-28  1,910
+     2   1994-11-16 ->  2002-10-23  1,999      26   2002-12-02 ->  2014-05-08  2,878
+     3   1994-11-16 ->  2006-08-28  2,967      26   2006-10-05 ->  2014-05-09  1,911
+     4   1994-11-16 ->  2010-07-02  3,935      26   2010-08-11 ->  2014-05-09    943
+    HO                                              2014-05-12 ->  2019-03-26  1,227  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (NFLX_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2002-05-23 ->  2002-08-21     63      26   2002-09-30 ->  2005-07-11    700
+     1   2002-05-23 ->  2005-07-11    789      26   2005-08-17 ->  2011-04-14  1,426
+     2   2002-05-23 ->  2008-05-29  1,515      26   2008-07-08 ->  2017-01-23  2,152
+     3   2002-05-23 ->  2011-04-14  2,241      26   2011-05-24 ->  2017-01-23  1,426
+     4   2002-05-23 ->  2014-03-06  2,967      26   2014-04-14 ->  2017-01-23    700
+    HO                                              2017-01-24 ->  2020-09-23    924  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (PFE_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1972-06-01 ->  1972-08-29     63      26   1972-10-06 ->  1979-05-17  1,668
+     1   1972-06-01 ->  1979-05-17  1,757      26   1979-06-26 ->  1992-10-09  3,362
+     2   1972-06-01 ->  1986-01-29  3,451      26   1986-03-10 ->  2006-03-22  5,056
+     3   1972-06-01 ->  1992-10-09  5,145      26   1992-11-17 ->  2006-03-28  3,366
+     4   1972-06-01 ->  1999-06-25  6,839      26   1999-08-04 ->  2006-03-28  1,672
+    HO                                              2006-03-29 ->  2014-09-19  2,135  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (MS_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1993-02-23 ->  1993-05-21     63      26   1993-06-30 ->  1997-06-10    998
+     1   1993-02-23 ->  1997-06-10  1,087      26   1997-07-18 ->  2005-08-01  2,022
+     2   1993-02-23 ->  2001-07-02  2,111      26   2001-08-09 ->  2013-09-19  3,046
+     3   1993-02-23 ->  2005-08-01  3,135      26   2005-09-08 ->  2013-09-23  2,024
+     4   1993-02-23 ->  2009-08-25  4,159      26   2009-10-02 ->  2013-09-23  1,000
+    HO                                              2013-09-24 ->  2018-11-14  1,297  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (ORCL_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1986-03-12 ->  1986-06-10     63      26   1986-07-18 ->  1991-05-17  1,223
+     1   1986-03-12 ->  1991-05-17  1,312      26   1991-06-26 ->  2001-04-06  2,472
+     2   1986-03-12 ->  1996-04-25  2,561      26   1996-06-04 ->  2011-03-15  3,721
+     3   1986-03-12 ->  2001-04-06  3,810      26   2001-05-16 ->  2011-03-17  2,474
+     4   1986-03-12 ->  2006-03-29  5,059      26   2006-05-08 ->  2011-03-17  1,225
+    HO                                              2011-03-18 ->  2017-06-23  1,578  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (SLB_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1981-12-31 ->  1982-03-31     63      26   1982-05-10 ->  1987-09-22  1,359
+     1   1981-12-31 ->  1987-09-22  1,448      26   1987-10-29 ->  1998-09-04  2,744
+     2   1981-12-31 ->  1993-03-15  2,833      26   1993-04-22 ->  2009-09-10  4,129
+     3   1981-12-31 ->  1998-09-04  4,218      26   1998-10-14 ->  2009-09-10  2,744
+     4   1981-12-31 ->  2004-03-11  5,603      26   2004-04-20 ->  2009-09-10  1,359
+    HO                                              2009-09-11 ->  2016-08-19  1,748  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (AMZN_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1997-05-15 ->  1997-08-13     63      26   1997-09-22 ->  2001-02-20    861
+     1   1997-05-15 ->  2001-02-20    950      26   2001-03-29 ->  2008-03-13  1,748
+     2   1997-05-15 ->  2004-09-02  1,837      26   2004-10-12 ->  2015-03-31  2,635
+     3   1997-05-15 ->  2008-03-13  2,724      26   2008-04-22 ->  2015-04-06  1,751
+     4   1997-05-15 ->  2011-09-19  3,611      26   2011-10-26 ->  2015-04-06    864
+    HO                                              2015-04-07 ->  2019-09-24  1,126  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (NKE_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1980-12-02 ->  1981-03-03     63      26   1981-04-09 ->  1986-10-13  1,394
+     1   1980-12-02 ->  1986-10-13  1,483      26   1986-11-19 ->  1998-01-06  2,814
+     2   1980-12-02 ->  1992-05-26  2,903      26   1992-07-02 ->  2009-04-22  4,234
+     3   1980-12-02 ->  1998-01-06  4,323      26   1998-02-13 ->  2009-04-23  2,815
+     4   1980-12-02 ->  2003-08-29  5,743      26   2003-10-08 ->  2009-04-23  1,395
+    HO                                              2009-04-24 ->  2016-06-03  1,791  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (COP_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1981-12-31 ->  1982-03-31     63      26   1982-05-10 ->  1987-09-22  1,359
+     1   1981-12-31 ->  1987-09-22  1,448      26   1987-10-29 ->  1998-09-04  2,744
+     2   1981-12-31 ->  1993-03-15  2,833      26   1993-04-22 ->  2009-09-10  4,129
+     3   1981-12-31 ->  1998-09-04  4,218      26   1998-10-14 ->  2009-09-10  2,744
+     4   1981-12-31 ->  2004-03-11  5,603      26   2004-04-20 ->  2009-09-10  1,359
+    HO                                              2009-09-11 ->  2016-08-19  1,748  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (META_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2012-05-18 ->  2012-08-16     63      26   2012-09-25 ->  2014-03-28    378
+     1   2012-05-18 ->  2014-03-28    467      26   2014-05-07 ->  2017-06-13    782
+     2   2012-05-18 ->  2015-11-03    871      26   2015-12-11 ->  2020-08-27  1,186
+     3   2012-05-18 ->  2017-06-13  1,275      26   2017-07-21 ->  2020-08-27    782
+     4   2012-05-18 ->  2019-01-22  1,679      26   2019-03-01 ->  2020-08-27    378
+    HO                                              2020-08-28 ->  2022-09-22    521  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (GS_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1999-05-04 ->  1999-08-02     63      26   1999-09-09 ->  2002-11-11    798
+     1   1999-05-04 ->  2002-11-11    887      26   2002-12-19 ->  2009-06-01  1,622
+     2   1999-05-04 ->  2006-02-21  1,711      26   2006-03-30 ->  2015-12-15  2,446
+     3   1999-05-04 ->  2009-06-01  2,535      26   2009-07-09 ->  2015-12-16  1,623
+     4   1999-05-04 ->  2012-09-05  3,359      26   2012-10-12 ->  2015-12-16    799
+    HO                                              2015-12-17 ->  2020-02-14  1,047  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (JNJ_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1962-01-02 ->  1962-03-30     63      26   1962-05-09 ->  1970-05-28  2,001
+     1   1962-01-02 ->  1970-05-28  2,090      26   1970-07-07 ->  1986-06-13  4,028
+     2   1962-01-02 ->  1978-06-07  4,117      26   1978-07-17 ->  2002-07-08  6,055
+     3   1962-01-02 ->  1986-06-13  6,144      26   1986-07-23 ->  2002-07-10  4,030
+     4   1962-01-02 ->  1994-06-20  8,171      26   1994-07-28 ->  2002-07-10  2,003
+    HO                                              2002-07-11 ->  2012-08-23  2,551  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (PYPL_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2015-07-06 ->  2015-10-01     63      26   2015-11-09 ->  2016-12-20    282
+     1   2015-07-06 ->  2016-12-20    371      26   2017-01-31 ->  2019-06-05    590
+     2   2015-07-06 ->  2018-03-14    679      26   2018-04-23 ->  2021-11-11    898
+     3   2015-07-06 ->  2019-06-05    987      26   2019-07-15 ->  2021-11-16    593
+     4   2015-07-06 ->  2020-08-24  1,295      26   2020-10-01 ->  2021-11-16    285
+    HO                                              2021-11-17 ->  2023-06-26    402  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (COST_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1986-07-09 ->  1986-10-06     63      26   1986-11-12 ->  1991-08-29  1,213
+     1   1986-07-09 ->  1991-08-29  1,302      26   1991-10-08 ->  2001-06-21  2,452
+     2   1986-07-09 ->  1996-07-24  2,541      26   1996-08-30 ->  2011-04-29  3,691
+     3   1986-07-09 ->  2001-06-21  3,780      26   2001-07-31 ->  2011-04-29  2,452
+     4   1986-07-09 ->  2006-05-30  5,019      26   2006-07-07 ->  2011-04-29  1,213
+    HO                                              2011-05-02 ->  2017-07-19  1,565  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (MRK_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1962-01-02 ->  1962-03-30     63      26   1962-05-09 ->  1970-05-28  2,001
+     1   1962-01-02 ->  1970-05-28  2,090      26   1970-07-07 ->  1986-06-13  4,028
+     2   1962-01-02 ->  1978-06-07  4,117      26   1978-07-17 ->  2002-07-08  6,055
+     3   1962-01-02 ->  1986-06-13  6,144      26   1986-07-23 ->  2002-07-10  4,030
+     4   1962-01-02 ->  1994-06-20  8,171      26   1994-07-28 ->  2002-07-10  2,003
+    HO                                              2002-07-11 ->  2012-08-23  2,551  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (AVGO_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2009-08-06 ->  2009-11-03     63      26   2009-12-11 ->  2011-10-18    467
+     1   2009-08-06 ->  2011-10-18    556      26   2011-11-25 ->  2015-09-21    960
+     2   2009-08-06 ->  2013-10-04  1,049      26   2013-11-12 ->  2019-08-21  1,453
+     3   2009-08-06 ->  2015-09-21  1,542      26   2015-10-28 ->  2019-08-27    964
+     4   2009-08-06 ->  2017-09-05  2,035      26   2017-10-12 ->  2019-08-27    471
+    HO                                              2019-08-28 ->  2022-03-03    634  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (MSFT_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1986-03-13 ->  1986-06-11     63      26   1986-07-21 ->  1991-05-20  1,223
+     1   1986-03-13 ->  1991-05-20  1,312      26   1991-06-27 ->  2001-04-09  2,472
+     2   1986-03-13 ->  1996-04-26  2,561      26   1996-06-05 ->  2011-03-16  3,721
+     3   1986-03-13 ->  2001-04-09  3,810      26   2001-05-17 ->  2011-03-18  2,474
+     4   1986-03-13 ->  2006-03-30  5,059      26   2006-05-09 ->  2011-03-18  1,225
+    HO                                              2011-03-21 ->  2017-06-26  1,578  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (KO_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1962-01-02 ->  1962-03-30     63      26   1962-05-09 ->  1970-05-28  2,001
+     1   1962-01-02 ->  1970-05-28  2,090      26   1970-07-07 ->  1986-06-13  4,028
+     2   1962-01-02 ->  1978-06-07  4,117      26   1978-07-17 ->  2002-07-08  6,055
+     3   1962-01-02 ->  1986-06-13  6,144      26   1986-07-23 ->  2002-07-10  4,030
+     4   1962-01-02 ->  1994-06-20  8,171      26   1994-07-28 ->  2002-07-10  2,003
+    HO                                              2002-07-11 ->  2012-08-23  2,551  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (NVDA_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1999-01-22 ->  1999-04-22     63      26   1999-06-01 ->  2002-08-15    807
+     1   1999-01-22 ->  2002-08-15    896      26   2002-09-24 ->  2009-03-30  1,640
+     2   1999-01-22 ->  2005-12-05  1,729      26   2006-01-13 ->  2015-11-09  2,473
+     3   1999-01-22 ->  2009-03-30  2,562      26   2009-05-07 ->  2015-11-10  1,641
+     4   1999-01-22 ->  2012-07-18  3,395      26   2012-08-24 ->  2015-11-10    808
+    HO                                              2015-11-11 ->  2020-01-27  1,058  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (SBUX_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1992-06-26 ->  1992-09-24     63      26   1992-11-02 ->  1996-11-11  1,019
+     1   1992-06-26 ->  1996-11-11  1,108      26   1996-12-19 ->  2005-03-04  2,064
+     2   1992-06-26 ->  2001-01-03  2,153      26   2001-02-12 ->  2013-06-24  3,109
+     3   1992-06-26 ->  2005-03-04  3,198      26   2005-04-13 ->  2013-06-28  2,068
+     4   1992-06-26 ->  2009-04-29  4,243      26   2009-06-08 ->  2013-06-28  1,023
+    HO                                              2013-07-01 ->  2018-09-28  1,323  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (PG_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1962-01-02 ->  1962-03-30     63      26   1962-05-09 ->  1970-05-28  2,001
+     1   1962-01-02 ->  1970-05-28  2,090      26   1970-07-07 ->  1986-06-13  4,028
+     2   1962-01-02 ->  1978-06-07  4,117      26   1978-07-17 ->  2002-07-08  6,055
+     3   1962-01-02 ->  1986-06-13  6,144      26   1986-07-23 ->  2002-07-10  4,030
+     4   1962-01-02 ->  1994-06-20  8,171      26   1994-07-28 ->  2002-07-10  2,003
+    HO                                              2002-07-11 ->  2012-08-23  2,551  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (SPY_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1993-01-29 ->  1993-04-29     63      26   1993-06-08 ->  1997-05-20  1,000
+     1   1993-01-29 ->  1997-05-20  1,089      26   1997-06-27 ->  2005-07-18  2,026
+     2   1993-01-29 ->  2001-06-14  2,115      26   2001-07-24 ->  2013-09-11  3,052
+     3   1993-01-29 ->  2005-07-18  3,141      26   2005-08-24 ->  2013-09-16  2,029
+     4   1993-01-29 ->  2009-08-13  4,167      26   2009-09-22 ->  2013-09-16  1,003
+    HO                                              2013-09-17 ->  2018-11-09  1,299  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (HD_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1981-09-22 ->  1981-12-18     63      26   1982-01-28 ->  1987-06-25  1,368
+     1   1981-09-22 ->  1987-06-25  1,457      26   1987-08-04 ->  1998-07-07  2,762
+     2   1981-09-22 ->  1992-12-29  2,851      26   1993-02-05 ->  2009-08-05  4,156
+     3   1981-09-22 ->  1998-07-07  4,245      26   1998-08-13 ->  2009-08-05  2,762
+     4   1981-09-22 ->  2004-01-22  5,639      26   2004-03-02 ->  2009-08-05  1,368
+    HO                                              2009-08-06 ->  2016-08-01  1,759  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (DE_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1972-06-01 ->  1972-08-29     63      26   1972-10-06 ->  1979-05-17  1,668
+     1   1972-06-01 ->  1979-05-17  1,757      26   1979-06-26 ->  1992-10-09  3,362
+     2   1972-06-01 ->  1986-01-29  3,451      26   1986-03-10 ->  2006-03-22  5,056
+     3   1972-06-01 ->  1992-10-09  5,145      26   1992-11-17 ->  2006-03-28  3,366
+     4   1972-06-01 ->  1999-06-25  6,839      26   1999-08-04 ->  2006-03-28  1,672
+    HO                                              2006-03-29 ->  2014-09-19  2,135  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (AMD_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1980-03-17 ->  1980-06-13     63      26   1980-07-23 ->  1986-02-28  1,417
+     1   1980-03-17 ->  1986-02-28  1,506      26   1986-04-09 ->  1997-07-29  2,860
+     2   1980-03-17 ->  1991-11-12  2,949      26   1991-12-20 ->  2009-01-16  4,303
+     3   1980-03-17 ->  1997-07-29  4,392      26   1997-09-05 ->  2009-01-20  2,861
+     4   1980-03-17 ->  2003-04-25  5,835      26   2003-06-04 ->  2009-01-20  1,418
+    HO                                              2009-01-21 ->  2016-04-13  1,820  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (CVX_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1962-01-02 ->  1962-03-30     63      26   1962-05-09 ->  1970-05-28  2,001
+     1   1962-01-02 ->  1970-05-28  2,090      26   1970-07-07 ->  1986-06-13  4,028
+     2   1962-01-02 ->  1978-06-07  4,117      26   1978-07-17 ->  2002-07-08  6,055
+     3   1962-01-02 ->  1986-06-13  6,144      26   1986-07-23 ->  2002-07-10  4,030
+     4   1962-01-02 ->  1994-06-20  8,171      26   1994-07-28 ->  2002-07-10  2,003
+    HO                                              2002-07-11 ->  2012-08-23  2,551  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (QQQ_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1999-03-10 ->  1999-06-08     63      26   1999-07-16 ->  2002-09-25    803
+     1   1999-03-10 ->  2002-09-25    892      26   2002-11-01 ->  2009-04-28  1,632
+     2   1999-03-10 ->  2006-01-10  1,721      26   2006-02-17 ->  2015-11-25  2,461
+     3   1999-03-10 ->  2009-04-28  2,550      26   2009-06-05 ->  2015-11-25  1,632
+     4   1999-03-10 ->  2012-08-09  3,379      26   2012-09-18 ->  2015-11-25    803
+    HO                                              2015-11-27 ->  2020-02-04  1,053  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (JPM_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1980-03-17 ->  1980-06-13     63      26   1980-07-23 ->  1986-02-28  1,417
+     1   1980-03-17 ->  1986-02-28  1,506      26   1986-04-09 ->  1997-07-29  2,860
+     2   1980-03-17 ->  1991-11-12  2,949      26   1991-12-20 ->  2009-01-16  4,303
+     3   1980-03-17 ->  1997-07-29  4,392      26   1997-09-05 ->  2009-01-20  2,861
+     4   1980-03-17 ->  2003-04-25  5,835      26   2003-06-04 ->  2009-01-20  1,418
+    HO                                              2009-01-21 ->  2016-04-13  1,820  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (MCD_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1966-07-05 ->  1966-09-30     63      26   1966-11-09 ->  1974-04-30  1,856
+     1   1966-07-05 ->  1974-04-30  1,945      26   1974-06-07 ->  1989-03-21  3,738
+     2   1966-07-05 ->  1981-10-09  3,827      26   1981-11-17 ->  2004-02-23  5,620
+     3   1966-07-05 ->  1989-03-21  5,709      26   1989-04-28 ->  2004-02-24  3,739
+     4   1966-07-05 ->  1996-08-28  7,591      26   1996-10-07 ->  2004-02-24  1,857
+    HO                                              2004-02-25 ->  2013-07-23  2,369  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (GOOGL_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2004-08-19 ->  2004-11-16     63      26   2004-12-27 ->  2007-06-22    627
+     1   2004-08-19 ->  2007-06-22    716      26   2007-08-01 ->  2012-08-27  1,280
+     2   2004-08-19 ->  2010-01-26  1,369      26   2010-03-05 ->  2017-11-03  1,933
+     3   2004-08-19 ->  2012-08-27  2,022      26   2012-10-04 ->  2017-11-09  1,284
+     4   2004-08-19 ->  2015-04-06  2,675      26   2015-05-13 ->  2017-11-09    631
+    HO                                              2017-11-10 ->  2021-03-08    834  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (ABT_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1980-03-17 ->  1980-06-13     63      26   1980-07-23 ->  1986-02-28  1,417
+     1   1980-03-17 ->  1986-02-28  1,506      26   1986-04-09 ->  1997-07-29  2,860
+     2   1980-03-17 ->  1991-11-12  2,949      26   1991-12-20 ->  2009-01-16  4,303
+     3   1980-03-17 ->  1997-07-29  4,392      26   1997-09-05 ->  2009-01-20  2,861
+     4   1980-03-17 ->  2003-04-25  5,835      26   2003-06-04 ->  2009-01-20  1,418
+    HO                                              2009-01-21 ->  2016-04-13  1,820  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (XOM_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1962-01-02 ->  1962-03-30     63      26   1962-05-09 ->  1970-05-28  2,001
+     1   1962-01-02 ->  1970-05-28  2,090      26   1970-07-07 ->  1986-06-13  4,028
+     2   1962-01-02 ->  1978-06-07  4,117      26   1978-07-17 ->  2002-07-08  6,055
+     3   1962-01-02 ->  1986-06-13  6,144      26   1986-07-23 ->  2002-07-10  4,030
+     4   1962-01-02 ->  1994-06-20  8,171      26   1994-07-28 ->  2002-07-10  2,003
+    HO                                              2002-07-11 ->  2012-08-23  2,551  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (V_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2008-03-19 ->  2008-06-17     63      26   2008-07-25 ->  2010-08-05    512
+     1   2008-03-19 ->  2010-08-05    601      26   2010-09-14 ->  2014-11-12  1,050
+     2   2008-03-19 ->  2012-09-21  1,139      26   2012-11-01 ->  2019-02-25  1,588
+     3   2008-03-19 ->  2014-11-12  1,677      26   2014-12-22 ->  2019-02-28  1,053
+     4   2008-03-19 ->  2017-01-03  2,215      26   2017-02-10 ->  2019-02-28    515
+    HO                                              2019-03-01 ->  2021-11-19    689  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (WMT_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1972-08-25 ->  1972-11-24     63      26   1973-01-05 ->  1979-08-02  1,661
+     1   1972-08-25 ->  1979-08-02  1,750      26   1979-09-11 ->  1992-12-04  3,348
+     2   1972-08-25 ->  1986-04-07  3,437      26   1986-05-14 ->  2006-04-27  5,035
+     3   1972-08-25 ->  1992-12-04  5,124      26   1993-01-14 ->  2006-04-28  3,349
+     4   1972-08-25 ->  1999-08-11  6,811      26   1999-09-20 ->  2006-04-28  1,662
+    HO                                              2006-05-01 ->  2014-10-07  2,125  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (CAT_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1962-01-02 ->  1962-03-30     63      26   1962-05-09 ->  1970-05-28  2,001
+     1   1962-01-02 ->  1970-05-28  2,090      26   1970-07-07 ->  1986-06-13  4,028
+     2   1962-01-02 ->  1978-06-07  4,117      26   1978-07-17 ->  2002-07-08  6,055
+     3   1962-01-02 ->  1986-06-13  6,144      26   1986-07-23 ->  2002-07-10  4,030
+     4   1962-01-02 ->  1994-06-20  8,171      26   1994-07-28 ->  2002-07-10  2,003
+    HO                                              2002-07-11 ->  2012-08-23  2,551  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (TSLA_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   2010-06-29 ->  2010-09-27     63      26   2010-11-03 ->  2012-07-31    439
+     1   2010-06-29 ->  2012-07-31    528      26   2012-09-07 ->  2016-04-13    904
+     2   2010-06-29 ->  2014-06-09    993      26   2014-07-17 ->  2019-12-20  1,369
+     3   2010-06-29 ->  2016-04-13  1,458      26   2016-05-20 ->  2019-12-20    904
+     4   2010-06-29 ->  2018-02-15  1,923      26   2018-03-27 ->  2019-12-20    439
+    HO                                              2019-12-23 ->  2022-05-06    598  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (UNH_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1984-10-17 ->  1985-01-16     63      26   1985-02-25 ->  1990-03-01  1,268
+     1   1984-10-17 ->  1990-03-01  1,357      26   1990-04-09 ->  2000-05-26  2,562
+     2   1984-10-17 ->  1995-04-12  2,651      26   1995-05-22 ->  2010-09-13  3,856
+     3   1984-10-17 ->  2000-05-26  3,945      26   2000-07-06 ->  2010-09-16  2,565
+     4   1984-10-17 ->  2005-07-22  5,239      26   2005-08-30 ->  2010-09-16  1,271
+    HO                                              2010-09-17 ->  2017-03-15  1,634  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (EOG_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1989-10-04 ->  1990-01-03     63      26   1990-02-09 ->  1994-06-28  1,108
+     1   1989-10-04 ->  1994-06-28  1,197      26   1994-08-05 ->  2003-06-30  2,242
+     2   1989-10-04 ->  1998-12-22  2,331      26   1999-02-02 ->  2012-06-29  3,376
+     3   1989-10-04 ->  2003-06-30  3,465      26   2003-08-07 ->  2012-06-29  2,242
+     4   1989-10-04 ->  2007-12-31  4,599      26   2008-02-08 ->  2012-06-29  1,108
+    HO                                              2012-07-02 ->  2018-03-14  1,434  (holdout 20%)
+
+[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha
+
+  [2mWalk-Forward Folds (DIS_1d, purge=21, embargo=5):[0m
+  Fold        Train ->         End  #Bars   Purge         Test ->         End  #Bars
+  ----  ----------- -- ----------- ------  ------  ----------- -- ----------- ------
+     0   1962-01-02 ->  1962-03-30     63      26   1962-05-09 ->  1970-05-28  2,001
+     1   1962-01-02 ->  1970-05-28  2,090      26   1970-07-07 ->  1986-06-13  4,028
+     2   1962-01-02 ->  1978-06-07  4,117      26   1978-07-17 ->  2002-07-08  6,055
+     3   1962-01-02 ->  1986-06-13  6,144      26   1986-07-23 ->  2002-07-10  4,030
+     4   1962-01-02 ->  1994-06-20  8,171      26   1994-07-28 ->  2002-07-10  2,003
+    HO                                              2002-07-11 ->  2012-08-23  2,551  (holdout 20%)
+
+
+  [2m[23:43:16][0m [92m+ Decision log: C:\Users\dilip\alpha_trade_v2_results\decision_log.json (357 trades)[0m
+  [2m[23:43:16][0m [92m+ Trade CSV: C:\Users\dilip\alpha_trade_v2_results\trade_decisions.csv[0m
+  [2m[23:43:17][0m [92m+ Step decisions: C:\Users\dilip\alpha_trade_v2_results\step_decisions.csv (47349 rows)[0m
+
+  [1m[96m================================================================================================[0m
+  [1m[97m  TRADE DECISION LOG -- 357 Trades across 50 Symbols[0m
+  [1m[96m================================================================================================[0m
+
+  [1m  SYMBOL SUMMARY:[0m
+  Symbol               TF Trades   Win%          P&L  AvgHold
+  ------------------------------------------------------------
+  COF_1d               1d     35  28.6% [92m$+13,574.82[0m     5.5b
+  BLK_1d               1d      5  40.0% [92m$+10,241.92[0m     9.6b
+  TSLA_1d              1d      3  66.7% [92m$ +9,119.33[0m     7.7b
+  ORCL_1d              1d     24  41.7% [92m$ +8,776.83[0m     6.4b
+  GS_1d                1d      7  28.6% [92m$ +7,908.87[0m     8.1b
+  GOOGL_1d             1d     22  40.9% [92m$ +7,715.73[0m     7.0b
+  AMD_1d               1d      2 100.0% [92m$ +6,751.48[0m    11.5b
+  EOG_1d               1d      1 100.0% [92m$ +6,711.80[0m    25.0b
+  COST_1d              1d      1 100.0% [92m$ +6,101.47[0m    25.0b
+  META_1d              1d      1 100.0% [92m$ +4,670.24[0m    16.0b
+  KO_1d                1d      1 100.0% [92m$ +4,225.64[0m    29.0b
+  SLB_1d               1d      1 100.0% [92m$ +3,898.03[0m    12.0b
+  AXP_1d               1d      4  50.0% [92m$ +3,388.13[0m     8.5b
+  ADBE_1d              1d      4  50.0% [92m$ +3,360.55[0m     9.2b
+  BAC_1d               1d      1 100.0% [92m$ +3,247.27[0m    24.0b
+  NFLX_1d              1d      4  75.0% [92m$ +3,224.04[0m    10.5b
+  DIA_1d               1d     20  40.0% [92m$ +3,078.70[0m     5.9b
+  SPY_1d               1d     11  36.4% [92m$ +2,365.03[0m     9.5b
+  NVDA_1d              1d      1 100.0% [92m$ +2,357.96[0m    17.0b
+  AMZN_1d              1d      2  50.0% [92m$ +1,845.52[0m     7.5b
+  JNJ_1d               1d      1 100.0% [92m$ +1,470.81[0m    25.0b
+  INTC_1d              1d      1 100.0% [92m$ +1,457.77[0m    11.0b
+  AAPL_1d              1d      2  50.0% [92m$ +1,329.83[0m     7.5b
+  PG_1d                1d      1 100.0% [92m$ +1,077.03[0m    10.0b
+  QQQ_1d               1d      1 100.0% [92m$ +1,045.00[0m    15.0b
+  MCD_1d               1d      3  33.3% [92m$   +979.67[0m     8.3b
+  LOW_1d               1d      2  50.0% [92m$   +971.83[0m    10.0b
+  V_1d                 1d      1 100.0% [92m$   +693.23[0m    22.0b
+  MA_1d                1d      5  20.0% [92m$   +481.29[0m     8.4b
+  SBUX_1d              1d      2   0.0% [91m$ -1,378.28[0m     8.5b
+  ABT_1d               1d     21  33.3% [91m$ -2,785.59[0m     3.3b
+  XOM_1d               1d      9  33.3% [91m$ -2,874.98[0m     2.4b
+  CVX_1d               1d     11  27.3% [91m$ -3,036.65[0m     2.0b
+  MSFT_1d              1d     16  31.2% [91m$ -3,544.08[0m     3.6b
+  JPM_1d               1d     14  35.7% [91m$ -3,658.93[0m     3.3b
+  NKE_1d               1d     10  20.0% [91m$ -3,659.94[0m     2.3b
+  MS_1d                1d      5  20.0% [91m$ -3,895.26[0m     1.8b
+  PEP_1d               1d      7  28.6% [91m$ -3,983.38[0m     2.3b
+  DE_1d                1d     11  45.5% [91m$ -4,011.52[0m     6.5b
+  CAT_1d               1d      6  16.7% [91m$ -4,029.71[0m     1.7b
+  HD_1d                1d      7  28.6% [91m$ -4,164.22[0m     4.1b
+  DIS_1d               1d      8  37.5% [91m$ -4,201.62[0m     3.0b
+  MRK_1d               1d      9  22.2% [91m$ -4,233.10[0m     3.0b
+  UNH_1d               1d      5   0.0% [91m$ -4,390.08[0m     1.8b
+  PFE_1d               1d      7   0.0% [91m$ -4,470.94[0m     2.4b
+  AVGO_1d              1d      4  25.0% [91m$ -4,863.59[0m     2.5b
+  CRM_1d               1d      3   0.0% [91m$ -5,154.45[0m     1.3b
+  WMT_1d               1d      6   0.0% [91m$ -5,156.96[0m     2.7b
+  PYPL_1d              1d      7  14.3% [91m$ -5,214.76[0m     6.4b
+  COP_1d               1d     22  45.5% [91m$ -6,224.53[0m     4.6b
+
+  [1m  TOP 20 TRADES (by absolute P&L):[0m
+    # Symbol            TF        Entry         Exit     Action        P&L  Bars Result Entry Reason
+  ------------------------------------------------------------------------------------------------------------------------
+    1 COF_1d            1d   2023-10-26   2024-01-03  HALF_LONG [92m$+16,409.63[0m    46 [92m   WIN[0m RSI near oversold; Near lower BB
+    2 BLK_1d            1d   2023-10-30   2024-01-03  HALF_LONG [92m$+11,586.70[0m    44 [92m   WIN[0m RSI oversold; Near lower BB; Strong trend (AD
+    3 GS_1d             1d   2023-10-30   2024-01-03  HALF_LONG [92m$+10,748.54[0m    44 [92m   WIN[0m RSI oversold; Near lower BB; Strong trend (AD
+    4 TSLA_1d           1d   2024-11-29   2024-12-19  HALF_LONG [92m$+10,300.45[0m    14 [92m   WIN[0m Uptrend; Moving avg bullish cross; Strong tre
+    5 COF_1d            1d   2023-05-08   2023-06-15  HALF_LONG [92m$+10,115.77[0m    27 [92m   WIN[0m RSI oversold; Near lower BB
+    6 ORCL_1d           1d   2022-10-03   2022-11-04  HALF_LONG [92m$+8,387.71[0m    24 [92m   WIN[0m RSI oversold; Near lower BB; Strong trend (AD
+    7 GOOGL_1d          1d   2024-11-22   2024-12-20  HALF_LONG [92m$+6,897.36[0m    19 [92m   WIN[0m Near lower BB; Uptrend; Moving avg bullish cr
+    8 EOG_1d            1d   2022-10-14   2022-11-18  HALF_LONG [92m$+6,711.80[0m    25 [92m   WIN[0m MACD bullish; Moving avg bullish cross
+    9 COST_1d           1d   2022-06-17   2022-07-26  HALF_LONG [92m$+6,101.47[0m    25 [92m   WIN[0m RSI near oversold; MACD bullish; Strong trend
+   10 DIA_1d            1d   2023-10-31   2024-01-05  HALF_LONG [92m$+5,730.06[0m    45 [92m   WIN[0m RSI near oversold; Near lower BB
+   11 ADBE_1d           1d   2022-07-15   2022-08-19  HALF_LONG [92m$+4,853.59[0m    25 [92m   WIN[0m MACD bullish; Strong trend (ADX)
+   12 AMD_1d            1d   2021-11-02   2021-12-03  HALF_LONG [92m$+4,839.97[0m    22 [92m   WIN[0m MACD bullish; Uptrend; Moving avg bullish cro
+   13 META_1d           1d   2025-01-24   2025-02-18  HALF_LONG [92m$+4,670.24[0m    16 [92m   WIN[0m MACD bullish; Moving avg bullish cross; Stron
+   14 ABT_1d            1d   2021-11-24   2022-01-03  HALF_LONG [92m$+4,584.00[0m    26 [92m   WIN[0m RSI near oversold; Near lower BB; Uptrend; Mo
+   15 ORCL_1d           1d   2022-07-14   2022-08-09  HALF_LONG [92m$+4,511.49[0m    18 [92m   WIN[0m MACD bullish
+   16 GOOGL_1d          1d   2024-09-10   2024-10-08  HALF_LONG [92m$+4,405.50[0m    20 [92m   WIN[0m RSI oversold; Near lower BB; Strong trend (AD
+   17 COP_1d            1d   2022-06-16   2022-06-17  HALF_LONG [91m$-4,331.26[0m     1 [91m  LOSS[0m Uptrend; Moving avg bullish cross; Strong tre
+   18 KO_1d             1d   2020-01-08   2020-02-20  HALF_LONG [92m$+4,225.64[0m    29 [92m   WIN[0m Uptrend; Moving avg bullish cross; Strong tre
+   19 COP_1d            1d   2022-06-27   2022-07-01  HALF_LONG [91m$-3,952.84[0m     4 [91m  LOSS[0m RSI oversold; Near lower BB; Strong trend (AD
+   20 SLB_1d            1d   2022-01-04   2022-01-21  HALF_LONG [92m$+3,898.03[0m    12 [92m   WIN[0m MACD bullish
+
+  [1m  AGGREGATE STATS:[0m
+  Total P&L:     [92m$  +37,137.25[0m
+  Win/Loss:      126W / 231L (35.3%)
+  Avg Win:       $+1,925.08
+  Avg Loss:      $-889.28
+  Avg Hold:      5.5 bars
+  Reward/Risk:   2.16
+
+  [1m  TOP ENTRY REASONS:[0m
+  ###################   212 ( 59.4%) Strong trend (ADX)
+  ###################   209 ( 58.5%) Near lower BB
+  ##############        160 ( 44.8%) Uptrend
+  #############         147 ( 41.2%) Moving avg bullish cross
+  ###########           119 ( 33.3%) RSI oversold
+  ########               88 ( 24.6%) RSI near oversold
+  #######                78 ( 21.8%) MACD bullish
+                          3 (  0.8%) Policy network decision
+
+  [96m================================================================================================[0m
+
+[2m-------------------- [96m[1mWALK-FORWARD ALPHA VALIDATION (WS1A)[0m[2m --------------------[0m
+  [2m[23:43:17][0m [96mi Running purged walk-forward CV on training data...[0m
+  [2m[23:43:17][0m [96mi   Each alpha evaluated for significance via t-stat, deflated Sharpe,[0m
+  [2m[23:43:17][0m [96mi   OOS/IS decay ratio, and probability of backtest overfitting (PBO)[0m
+
+  [2m[23:43:17][0m [96mi Parallelizing walk-forward validation across 18 workers (50 datasets)[0m
+
+  [1m[96m=== WALK-FORWARD ALPHA VALIDATION (WS1A) ===[0m
+  Datasets: 50  |  CV folds: 250  |  Purge gap: 21 bars  |  Embargo: 5 bars
+
+Traceback (most recent call last):
+  File "D:\Experiments\Trading\alphago_layering.py", line 2765, in <module>
+    main()
+  File "D:\Experiments\Trading\alphago_layering.py", line 2214, in main
+    wf_validation = validate_alphas_walkforward(
+  File "D:\Experiments\Trading\alphago_layering.py", line 1368, in validate_alphas_walkforward
+    print("  " + table.render().replace("\n", "\n  "))
+  File "C:\Users\dilip\AppData\Local\Programs\Python\Python310\lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 2-109: character maps to <undefined>
