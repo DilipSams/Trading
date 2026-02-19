@@ -54,6 +54,7 @@ import json
 import math
 from copy import copy
 from datetime import datetime
+from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
@@ -67,7 +68,8 @@ if script_dir not in sys.path:
 try:
     from alphago_trading_system import (
         Config, AlphaTradeSystem, SyntheticMarketGenerator, TradingEnv,
-        prepare_datasets, download_data, load_from_dir, build_network,
+        prepare_datasets, download_data, load_from_dir, load_from_norgate,
+        NORGATE_DIR, NORGATE_DATABASES, build_network,
         unwrap_net, DEFAULT_SYMBOLS, HAS_YF, NUM_FEATURES,
         print_box, print_divider, print_gpu_info, tprint, C,
         build_feature_matrix, compute_indicators,  # For RL observation construction
@@ -1776,7 +1778,14 @@ Examples:
     g.add_argument("--symbols", type=str, default="",
                    help="Comma-separated symbols (e.g. AAPL,MSFT,NVDA)")
     g.add_argument("--n-symbols", type=int, default=50)
-    g.add_argument("--data-dir", type=str, default="")
+    g.add_argument("--data-dir", type=str, default="",
+                   help="Load from a directory of CSV/Parquet files")
+    g.add_argument("--norgate-dir", type=str, default="",
+                   help="Override Norgate data path (default: D:\\Experiments\\norgate_data)")
+    g.add_argument("--norgate-db", type=str, default="",
+                   help="Comma-separated Norgate databases (e.g. US_Equities,US_Equities_Delisted)")
+    g.add_argument("--yahoo", action="store_true",
+                   help="Use Yahoo Finance instead of Norgate (survivorship-biased)")
 
     # Training
     g = p.add_argument_group("Training")
@@ -1814,16 +1823,12 @@ Examples:
                    help="L3 target annual volatility (default: 0.15)")
     g.add_argument("--max-leverage", type=float, default=2.0)
 
-    # Data Caching
+    # Data Caching (Yahoo Finance only)
     g = p.add_argument_group("Data Caching")
-    g.add_argument("--cache-dir", type=str, default="data_cache",
-                   help="Directory for cached market data (default: data_cache)")
-    g.add_argument("--cache-max-age", type=float, default=24.0,
-                   help="Maximum cache age in hours before prompting for re-download (default: 24)")
-    g.add_argument("--force-download", action="store_true",
-                   help="Force re-download of data, ignoring cache")
+    g.add_argument("--cache", action="store_true",
+                   help="Enable Yahoo Finance data caching (disabled by default)")
     g.add_argument("--no-cache", action="store_true",
-                   help="Disable caching entirely")
+                   help="(Deprecated, caching is already off by default)")
     g.add_argument("--kelly-fraction", type=float, default=0.25)
     g.add_argument("--no-trade-threshold", type=float, default=0.005)  # Lowered from 0.02 (2%) to 0.005 (0.5%) based on persistence analysis
 
@@ -2094,38 +2099,52 @@ def main():
     # STEP 4: Load data
     # **********************************************************************
     print_divider("DATA LOADING")
-    tprint("Loading historical price data (like looking at past stock charts) for training.", "info")
-    data = {}
+    tprint("Loading historical price data for training.", "info")
+    data = None
+    data_source = "unknown"
 
-    if args.data_dir:
-        tprint(f"Loading from directory: {args.data_dir}", "info")
+    if args.yahoo:
+        data_source = "Yahoo Finance (survivorship-biased)"
+        if not HAS_YF:
+            tprint("--yahoo requires yfinance: pip install yfinance", "err"); return
+        syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+                if args.symbols else DEFAULT_SYMBOLS[:min(args.n_symbols, 53)])
+        tprint(f"Data source: {data_source}", "warn")
+        tprint("  Backtest results will be upward-biased. Use Norgate PIT data for valid results.", "warn")
+        data = download_data(syms, cfg, use_cache=args.cache)
+    elif args.data_dir:
+        data_source = f"Local directory: {args.data_dir}"
+        tprint(f"Data source: {data_source}", "info")
         data = load_from_dir(args.data_dir, cfg.min_bars)
-    elif args.synthetic or not HAS_YF:
-        if not HAS_YF and not args.synthetic:
-            tprint("yfinance not installed -- using synthetic data", "warn")
-        tprint(f"Generating {args.n_synthetic} synthetic symbols...", "info")
-        data = SyntheticMarketGenerator(cfg).generate_multiple(
-            args.n_synthetic, 2000
-        )
+    elif args.synthetic:
+        data_source = f"Synthetic ({args.n_synthetic} instruments)"
+        tprint(f"Data source: {data_source}", "info")
+        data = SyntheticMarketGenerator(cfg).generate_multiple(args.n_synthetic, 2000)
     else:
-        if args.symbols:
-            syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        else:
-            syms = DEFAULT_SYMBOLS[:min(args.n_symbols, 53)]
-        tprint(f"Downloading {len(syms)} symbols...", "info")
+        norgate_dir = args.norgate_dir or NORGATE_DIR
+        norgate_dbs = ([d.strip() for d in args.norgate_db.split(",") if d.strip()]
+                       if args.norgate_db else None)
+        norgate_syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+                        if args.symbols else None)
 
-        # Handle cache parameters
-        cache_kwargs = {}
-        if not args.no_cache:
-            cache_kwargs['cache_dir'] = args.cache_dir
-            cache_kwargs['cache_max_age_hours'] = args.cache_max_age
-            cache_kwargs['force_download'] = args.force_download
+        if not Path(norgate_dir).exists():
+            tprint(f"Norgate data not found at: {norgate_dir}", "err")
+            tprint("Run norgate_download_all.py first, or use --yahoo / --synthetic", "err")
+            return
 
-        data = download_data(syms, cfg, **cache_kwargs) if not args.no_cache else download_data(syms, cfg)
+        db_list = norgate_dbs or [db for db, info in NORGATE_DATABASES.items() if info["has_volume"]]
+        data_source = f"Norgate PIT data: {norgate_dir}"
+        tprint(f"Data source: {data_source}", "ok")
+        tprint(f"  Databases: {', '.join(db_list)}", "info")
+        if norgate_syms:
+            tprint(f"  Symbols filter: {', '.join(norgate_syms[:10])}"
+                   f"{'...' if len(norgate_syms) > 10 else ''}", "info")
+        data = load_from_norgate(norgate_dir, databases=norgate_dbs,
+                                 symbols=norgate_syms, mb=cfg.min_bars)
 
     if not data:
-        tprint("No data! Use --synthetic or --data-dir", "err")
-        return
+        tprint(f"No data loaded from: {data_source}", "err")
+        tprint("Check your data source or use --synthetic", "err"); return
 
     tprint(f"Loaded {len(data)} datasets", "ok")
 
@@ -2170,7 +2189,7 @@ def main():
 
             fields = [c for c in ("open", "high", "low", "close", "volume") if c in df_q.columns]
             meta = DataLoadMeta(
-                source="yfinance" if not args.synthetic else "synthetic",
+                source=data_source,
                 symbols=[sym], timeframe=tf,
                 requested_start=str(args.start) if hasattr(args, "start") else "N/A",
                 requested_end=str(args.end) if hasattr(args, "end") else "N/A",

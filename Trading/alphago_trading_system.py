@@ -238,11 +238,11 @@ class Config:
     n_iterations: int = 8
     total_timesteps_per_iter: int = 100_000
     champion_margin: float = 0.1        # Additive margin (was multiplicative -- broken on negatives)
-    # MCTS
-    mcts_rollouts: int = 32
-    mcts_exploration: float = 1.414
+    # MCTS — Deep Search (AlphaGo-style 15-20 step lookahead)
+    mcts_rollouts: int = 256            # UP from 32: 8x more sims → tree depth ~10-12
+    mcts_exploration: float = 1.0       # DOWN from 1.414: deeper principal variation
     mcts_temperature: float = 1.0
-    mcts_batch_size: int = 128          # GPU-optimized: 4x larger (was 32)
+    mcts_batch_size: int = 64           # DOWN from 128: fewer roots, more rollouts per root
     # Environment -- target-position action space
     # Actions represent target exposure: {-1.0, -0.5, 0, +0.5, +1.0}
     # Enables: long, short, flat, continuous sizing -- all native
@@ -283,7 +283,20 @@ class Config:
     # MCTS planning realism
     mcts_stochastic: bool = True           # Use stochastic rollouts (not realized tape)
     mcts_bootstrap_block: int = 5          # Block size for regime-conditioned bootstrap
-    mcts_sim_horizon: int = 20             # Max bars of synthetic future per rollout
+    mcts_sim_horizon: int = 60             # UP from 20: support 60-bar (3-month) lookahead
+    # Virtual Loss (AlphaGo parallel exploration trick)
+    mcts_virtual_loss: float = 3.0        # Magnitude of virtual loss (discourages revisiting)
+    mcts_use_virtual_loss: bool = True    # Enable virtual loss for deeper tree exploration
+    # Progressive Widening (reduce effective branching 5→3 for deeper search)
+    mcts_progressive_widening: bool = True  # Expand only top-K children initially
+    mcts_pw_alpha: float = 0.5           # Widen when N^alpha > |children|
+    mcts_pw_max_children: int = 3        # Hard cap: start with top-3 by prior probability
+    # Continuation Rollouts (add +5 depth per rollout cheaply, no GPU)
+    mcts_continuation_steps: int = 5     # Extra greedy steps after leaf expansion
+    # Iterative Deepening (scale rollouts with training iteration)
+    mcts_schedule_enabled: bool = True   # Scale rollouts as value network improves
+    mcts_schedule_base: int = 64         # Rollouts at iteration 2 (shallow, network still weak)
+    mcts_schedule_max: int = 512         # Rollouts at final iteration (full depth)
     # --- Institutional splitting / leakage control ---
     val_ratio: float = 0.10                # Fraction for validation (time-based)
     holdout_ratio: float = 0.10            # Fraction for holdout (never seen in training)
@@ -2603,11 +2616,11 @@ class GPUPPOTrainer:
                 "kl": tkl / max(nu, 1), "risk_loss": trl / max(nu, 1), "nu": nu,
                 "grad_norm": tgn / max(nu, 1), "lr": cur_lr, "ent_coef_used": ent_coef}
 
-    def distill_mcts(self, states, mcts_policies):
+    def distill_mcts(self, states, mcts_policies, n_distill_steps=5):
         """
         Distill MCTS search results into the policy network.
         Minimizes KL(-_mcts || -_net) so the network learns from planning.
-        Fix #6: Uses random minibatches instead of full tensor per step.
+        n_distill_steps scales with search depth (deeper search = more distillation).
         """
         if len(states) == 0:
             return 0.0
@@ -2628,7 +2641,7 @@ class GPUPPOTrainer:
         total_loss = 0.0; valid_steps = 0
         N = len(states)
         bs = min(self.cfg.batch_size, N)
-        n_steps = min(5, max(1, N // bs + 1))
+        n_steps = min(n_distill_steps, max(1, N // bs + 1))
         for _ in range(n_steps):
             # Fix #6: Random minibatch instead of full forward pass
             ix = torch.randint(0, N, (bs,), device=DEVICE)
@@ -3198,14 +3211,23 @@ class AlphaTradeSystem:
                 tprint(f"Diagnostics: ent={avg_ent:.3f}[{ent_status}] grad_norm={avg_gn:.3f} "
                        f"lr={cur_lr:.2e} pl={um.get('pl',0):.4f} vl={um.get('vl',0):.4f} "
                        f"kl={um.get('kl',0):.4f}", "info")
-            # MCTS -- Forward simulation + distillation into policy (point #5)
+            # MCTS -- Deep search + distillation into policy (AlphaGo-style)
             if self.cfg.mcts_rollouts>0 and it>1:
-                tprint(f"MCTS planning + distillation ({self.cfg.mcts_rollouts} rollouts) [PARALLEL]...","info")
-                # Use parallel MCTS for 10-20x speedup on GPU
+                # Iterative deepening: scale rollouts as value network improves
+                if getattr(self.cfg, 'mcts_schedule_enabled', False):
+                    progress = (it - 2) / max(self.cfg.n_iterations - 2, 1)
+                    n_rollouts = int(self.cfg.mcts_schedule_base +
+                                     progress * (self.cfg.mcts_schedule_max - self.cfg.mcts_schedule_base))
+                    n_rollouts = 2 ** round(math.log2(max(n_rollouts, 8)))  # Round to power of 2
+                else:
+                    n_rollouts = self.cfg.mcts_rollouts
+                tprint(f"MCTS deep search ({n_rollouts} rollouts, "
+                       f"horizon={self.cfg.mcts_sim_horizon}) [PARALLEL]...","info")
+                # Use parallel MCTS with deep search
                 try:
                     from alphago_mcts_parallel import ParallelMCTSPlanner
                     mcts=ParallelMCTSPlanner(unwrap_net(cnet),self.cfg)
-                    tprint("ParallelMCTSPlanner loaded (GPU-optimized 10-20x faster)","gpu")
+                    tprint("ParallelMCTSPlanner loaded (deep search: virtual loss + progressive widening)","gpu")
                 except ImportError as e:
                     mcts=BatchedMCTSPlanner(unwrap_net(cnet),self.cfg)
                     tprint(f"Fallback to BatchedMCTSPlanner: {e}","warn")
@@ -3214,7 +3236,10 @@ class AlphaTradeSystem:
                 for d in sel[:3]:
                     env=TradingEnv(d.features_train,d.prices_train,self.cfg,d.symbol)
                     env.reset()
-                    n_roots = min(self.cfg.mcts_batch_size, d.n_train - self.cfg.window_size - 5)
+                    # Scale down roots inversely with rollout count to keep time budget
+                    max_roots = min(self.cfg.mcts_batch_size, d.n_train - self.cfg.window_size - 5)
+                    scale_factor = max(1, n_rollouts // 64)
+                    n_roots = max(16, max_roots // scale_factor)
                     if n_roots < 2:
                         continue
 
@@ -3271,9 +3296,20 @@ class AlphaTradeSystem:
                         root_obs.append(e._obs())
 
                     if root_envs:
-                        improved = mcts.batch_search(root_envs)
+                        improved = mcts.batch_search(root_envs, n_rollouts=n_rollouts)
                         all_mcts_states.extend(root_obs)
                         all_mcts_policies.extend(improved)
+                # Log tree depth statistics
+                if hasattr(mcts, '_tree_depth') and hasattr(mcts, '_principal_variation_depth'):
+                    try:
+                        # Access the last search's roots via a quick re-check isn't possible,
+                        # but we can log the rollout count and expected depth
+                        pw_str = "PW=3" if getattr(self.cfg, 'mcts_progressive_widening', False) else "PW=off"
+                        cont_str = f"+{getattr(self.cfg, 'mcts_continuation_steps', 0)}cont"
+                        tprint(f"MCTS depth: {n_rollouts} rollouts, {pw_str}, {cont_str}, "
+                               f"est. PV depth ~{int(np.log(n_rollouts)/np.log(1/0.4))+getattr(self.cfg,'mcts_continuation_steps',0)}","info")
+                    except Exception:
+                        pass
                 # DISTILL: train policy to match MCTS-improved distribution
                 if all_mcts_states:
                     states_arr=np.array(all_mcts_states)
@@ -3286,8 +3322,11 @@ class AlphaTradeSystem:
                         states_arr=states_arr[valid_mask]
                         policies_arr=policies_arr[valid_mask]
                     if len(states_arr)>0:
-                        kl_loss=trainer.distill_mcts(states_arr, policies_arr)
-                        tprint(f"MCTS distilled: {len(states_arr)} states, KL={kl_loss:.4f}","ok")
+                        # Scale distillation steps with search depth
+                        distill_steps = min(10, max(5, n_rollouts // 64))
+                        kl_loss=trainer.distill_mcts(states_arr, policies_arr, n_distill_steps=distill_steps)
+                        tprint(f"MCTS distilled: {len(states_arr)} states, KL={kl_loss:.4f} "
+                               f"(distill_steps={distill_steps})","ok")
                     else:
                         tprint("MCTS: all policy rows invalid after filtering","warn")
                 else:
@@ -3905,84 +3944,47 @@ DEFAULT_SYMBOLS=["SPY","QQQ","DIA","AAPL","MSFT","AMZN","GOOGL","META","NVDA","T
 YF_INTRADAY_MAX_PERIOD={"1m":"7d","2m":"60d","5m":"60d","15m":"60d","30m":"60d",
     "60m":"730d","1h":"730d","90m":"60d","1d":"max","5d":"max","1wk":"max","1mo":"max"}
 
-def download_data(symbols,cfg,cache_dir="data_cache",cache_max_age_hours=24,force_download=False):
-    """Download market data with caching and user prompts.
+def download_data(symbols, cfg, cache_dir="data_cache", use_cache=False):
+    """Download market data from Yahoo Finance.
 
     Args:
         symbols: List of ticker symbols
         cfg: Configuration object
         cache_dir: Directory for cached data (default: "data_cache")
-        cache_max_age_hours: Maximum age of cached data in hours (default: 24)
-        force_download: Skip cache and force re-download (default: False)
+        use_cache: Enable read/write cache (default: False, requires --cache flag)
     """
     if not HAS_YF: tprint("yfinance not installed","err");return {}
 
     import threading
     import pickle
     from pathlib import Path
-    from datetime import datetime, timedelta
-
-    # Setup cache directory
-    cache_path = Path(cache_dir)
-    cache_path.mkdir(exist_ok=True)
+    from datetime import datetime
 
     tfs=cfg.timeframes;data={};lock=threading.Lock()
     total=len(symbols)*len(tfs);done=[0];fail=[0];st=time.time()
 
-    # Check cache
-    use_cache = True
-    cache_file = cache_path / f"market_data_{'_'.join(sorted(symbols)[:3])}_{len(symbols)}syms_{'_'.join(tfs)}.pkl"
-    cache_meta_file = cache_path / f"{cache_file.stem}_meta.txt"
+    # Check cache only if explicitly enabled
+    if use_cache:
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(exist_ok=True)
+        cache_file = cache_path / f"market_data_{'_'.join(sorted(symbols)[:3])}_{len(symbols)}syms_{'_'.join(tfs)}.pkl"
+        cache_meta_file = cache_path / f"{cache_file.stem}_meta.txt"
 
-    if cache_file.exists() and cache_meta_file.exists() and not force_download:
-        # Read cache metadata
-        with open(cache_meta_file, 'r') as f:
-            cache_time_str = f.read().strip()
-
-        try:
-            cache_time = datetime.fromisoformat(cache_time_str)
-            age_hours = (datetime.now() - cache_time).total_seconds() / 3600
-
-            tprint(f"Found cached data from {cache_time.strftime('%Y-%m-%d %H:%M:%S')} ({age_hours:.1f}h ago)", "info")
-
-            if age_hours < cache_max_age_hours:
-                # Cache is fresh
-                response = input(f"\n  Use cached data? (Y/n): ").strip().lower()
-                if response in ('', 'y', 'yes'):
-                    tprint("Loading from cache...", "info")
-                    with open(cache_file, 'rb') as f:
-                        data = pickle.load(f)
-
-                    tc=defaultdict(int);tb=defaultdict(int)
-                    for k,v in data.items(): t=k.rsplit("_",1)[-1];tc[t]+=1;tb[t]+=len(v)
-                    tprint(f"Loaded {len(data)} datasets from cache", "ok")
-                    for tf in tfs: tprint(f"  {tf:>4s}: {tc[tf]:>3d} syms {tb[tf]:>10,d} bars","info")
-                    return data
-                else:
-                    tprint("Re-downloading data...", "info")
-                    use_cache = False
-            else:
-                # Cache is stale
-                response = input(f"\n  Cache is {age_hours:.1f}h old (>{cache_max_age_hours}h). Re-download? (Y/n): ").strip().lower()
-                if response in ('', 'y', 'yes'):
-                    tprint("Re-downloading fresh data...", "info")
-                    use_cache = False
-                else:
-                    tprint("Using stale cache (user override)...", "warn")
-                    with open(cache_file, 'rb') as f:
-                        data = pickle.load(f)
-
-                    tc=defaultdict(int);tb=defaultdict(int)
-                    for k,v in data.items(): t=k.rsplit("_",1)[-1];tc[t]+=1;tb[t]+=len(v)
-                    tprint(f"Loaded {len(data)} datasets from cache", "ok")
-                    for tf in tfs: tprint(f"  {tf:>4s}: {tc[tf]:>3d} syms {tb[tf]:>10,d} bars","info")
-                    return data
-        except Exception as e:
-            tprint(f"Cache metadata error: {e}, re-downloading...", "warn")
-            use_cache = False
-    else:
-        if not force_download:
-            tprint("No cache found, downloading fresh data...", "info")
+        if cache_file.exists() and cache_meta_file.exists():
+            try:
+                with open(cache_meta_file, 'r') as f:
+                    cache_time = datetime.fromisoformat(f.read().strip())
+                age_hours = (datetime.now() - cache_time).total_seconds() / 3600
+                tprint(f"Found cached data from {cache_time:%Y-%m-%d %H:%M:%S} ({age_hours:.1f}h ago)", "info")
+                with open(cache_file, 'rb') as f:
+                    data = pickle.load(f)
+                tc=defaultdict(int);tb=defaultdict(int)
+                for k,v in data.items(): t=k.rsplit("_",1)[-1];tc[t]+=1;tb[t]+=len(v)
+                tprint(f"Loaded {len(data)} datasets from cache", "ok")
+                for tf in tfs: tprint(f"  {tf:>4s}: {tc[tf]:>3d} syms {tb[tf]:>10,d} bars","info")
+                return data
+            except Exception as e:
+                tprint(f"Cache read error: {e}, downloading fresh...", "warn")
 
     # Download data
     tprint(f"Downloading {len(symbols)} symbols x {len(tfs)} TFs = {total} jobs", "info")
@@ -4008,8 +4010,8 @@ def download_data(symbols,cfg,cache_dir="data_cache",cache_max_age_hours=24,forc
         futs=[pool.submit(_dl,s,t) for s in symbols for t in tfs]
         for f in as_completed(futs): pass
 
-    # Save to cache
-    if data:
+    # Save to cache only if explicitly enabled
+    if use_cache and data:
         try:
             with open(cache_file, 'wb') as f:
                 pickle.dump(data, f)
@@ -4017,7 +4019,7 @@ def download_data(symbols,cfg,cache_dir="data_cache",cache_max_age_hours=24,forc
                 f.write(datetime.now().isoformat())
             tprint(f"Cached data to {cache_file}", "info")
         except Exception as e:
-            tprint(f"Failed to cache data: {e}", "warn")
+            tprint(f"Failed to cache: {e}", "warn")
 
     tc=defaultdict(int);tb=defaultdict(int)
     for k,v in data.items(): t=k.rsplit("_",1)[-1];tc[t]+=1;tb[t]+=len(v)
@@ -4047,15 +4049,129 @@ def load_from_dir(dd,mb=200):
         except: pass
     tprint(f"Loaded {len(data)} symbols","ok"); return data
 
+# ── Norgate Data loader (PIT-safe, reads from norgate_download_all.py output) ──
+NORGATE_DIR = r"D:\Experiments\norgate_data"
+NORGATE_DATABASES = {
+    "US_Equities":          {"has_volume": True,  "desc": "Active US stocks (PIT-adjusted)"},
+    "US_Equities_Delisted": {"has_volume": True,  "desc": "Delisted US stocks (survivorship-bias-free)"},
+    "US_Indices":           {"has_volume": True,  "desc": "US market indices (S&P 500, Nasdaq, etc.)"},
+    "World_Indices":        {"has_volume": True,  "desc": "Global market indices"},
+    "Continuous_Futures":   {"has_volume": True,  "desc": "Continuous futures contracts"},
+    "Cash_Commodities":     {"has_volume": False, "desc": "Cash commodity indices"},
+    "Forex_Spot":           {"has_volume": False, "desc": "Spot FX rates"},
+    "Economic":             {"has_volume": False, "desc": "Economic indicators (CPI, GDP, etc.)"},
+}
+
+def load_from_norgate(norgate_dir=NORGATE_DIR, databases=None, symbols=None, mb=200):
+    """Load data from local Norgate parquet files (downloaded by norgate_download_all.py).
+
+    Args:
+        norgate_dir: Root directory containing database subfolders.
+        databases:   List of database folder names to load (default: all with volume).
+        symbols:     Optional list of specific symbols to load (case-insensitive).
+        mb:          Minimum bars required per symbol.
+    Returns:
+        dict of {symbol: DataFrame[OHLCV]} ready for prepare_datasets().
+    """
+    base = Path(norgate_dir)
+    if not base.exists():
+        tprint(f"Norgate dir not found: {norgate_dir}", "err")
+        return {}
+
+    # Default: only databases that have volume data (tradeable instruments)
+    if databases is None:
+        databases = [db for db, info in NORGATE_DATABASES.items() if info["has_volume"]]
+
+    sym_filter = None
+    if symbols:
+        sym_filter = {s.upper() for s in symbols}
+
+    data = {}
+    st = time.time()
+    total_files = 0
+    total_loaded = 0
+    total_skipped = 0
+
+    for db_name in databases:
+        db_dir = base / db_name
+        if not db_dir.exists():
+            tprint(f"  {db_name}: folder not found, skipping", "warn")
+            continue
+
+        files = sorted(db_dir.glob("*.parquet"))
+        total_files += len(files)
+        db_loaded = 0
+
+        for fp in files:
+            sym = fp.stem.upper()
+            if sym_filter and sym not in sym_filter:
+                continue
+            try:
+                df = pd.read_parquet(fp)
+                # Build OHLCV — fill Volume=0 for databases without it
+                cols = {}
+                for c in df.columns:
+                    cl = c.lower().strip()
+                    if cl == "open": cols[c] = "Open"
+                    elif cl == "high": cols[c] = "High"
+                    elif cl == "low": cols[c] = "Low"
+                    elif cl == "close" and "unadj" not in cl.replace(" ", ""): cols[c] = "Close"
+                    elif cl in ("volume", "vol"): cols[c] = "Volume"
+                df = df.rename(columns=cols)
+
+                need = {"Open", "High", "Low", "Close"}
+                if not need.issubset(df.columns):
+                    total_skipped += 1
+                    continue
+
+                if "Volume" in df.columns:
+                    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                else:
+                    df = df[["Open", "High", "Low", "Close"]].dropna()
+                    df["Volume"] = 0.0
+
+                if len(df) < mb:
+                    total_skipped += 1
+                    continue
+
+                # Key format: SYM_1d (parsed by prepare_datasets to extract timeframe)
+                key = f"{sym}_1d"
+                if key in data:
+                    # Collision: e.g. same ticker in US_Equities and US_Equities_Delisted
+                    key = f"{sym}_{db_name}_1d"
+                data[key] = df
+                db_loaded += 1
+            except Exception:
+                total_skipped += 1
+
+        total_loaded += db_loaded
+        tprint(f"  {db_name + ':':.<30s} {db_loaded:>5} symbols loaded ({len(files)} files)", "info")
+
+    elapsed = time.time() - st
+    tprint(f"Norgate: {total_loaded} symbols from {len(databases)} databases "
+           f"({total_skipped} skipped, {elapsed:.1f}s)", "ok")
+    return data
+
 
 # ============================================================================
 # CLI & MAIN
 # ============================================================================
 def parse_args():
     p=argparse.ArgumentParser(description="Alpha-Trade v3.0 GPU-Accelerated")
-    p.add_argument("--data-dir",type=str,default="")
-    p.add_argument("--symbols",type=str,default="")
-    p.add_argument("--n-symbols",type=int,default=50)
+    p.add_argument("--data-dir",type=str,default="",
+                   help="Load from a directory of CSV/Parquet files")
+    p.add_argument("--norgate-dir",type=str,default="",
+                   help="Override Norgate data path (default: D:\\Experiments\\norgate_data)")
+    p.add_argument("--norgate-db",type=str,default="",
+                   help="Comma-separated Norgate databases (e.g. US_Equities,US_Equities_Delisted)")
+    p.add_argument("--yahoo",action="store_true",
+                   help="Use Yahoo Finance instead of Norgate (survivorship-biased)")
+    p.add_argument("--cache",action="store_true",
+                   help="Enable Yahoo Finance data caching (disabled by default)")
+    p.add_argument("--symbols",type=str,default="",
+                   help="Comma-separated symbols to load (filters Norgate, or selects Yahoo symbols)")
+    p.add_argument("--n-symbols",type=int,default=50,
+                   help="Number of default symbols for --yahoo mode (default: 50)")
     p.add_argument("--timeframes",type=str,default="5m,15m,30m,1h,1d")
     p.add_argument("--iterations",type=int,default=3)        # v7.0 optimal: 3 iterations
     p.add_argument("--steps-per-iter",type=int,default=50_000)  # v7.0 optimal: 50k per iter (3 × 50k = 150k total)
@@ -4098,18 +4214,55 @@ def main():
            f"Deflated Sharpe threshold: p<{cfg.deflated_sharpe_threshold}","info")
 
     print_divider("DATA LOADING")
-    if args.data_dir: data=load_from_dir(args.data_dir,cfg.min_bars)
-    elif args.synthetic or not HAS_YF:
-        tprint("Generating synthetic data...","info")
-        data=SyntheticMarketGenerator(cfg).generate_multiple(args.n_synthetic,2000)
+    # --- Data source: explicit flags > Norgate (default) ---
+    # Priority: --yahoo > --data-dir > --synthetic > Norgate (default)
+    # If none of the explicit flags are set, Norgate is used.
+    # If Norgate data is missing, pipeline stops (no silent fallback).
+    data = None
+    data_source = "unknown"
+
+    if args.yahoo:
+        data_source = "Yahoo Finance (survivorship-biased)"
+        if not HAS_YF:
+            tprint("--yahoo requires yfinance: pip install yfinance", "err"); return
+        syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+                if args.symbols else DEFAULT_SYMBOLS[:min(args.n_symbols, 50)])
+        tprint(f"Data source: {data_source}", "warn")
+        tprint("  Backtest results will be upward-biased. Use Norgate PIT data for valid results.", "warn")
+        data = download_data(syms, cfg, use_cache=args.cache)
+    elif args.data_dir:
+        data_source = f"Local directory: {args.data_dir}"
+        tprint(f"Data source: {data_source}", "info")
+        data = load_from_dir(args.data_dir, cfg.min_bars)
+    elif args.synthetic:
+        data_source = f"Synthetic ({args.n_synthetic} instruments)"
+        tprint(f"Data source: {data_source}", "info")
+        data = SyntheticMarketGenerator(cfg).generate_multiple(args.n_synthetic, 2000)
     else:
-        syms=[s.strip().upper() for s in args.symbols.split(",") if s.strip()] if args.symbols else DEFAULT_SYMBOLS[:min(args.n_symbols,50)]
-        if not args.symbols:
-            tprint("SURVIVORSHIP BIAS WARNING: Using current S&P 500 constituents. "
-                   "Backtest results will be upward-biased. Use --symbols or "
-                   "--data-dir with PIT data for valid results.", "warn")
-        data=download_data(syms,cfg)
-    if not data: tprint("No data. Use --synthetic","err");return
+        norgate_dir = args.norgate_dir or NORGATE_DIR
+        norgate_dbs = ([d.strip() for d in args.norgate_db.split(",") if d.strip()]
+                       if args.norgate_db else None)
+        norgate_syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+                        if args.symbols else None)
+
+        if not Path(norgate_dir).exists():
+            tprint(f"Norgate data not found at: {norgate_dir}", "err")
+            tprint("Run norgate_download_all.py first, or use --yahoo / --synthetic", "err")
+            return
+
+        db_list = norgate_dbs or [db for db, info in NORGATE_DATABASES.items() if info["has_volume"]]
+        data_source = f"Norgate PIT data: {norgate_dir}"
+        tprint(f"Data source: {data_source}", "ok")
+        tprint(f"  Databases: {', '.join(db_list)}", "info")
+        if norgate_syms:
+            tprint(f"  Symbols filter: {', '.join(norgate_syms[:10])}"
+                   f"{'...' if len(norgate_syms) > 10 else ''}", "info")
+        data = load_from_norgate(norgate_dir, databases=norgate_dbs,
+                                 symbols=norgate_syms, mb=cfg.min_bars)
+
+    if not data:
+        tprint(f"No data loaded from: {data_source}", "err")
+        tprint("Check your data source or use --synthetic", "err"); return
 
     print_divider("FEATURE ENGINEERING")
     datasets=prepare_datasets(data,cfg)
