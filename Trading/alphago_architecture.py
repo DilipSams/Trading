@@ -68,7 +68,10 @@ try:
     CROWDING_AVAILABLE = True
 except ImportError:
     CROWDING_AVAILABLE = False
-    print("[WARNING] alphago_crowding.py not found - crowding detection disabled")
+    # Only warn in main process (workers re-import and spam this)
+    import multiprocessing as _mp
+    if _mp.current_process().name == 'MainProcess':
+        print("[WARNING] alphago_crowding.py not found - crowding detection disabled")
 
 try:
     from alphago_cost_model import estimate_cost_dollars, CostBreakdown
@@ -329,7 +332,7 @@ class ArchitectureConfig:
     regime_gating: bool = True               # Shift weights by regime
 
     # Horizon blending
-    horizon_blend_weights: Tuple[float, ...] = (0.3, 0.3, 0.4)  # 1d, 5d, 15d (IC analysis: 15-bar most predictive)
+    horizon_blend_weights: Tuple[float, ...] = (0.0, 0.35, 0.65)  # 1d, 5d, 15d — no 1-bar alphas; sqrt(h) weighting within buckets
     horizon_bars: Tuple[int, ...] = (1, 5, 15)
 
     # -- L3: Portfolio / Risk --
@@ -352,6 +355,9 @@ class ArchitectureConfig:
     drift_z_threshold: float = 2.0
     drift_cooldown: int = 20
     drift_risk_reduction: float = 0.50
+    drift_ks_sensitivity: float = 0.01         # p-value threshold for KS test
+    drift_adwin_delta: float = 0.002           # ADWIN confidence (lower = more sensitive)
+    drift_min_signals_for_trigger: int = 2     # N of 4 detectors must agree
 
     turnover_limit_annual: float = 20.0     # Max annual turnover (x capital)
     factor_exposure_limit: float = 0.50     # Max single-factor tilt
@@ -3517,10 +3523,16 @@ class HorizonBlender:
         self.weights = self.weights / (self.weights.sum() + 1e-10)
         self.horizon_bars = acfg.horizon_bars
 
-    def blend(self, signals: Dict[str, AlphaSignal]) -> Tuple[float, float]:
+    def blend(self, signals: Dict[str, AlphaSignal]) -> Tuple[float, float, float]:
         """
-        Blend signals grouped by horizon proximity.
-        Returns (blended_mu, blended_sigma).
+        Blend signals grouped by native horizon proximity with sqrt(h) weighting.
+
+        Uses original_horizon from metadata (before per-bar normalization) to
+        assign signals to horizon buckets. Within each bucket, signals are
+        weighted by sqrt(native_horizon) * confidence — longer-horizon signals
+        get more weight due to higher signal-to-noise ratio and lower turnover.
+
+        Returns (blended_mu, blended_sigma, blended_confidence).
         """
         horizon_mus = {h: [] for h in self.horizon_bars}
         horizon_sigmas = {h: [] for h in self.horizon_bars}
@@ -3528,19 +3540,26 @@ class HorizonBlender:
         for sig in signals.values():
             if not sig.is_active:
                 continue
-            # Assign to nearest horizon bucket
+            # Use original native horizon (before _normalize_horizon set it to 1)
+            native_h = sig.metadata.get('original_horizon', sig.horizon)
             best_h = min(self.horizon_bars,
-                         key=lambda h: abs(h - sig.horizon))
-            horizon_mus[best_h].append(sig.mu * sig.confidence)
-            horizon_sigmas[best_h].append(sig.sigma)
+                         key=lambda h: abs(h - native_h))
+            # sqrt(h) weighting: longer horizons have higher SNR, lower turnover
+            h_weight = np.sqrt(native_h) * sig.confidence
+            horizon_mus[best_h].append((sig.mu, h_weight))
+            horizon_sigmas[best_h].append((sig.sigma, h_weight))
 
         blended_mu = 0.0
         blended_var = 0.0
 
         for i, h in enumerate(self.horizon_bars):
             if horizon_mus[h]:
-                h_mu = np.mean(horizon_mus[h])
-                h_sigma = np.mean(horizon_sigmas[h])
+                mus, weights = zip(*horizon_mus[h])
+                sigs, _ = zip(*horizon_sigmas[h])
+                w_arr = np.array(weights)
+                w_sum = w_arr.sum() + 1e-10
+                h_mu = float(np.dot(mus, w_arr) / w_sum)
+                h_sigma = float(np.dot(sigs, w_arr) / w_sum)
             else:
                 h_mu = 0.0
                 h_sigma = 0.15
@@ -3548,7 +3567,12 @@ class HorizonBlender:
             blended_mu += self.weights[i] * h_mu
             blended_var += (self.weights[i] * h_sigma) ** 2
 
-        return float(blended_mu), float(np.sqrt(blended_var + 1e-10))
+        # Max confidence across active signals — if any horizon is confident, hold
+        blended_conf = max(
+            (sig.confidence for sig in signals.values() if sig.is_active),
+            default=0.5)
+
+        return float(blended_mu), float(np.sqrt(blended_var + 1e-10)), blended_conf
 
 
 class RegimeGating:
@@ -3668,7 +3692,7 @@ class SignalEnsemble:
         mu_hat, sigma_hat, meta_diag = self.meta_learner.combine(signals, regime_probs)
 
         # Step 4: Horizon blending (as secondary signal)
-        h_mu, h_sigma = self.horizon_blender.blend(signals)
+        h_mu, h_sigma, h_conf = self.horizon_blender.blend(signals)
 
         # Blend meta-learner and horizon-blender outputs
         # Meta-learner gets more weight as it trains
@@ -3685,7 +3709,7 @@ class SignalEnsemble:
 
         diagnostics = {
             'meta_mu': mu_hat, 'meta_sigma': sigma_hat,
-            'horizon_mu': h_mu, 'horizon_sigma': h_sigma,
+            'horizon_mu': h_mu, 'horizon_sigma': h_sigma, 'horizon_conf': h_conf,
             'final_mu': final_mu, 'final_sigma': final_sigma,
             'meta_fitted': self.meta_learner._is_fitted,
             'n_active_alphas': sum(1 for s in signals.values() if s.is_active),
@@ -3788,9 +3812,236 @@ class LedoitWolfShrinkage:
         }
 
 
+# ============================================================================
+# STATISTICAL DRIFT DETECTION UTILITIES
+# ============================================================================
+
+def ks_2sample_test(sample_a: np.ndarray, sample_b: np.ndarray) -> Tuple[float, float]:
+    """
+    Two-sample Kolmogorov-Smirnov test (pure NumPy, no scipy).
+
+    Tests whether two samples come from the same distribution.
+    Returns (D_statistic, p_value_approx).
+
+    P-value uses the Kolmogorov asymptotic series:
+        P(D > d) ~ 2 * sum_{k=1}^inf (-1)^{k-1} * exp(-2*k^2*lambda^2)
+    Accurate for n1, n2 >= 20.
+
+    Reference: Numerical Recipes, Press et al. (1992), Section 14.3
+    """
+    a = np.sort(np.asarray(sample_a, dtype=np.float64).ravel())
+    b = np.sort(np.asarray(sample_b, dtype=np.float64).ravel())
+    n1, n2 = len(a), len(b)
+    if n1 < 2 or n2 < 2:
+        return 0.0, 1.0
+
+    # Compute ECDFs at all combined sorted values
+    combined = np.concatenate([a, b])
+    combined.sort()
+    cdf_a = np.searchsorted(a, combined, side='right') / n1
+    cdf_b = np.searchsorted(b, combined, side='right') / n2
+    D = float(np.max(np.abs(cdf_a - cdf_b)))
+
+    # Effective sample size and lambda
+    n_eff = n1 * n2 / (n1 + n2)
+    lam = (np.sqrt(n_eff) + 0.12 + 0.11 / np.sqrt(n_eff)) * D
+
+    # Kolmogorov asymptotic series (converges in 5 terms for typical values)
+    if lam < 1e-10:
+        return D, 1.0
+    p_val = 0.0
+    for k in range(1, 6):
+        p_val += (-1.0) ** (k - 1) * np.exp(-2.0 * k * k * lam * lam)
+    p_val = max(0.0, min(1.0, 2.0 * p_val))
+    return D, p_val
+
+
+class ADWIN:
+    """
+    Adaptive Windowing algorithm for change detection.
+
+    Maintains a window of observations. Checks exponentially-spaced split
+    points for statistically significant mean differences (Hoeffding bound).
+    When detected, drops the older sub-window.
+
+    Reference: Bifet & Gavalda (2007) "Learning from Time-Changing Data
+               with Adaptive Windowing"
+
+    Parameters:
+        delta: Confidence parameter (default 0.002). Lower = more sensitive.
+        max_window: Maximum window size (default 500).
+    """
+
+    def __init__(self, delta: float = 0.002, max_window: int = 500):
+        self._delta = delta
+        self._max_window = max_window
+        self._window: deque = deque(maxlen=max_window)
+        self._sum = 0.0
+        self._sum_sq = 0.0
+        self._detected = False  # Last update detection result
+
+    @property
+    def detected(self) -> bool:
+        """Whether the last update() detected a change."""
+        return self._detected
+
+    def update(self, value: float) -> Tuple[bool, int]:
+        """Add observation. Returns (change_detected, current_window_size)."""
+        self._window.append(value)
+        self._sum += value
+        self._sum_sq += value * value
+
+        # Trim if over max
+        while len(self._window) > self._max_window:
+            old = self._window.popleft()
+            self._sum -= old
+            self._sum_sq -= old * old
+
+        n = len(self._window)
+        if n < 10:
+            self._detected = False
+            return False, n
+
+        # Check exponentially-spaced split points
+        arr = np.array(self._window)
+        k = 1
+        while k < n // 2:
+            left = arr[:k]
+            right = arr[k:]
+            n0, n1 = len(left), len(right)
+            if n0 < 5 or n1 < 5:
+                k *= 2
+                continue
+
+            mean_diff = abs(float(left.mean() - right.mean()))
+            m = 1.0 / (1.0 / n0 + 1.0 / n1)  # harmonic mean
+            eps_cut = np.sqrt(np.log(4.0 * n / self._delta) / (2.0 * m))
+
+            if mean_diff >= eps_cut:
+                # Change detected — drop older portion
+                for _ in range(k):
+                    old = self._window.popleft()
+                    self._sum -= old
+                    self._sum_sq -= old * old
+                self._detected = True
+                return True, len(self._window)
+            k *= 2
+
+        self._detected = False
+        return False, n
+
+    def mean(self) -> float:
+        """Current window mean."""
+        n = len(self._window)
+        return self._sum / n if n > 0 else 0.0
+
+    def variance(self) -> float:
+        """Current window variance."""
+        n = len(self._window)
+        if n < 2:
+            return 0.0
+        m = self._sum / n
+        return max(0.0, self._sum_sq / n - m * m)
+
+    @property
+    def window_size(self) -> int:
+        return len(self._window)
+
+    def reset(self):
+        self._window.clear()
+        self._sum = 0.0
+        self._sum_sq = 0.0
+
+
+class AlphaDriftMonitor:
+    """
+    Per-alpha drift detection using KS test and ADWIN on individual alpha IC streams.
+
+    Each alpha maintains:
+        - Rolling IC window (prediction vs. realized)
+        - ADWIN detector on the IC stream
+        - KS test comparing recent IC window vs. reference window
+    """
+
+    def __init__(self, alpha_names: List[str], ic_window: int = 100,
+                 ks_ref_window: int = 50, ks_test_window: int = 50,
+                 adwin_delta: float = 0.002):
+        self._alpha_names = list(alpha_names)
+        self._ic_window = ic_window
+        self._ks_ref = ks_ref_window
+        self._ks_test = ks_test_window
+
+        # Per-alpha state
+        self._mu_history: Dict[str, deque] = {n: deque(maxlen=ic_window) for n in alpha_names}
+        self._ret_history: deque = deque(maxlen=ic_window)
+        self._ic_series: Dict[str, deque] = {n: deque(maxlen=500) for n in alpha_names}
+        self._adwin: Dict[str, ADWIN] = {n: ADWIN(delta=adwin_delta, max_window=500) for n in alpha_names}
+        self._last_drift: Dict[str, Dict] = {}
+
+    def update_all(self, signals: Dict[str, Any], realized_return: float) -> Dict[str, Dict]:
+        """Batch update for all alphas. signals: {name: AlphaSignal or object with .mu}"""
+        self._ret_history.append(realized_return)
+        results = {}
+
+        for name in self._alpha_names:
+            sig = signals.get(name)
+            if sig is None:
+                continue
+            mu_val = sig.mu if hasattr(sig, 'mu') else float(sig)
+            self._mu_history[name].append(mu_val)
+
+            # Compute rolling IC for this alpha
+            n = min(len(self._mu_history[name]), len(self._ret_history))
+            if n >= 20:
+                preds = np.array(list(self._mu_history[name])[-n:])
+                rets = np.array(list(self._ret_history))[-n:]
+                p_std, r_std = np.std(preds), np.std(rets)
+                if p_std > 1e-10 and r_std > 1e-10:
+                    ic = float(np.corrcoef(preds, rets)[0, 1])
+                    if not np.isnan(ic):
+                        self._ic_series[name].append(ic)
+                        # Feed ADWIN
+                        adwin_detected, _ = self._adwin[name].update(ic)
+
+                        # KS test on IC halves
+                        ic_arr = np.array(list(self._ic_series[name]))
+                        ks_stat, ks_pval, ks_drifting = 0.0, 1.0, False
+                        if len(ic_arr) >= self._ks_ref + self._ks_test:
+                            ref = ic_arr[-(self._ks_ref + self._ks_test):-self._ks_test]
+                            test = ic_arr[-self._ks_test:]
+                            ks_stat, ks_pval = ks_2sample_test(ref, test)
+                            ks_drifting = ks_pval < 0.01
+
+                        results[name] = {
+                            'ic_current': ic,
+                            'ks_stat': ks_stat, 'ks_pval': ks_pval, 'ks_drifting': ks_drifting,
+                            'adwin_detected': adwin_detected,
+                            'adwin_window': self._adwin[name].window_size,
+                        }
+
+        self._last_drift = results
+        return results
+
+    def is_any_drifting(self, ks_threshold: float = 0.01,
+                        min_fraction: float = 0.3) -> Tuple[bool, Dict]:
+        """Aggregate: True if >= min_fraction of active alphas show drift."""
+        if not self._last_drift:
+            return False, {'n_drifting': 0, 'n_monitored': 0}
+        n_drifting = sum(1 for d in self._last_drift.values()
+                         if d.get('ks_drifting', False) or d.get('adwin_detected', False))
+        n_monitored = len(self._last_drift)
+        frac = n_drifting / max(n_monitored, 1)
+        return frac >= min_fraction, {
+            'n_drifting': n_drifting,
+            'n_monitored': n_monitored,
+            'fraction': frac,
+            'per_alpha': self._last_drift,
+        }
+
+
 class DriftDetector:
     """
-    Feature and model drift detection using PSI and ADWIN-inspired methods.
+    Feature and model drift detection using PSI, KS test, and ADWIN.
 
     Detects:
       - Feature drift: Population Stability Index (PSI) between training
@@ -3802,11 +4053,15 @@ class DriftDetector:
     """
 
     def __init__(self, reference_window: int = 252, test_window: int = 63,
-                 psi_threshold: float = 0.25, ic_decay_threshold: float = 0.30):
+                 psi_threshold: float = 0.25, ic_decay_threshold: float = 0.30,
+                 ks_sensitivity: float = 0.01, adwin_delta: float = 0.002,
+                 min_signals: int = 2):
         self._reference_window = reference_window
         self._test_window = test_window
         self._psi_threshold = psi_threshold
         self._ic_decay_threshold = ic_decay_threshold
+        self._ks_sensitivity = ks_sensitivity
+        self._min_signals = min_signals
 
         self._feature_history = deque(maxlen=reference_window + test_window)
         self._prediction_history = deque(maxlen=reference_window + test_window)
@@ -3816,11 +4071,26 @@ class DriftDetector:
         # Reference IC from training period
         self._reference_ic: Optional[float] = None
 
-    def update(self, features: float, prediction: float, outcome: float):
+        # ADWIN detectors on aggregate IC and residual streams
+        self._adwin_ic = ADWIN(delta=adwin_delta, max_window=500)
+        self._adwin_residual = ADWIN(delta=adwin_delta, max_window=500)
+
+        # Per-alpha drift monitor (configured after alphas are registered)
+        self._alpha_drift: Optional[AlphaDriftMonitor] = None
+
+    def set_alpha_names(self, alpha_names: List[str]):
+        """Enable per-alpha drift monitoring after alphas are registered."""
+        self._alpha_drift = AlphaDriftMonitor(alpha_names)
+
+    def update(self, features: float, prediction: float, outcome: float,
+               signals: Dict[str, Any] = None):
         """Ingest one bar of drift monitoring data."""
         self._feature_history.append(features)
         self._prediction_history.append(prediction)
         self._outcome_history.append(outcome)
+
+        # Feed ADWIN residual detector
+        self._adwin_residual.update(prediction - outcome)
 
         # Rolling IC update
         n = len(self._prediction_history)
@@ -3833,6 +4103,11 @@ class DriftDetector:
                 ic = float(np.corrcoef(preds, outs)[0, 1])
                 if not np.isnan(ic):
                     self._ic_history.append(ic)
+                    self._adwin_ic.update(ic)
+
+        # Per-alpha drift update
+        if self._alpha_drift is not None and signals is not None:
+            self._alpha_drift.update_all(signals, outcome)
 
     def set_reference_ic(self, ic: float):
         """Set the reference IC from training period for decay monitoring."""
@@ -3882,16 +4157,63 @@ class DriftDetector:
         recent_ic = float(np.mean(list(self._ic_history)[-20:]))
         return recent_ic / (self._reference_ic + 1e-10)
 
+    def ks_test_drift(self) -> Tuple[float, float, bool]:
+        """KS test on first-half vs second-half of IC history.
+
+        Returns (D_stat, p_value, is_drifting).
+        """
+        n = len(self._ic_history)
+        if n < 40:  # Need at least 20 per half
+            return 0.0, 1.0, False
+        ic_arr = np.array(list(self._ic_history))
+        mid = n // 2
+        d_stat, p_val = ks_2sample_test(ic_arr[:mid], ic_arr[mid:])
+        return d_stat, p_val, p_val < self._ks_sensitivity
+
+    def adwin_drift(self) -> Tuple[bool, bool]:
+        """Check ADWIN detectors on IC and residual streams.
+
+        Returns (ic_change_detected, residual_change_detected).
+        """
+        return self._adwin_ic.detected, self._adwin_residual.detected
+
     def is_drifting(self) -> Tuple[bool, Dict[str, float]]:
         """
-        Composite drift check.
+        Composite drift check with majority vote across 4 signal families.
 
-        Returns: (is_drifting, {psi, ic_decay, ...})
+        Signals:
+          1. PSI > threshold           (feature distribution shift)
+          2. IC decay < threshold       (IC level decay)
+          3. KS p-value < sensitivity   (IC distribution change)
+          4. ADWIN detected             (adaptive change detection)
+
+        Drifting = signals_firing >= 2  (majority vote)
+
+        Returns: (is_drifting, {psi, ic_decay, ks_*, adwin_*, ...})
         """
         psi = self.compute_psi()
         ic_decay = self.ic_decay_ratio()
+        ks_stat, ks_pval, ks_drifting = self.ks_test_drift()
+        adwin_ic_drift, adwin_residual_drift = self.adwin_drift()
 
-        drifting = (psi > self._psi_threshold) or (ic_decay < self._ic_decay_threshold)
+        # Count signals firing
+        signals_firing = 0
+        if psi > self._psi_threshold:
+            signals_firing += 1
+        if ic_decay < self._ic_decay_threshold:
+            signals_firing += 1
+        if ks_drifting:
+            signals_firing += 1
+        if adwin_ic_drift or adwin_residual_drift:
+            signals_firing += 1
+
+        drifting = signals_firing >= self._min_signals
+
+        # Per-alpha drift summary
+        alpha_drift_count = 0
+        if self._alpha_drift is not None:
+            any_drifting, alpha_info = self._alpha_drift.is_any_drifting()
+            alpha_drift_count = alpha_info.get('n_drifting', 0)
 
         return drifting, {
             'psi': psi,
@@ -3899,6 +4221,13 @@ class DriftDetector:
             'ic_decay_ratio': ic_decay,
             'ic_decay_threshold': self._ic_decay_threshold,
             'n_ic_observations': len(self._ic_history),
+            'ks_stat': ks_stat,
+            'ks_pval': ks_pval,
+            'ks_drifting': ks_drifting,
+            'adwin_ic_drift': adwin_ic_drift,
+            'adwin_residual_drift': adwin_residual_drift,
+            'drift_signals_firing': signals_firing,
+            'alpha_drift_count': alpha_drift_count,
         }
 
 class PortfolioConstructor:
@@ -3946,10 +4275,13 @@ class PortfolioConstructor:
         # Ledoit-Wolf shrinkage covariance estimator
         self._lw_estimator = LedoitWolfShrinkage(lookback=252)
 
-        # PSI / ADWIN drift detector
+        # PSI / KS / ADWIN drift detector
         self._drift_detector = DriftDetector(
             reference_window=252, test_window=63,
             psi_threshold=0.25, ic_decay_threshold=0.30,
+            ks_sensitivity=acfg.drift_ks_sensitivity,
+            adwin_delta=acfg.drift_adwin_delta,
+            min_signals=acfg.drift_min_signals_for_trigger,
         )
 
         # Drawdown duration tracking
@@ -3958,6 +4290,10 @@ class PortfolioConstructor:
 
         # Risk stats from last rebalance (for audit)
         self._last_risk_stats: Dict[str, Any] = {}
+
+    def configure_alpha_drift(self, alpha_names: List[str]):
+        """Enable per-alpha drift monitoring after alphas are registered."""
+        self._drift_detector.set_alpha_names(alpha_names)
 
     def construct(self, mu_hat: float, sigma_hat: float,
                   regime_probs: np.ndarray = None,
@@ -3992,6 +4328,7 @@ class PortfolioConstructor:
             features=feature_proxy,
             prediction=mu_hat,
             outcome=bar_return,
+            signals=signals,
         )
 
         # -- Track drawdown duration (for kill switch) --
@@ -4140,6 +4477,10 @@ class PortfolioConstructor:
             'drift_detected': drift_status,
             'drift_psi': drift_metrics.get('psi', 0.0),
             'drift_ic_decay': drift_metrics.get('ic_decay_ratio', 1.0),
+            'drift_ks_pval': drift_metrics.get('ks_pval', 1.0),
+            'drift_adwin_ic': drift_metrics.get('adwin_ic_drift', False),
+            'drift_signals_firing': drift_metrics.get('drift_signals_firing', 0),
+            'drift_alpha_count': drift_metrics.get('alpha_drift_count', 0),
             # FIX §SA-1: Expose regime_scale so L4 can make its no-trade
             # threshold regime-aware and avoid the mathematical deadlock
             # where kelly_cap × regime_scale can never exceed the
@@ -4247,27 +4588,42 @@ class PortfolioConstructor:
         return float(np.clip(scale, 0.1, 1.5))
 
     def _drift_scale(self, predicted_mu: float, realized_return: float) -> float:
-        """Autoregressive drift detection with cooldown."""
+        """Graduated drift response based on DriftDetector majority vote.
+
+        | Signals Firing | Action                                    |
+        |----------------|-------------------------------------------|
+        | 0              | Full exposure (scale=1.0)                 |
+        | 1              | Log only, no position impact              |
+        | 2              | Moderate reduction (drift_risk_reduction)  |
+        | 3-4            | Severe reduction (0.25) + cooldown        |
+        """
         if self._drift_cooldown > 0:
             self._drift_cooldown -= 1
-            return self.acfg.drift_risk_reduction
+            return 0.25  # Severe reduction persists during cooldown
 
         residual = predicted_mu - realized_return
         self._residual_history.append(residual)
 
-        if len(self._residual_history) < 30:
+        # Use DriftDetector's majority vote
+        _, drift_metrics = self._drift_detector.is_drifting()
+        signals_firing = drift_metrics.get('drift_signals_firing', 0)
+
+        if signals_firing == 0:
+            self._drift_active = False
             return 1.0
-
-        residuals = np.array(list(self._residual_history))
-        z = abs(np.mean(residuals[-20:])) / (np.std(residuals) + 1e-10)
-
-        if z > self.acfg.drift_z_threshold:
+        elif signals_firing == 1:
+            # Log only — single detector may be noisy
+            self._drift_active = False
+            return 1.0
+        elif signals_firing == 2:
+            # Moderate reduction
+            self._drift_active = True
+            return self.acfg.drift_risk_reduction
+        else:
+            # 3-4 signals: severe reduction + cooldown
             self._drift_active = True
             self._drift_cooldown = self.acfg.drift_cooldown
-            return self.acfg.drift_risk_reduction
-
-        self._drift_active = False
-        return 1.0
+            return 0.25
 
     def _update_drawdown(self, bar_return: float):
         """Track rolling portfolio value and drawdown."""
@@ -4682,7 +5038,7 @@ class ExecutionEngine:
                                              realized_vol, regime_scale):
             self._n_suppressed += 1
             # BUG FIX DEBUG: Log first 10 suppressions to diagnose why trades aren't happening
-            if self._n_suppressed <= 10:
+            if self._n_suppressed <= 10 and getattr(self, 'verbose', 1) >= 2:
                 delta = abs(target - current_exposure)
                 threshold = self.acfg.no_trade_threshold_pct
                 if self.acfg.no_trade_vol_adaptive:
@@ -5204,6 +5560,8 @@ class InstitutionalPipeline:
         self._lifecycle_monitor = AlphaLifecycleMonitor(
             self.alpha_factory.alpha_names, window=100
         )
+        # Enable per-alpha drift monitoring in L3
+        self.portfolio.configure_alpha_drift(self.alpha_factory.alpha_names)
 
     def step(self, observation: np.ndarray = None,
              closes: np.ndarray = None,

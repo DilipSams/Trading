@@ -3,7 +3,8 @@ Deep MCTS Implementation (AlphaGo-Style 15-20 Step Lookahead)
 =============================================================
 
 GPU-batched MCTS with:
-  - Virtual loss: forces parallel diversity (AlphaGo's key parallel trick)
+  - Wave batching: K rollouts per GPU call (K×B batch size, saturates GPU)
+  - Virtual loss: forces parallel diversity across rollouts within each wave
   - Progressive widening: reduces effective branching 5→3 for deeper search
   - Continuation rollouts: +5 depth per rollout cheaply (no GPU eval)
   - Iterative deepening: scales rollouts with training iteration
@@ -12,8 +13,8 @@ Depth estimation:
   256 rollouts + branching 3 + 5 continuation = ~15-17 effective depth
   512 rollouts + branching 3 + 5 continuation = ~17-19 effective depth
 
-Each rollout: Selection → Leaf GPU eval → Expansion → Continuation → Backup
-GPU batching: one forward pass per rollout across all B root environments.
+Each wave: K×(Selection) → ONE GPU eval (K×B batch) → K×(Expansion+Backup)
+Wave size auto-calculated to target GPU batch size ~256.
 """
 
 import torch
@@ -57,15 +58,16 @@ class MCTSNode:
 
 class ParallelMCTSPlanner:
     """
-    Deep MCTS planner with AlphaGo-style techniques.
+    Deep MCTS planner with AlphaGo-style wave batching.
 
     Architecture:
-      - One rollout at a time, batched across B root environments for GPU efficiency
-      - Each rollout: Select → Evaluate (GPU batch of B) → Expand → Continue → Backup
-      - Tree grows deeper across rollouts as PUCT drives into less-visited regions
+      - K rollouts selected per wave, ONE GPU eval per wave (batch size K×B)
+      - Virtual loss accumulates across rollouts within a wave → forces diversity
+      - Tree grows deeper across waves as PUCT drives into less-visited regions
 
     Key techniques:
-      - Virtual loss: temporarily penalizes visited nodes → forces diversity → deeper tree
+      - Wave batching: K rollouts per GPU call → saturates GPU Tensor Cores
+      - Virtual loss: penalizes visited nodes across parallel rollouts within a wave
       - Progressive widening: expand top-3 children first → effective branching 3 not 5
       - Continuation rollouts: 5 extra greedy steps after leaf → +5 depth for free
     """
@@ -186,14 +188,19 @@ class ParallelMCTSPlanner:
 
     def _run_rollouts(self, root_envs, roots, n_rollouts):
         """
-        Execute n_rollouts of deep MCTS search.
+        Execute n_rollouts of deep MCTS search using wave batching.
 
-        Each rollout:
-          1. SELECTION: Walk from root to leaf via PUCT (with virtual loss)
-          2. EVALUATION: Batched GPU forward pass for all B leaves
+        Wave batching: K rollouts are selected before a single GPU eval,
+        producing batch size K×B per forward pass. Virtual loss accumulates
+        across rollouts within each wave, forcing PUCT to explore different
+        branches (AlphaGo-style parallel diversity).
+
+        Each wave:
+          1. SELECTION ×K: Walk K rollouts per root, VL accumulates across K
+          2. EVALUATION: ONE batched GPU forward pass for all K×B leaves
           3. EXPANSION: Create children (progressive widening)
           4. CONTINUATION: 5 extra greedy steps for deeper value estimate
-          5. BACKUP: Propagate value up the tree, remove virtual loss
+          5. BACKUP: Propagate values, remove VL for entire wave
         """
         B = len(root_envs)
         cfg = self.cfg
@@ -203,75 +210,83 @@ class ParallelMCTSPlanner:
         pw_max = getattr(cfg, 'mcts_pw_max_children', 3)
         cont_steps = getattr(cfg, 'mcts_continuation_steps', 0)
 
-        for r in range(n_rollouts):
+        # Wave size: how many rollouts per GPU batch (auto-target batch ~256)
+        wave_size = getattr(cfg, 'mcts_wave_size', 0)
+        if wave_size <= 0:
+            wave_size = max(1, 256 // max(B, 1))
+        wave_size = min(wave_size, n_rollouts)
+
+        for wave_start in range(0, n_rollouts, wave_size):
+            K = min(wave_size, n_rollouts - wave_start)
+
             leaf_obs_list = []
             leaf_meta = []  # (env_idx, node, path_reward, depth, sim_env, path_nodes)
-            terminated_backups = []  # (node, v_total, path_nodes) for early terminations
+            terminated_backups = []  # (node, v_total, path_nodes)
 
-            # --- Per-environment: Selection phase ---
-            for b in range(B):
-                # Clone environment for this rollout
-                if cfg.mcts_stochastic:
-                    sim_env = root_envs[b].stochastic_clone(
-                        horizon=cfg.mcts_sim_horizon,
-                        block_size=cfg.mcts_bootstrap_block)
-                else:
-                    sim_env = root_envs[b].clone()
+            # --- K rollouts of selection (VL accumulates across rollouts) ---
+            for w in range(K):
+                for b in range(B):
+                    # Clone environment for this rollout
+                    if cfg.mcts_stochastic:
+                        sim_env = root_envs[b].stochastic_clone(
+                            horizon=cfg.mcts_sim_horizon,
+                            block_size=cfg.mcts_bootstrap_block)
+                    else:
+                        sim_env = root_envs[b].clone()
 
-                node = roots[b]
-                path_reward = 0.0
-                depth = 0
-                path_nodes = []  # track for virtual loss cleanup
-                terminated = False
+                    node = roots[b]
+                    path_reward = 0.0
+                    depth = 0
+                    path_nodes = []  # track for virtual loss cleanup
+                    terminated = False
 
-                # --- SELECTION with virtual loss ---
-                while not node.is_leaf():
-                    # Progressive widening: add children if visits warrant it
-                    if pw_enabled and node.stored_priors is not None:
-                        threshold = max(1, int(node.vc ** pw_alpha))
-                        n_children = len(node.children)
-                        if n_children < min(threshold, self.na):
-                            existing = set(node.children.keys())
-                            all_priors = node.stored_priors
-                            missing = [(a, all_priors[a]) for a in range(self.na)
-                                       if a not in existing]
-                            missing.sort(key=lambda x: x[1], reverse=True)
-                            for a, p in missing[:threshold - n_children]:
-                                node.children[a] = MCTSNode(
-                                    parent=node, action=a, prior=float(p))
+                    # --- SELECTION with virtual loss ---
+                    while not node.is_leaf():
+                        # Progressive widening: add children if visits warrant it
+                        if pw_enabled and node.stored_priors is not None:
+                            threshold = max(1, int(node.vc ** pw_alpha))
+                            n_children = len(node.children)
+                            if n_children < min(threshold, self.na):
+                                existing = set(node.children.keys())
+                                all_priors = node.stored_priors
+                                missing = [(a, all_priors[a]) for a in range(self.na)
+                                           if a not in existing]
+                                missing.sort(key=lambda x: x[1], reverse=True)
+                                for a, p in missing[:threshold - n_children]:
+                                    node.children[a] = MCTSNode(
+                                        parent=node, action=a, prior=float(p))
 
-                    # PUCT selection
-                    best_a = max(node.children.keys(),
-                                 key=lambda a: node.children[a].ucb(cfg.mcts_exploration))
-                    child = node.children[best_a]
+                        # PUCT selection
+                        best_a = max(node.children.keys(),
+                                     key=lambda a: node.children[a].ucb(cfg.mcts_exploration))
+                        child = node.children[best_a]
 
-                    # Apply virtual loss before descending
-                    if vl_val > 0:
-                        child.vl += vl_val
-                        path_nodes.append(child)
+                        # Apply virtual loss before descending
+                        if vl_val > 0:
+                            child.vl += vl_val
+                            path_nodes.append(child)
 
-                    node = child
+                        node = child
 
-                    # Step simulation forward
-                    if sim_env.cs < sim_env.nb - 1:
-                        _, rew, term, trunc, _ = sim_env.step(best_a)
-                        path_reward += (self.gamma ** depth) * rew
-                        depth += 1
-                        if term or trunc:
+                        # Step simulation forward
+                        if sim_env.cs < sim_env.nb - 1:
+                            _, rew, term, trunc, _ = sim_env.step(best_a)
+                            path_reward += (self.gamma ** depth) * rew
+                            depth += 1
+                            if term or trunc:
+                                terminated = True
+                                break
+                        else:
                             terminated = True
                             break
+
+                    if terminated:
+                        terminated_backups.append((node, path_reward, path_nodes))
                     else:
-                        terminated = True
-                        break
+                        leaf_obs_list.append(sim_env._obs())
+                        leaf_meta.append((b, node, path_reward, depth, sim_env, path_nodes))
 
-                if terminated:
-                    # Backup terminated sim with path reward only
-                    terminated_backups.append((node, path_reward, path_nodes))
-                else:
-                    leaf_obs_list.append(sim_env._obs())
-                    leaf_meta.append((b, node, path_reward, depth, sim_env, path_nodes))
-
-            # --- Backup terminated simulations immediately ---
+            # --- Backup terminated simulations ---
             for node, v_total, path_nodes in terminated_backups:
                 current = node
                 while current is not None:
@@ -282,7 +297,7 @@ class ParallelMCTSPlanner:
                 for n in path_nodes:
                     n.vl -= vl_val
 
-            # --- BATCHED GPU EVALUATION of all B leaves ---
+            # --- ONE BATCHED GPU EVALUATION for all K×B leaves ---
             if not leaf_obs_list:
                 continue
 
@@ -293,7 +308,7 @@ class ParallelMCTSPlanner:
                 leaf_risks = leaf_risks.cpu().numpy()
                 leaf_priors = F.softmax(logits, dim=-1).cpu().numpy()
 
-            # --- EXPANSION + CONTINUATION + BACKUP ---
+            # --- EXPANSION + CONTINUATION + BACKUP for all K×B leaves ---
             for idx, (b, node, path_rew, depth, sim_env, path_nodes) in enumerate(leaf_meta):
                 priors = leaf_priors[idx]
 

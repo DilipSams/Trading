@@ -234,6 +234,7 @@ class Config:
     use_multi_gpu: bool = True
     n_envs: int = 64                    # GPU-optimized: 4x more parallel (was 16)
     pin_memory: bool = True
+    no_subproc: bool = True              # SubprocVecEnv disabled (use TorchVecEnv for GPU parallelism)
     # Self-Play (increased budget: 8 iterations × 100k steps = 800k total)
     n_iterations: int = 8
     total_timesteps_per_iter: int = 100_000
@@ -297,6 +298,8 @@ class Config:
     mcts_schedule_enabled: bool = True   # Scale rollouts as value network improves
     mcts_schedule_base: int = 64         # Rollouts at iteration 2 (shallow, network still weak)
     mcts_schedule_max: int = 512         # Rollouts at final iteration (full depth)
+    # Wave batching (GPU saturation)
+    mcts_wave_size: int = 0              # Rollouts per GPU batch wave (0 = auto: target batch ~256)
     # --- Institutional splitting / leakage control ---
     val_ratio: float = 0.10                # Fraction for validation (time-based)
     holdout_ratio: float = 0.10            # Fraction for holdout (never seen in training)
@@ -945,6 +948,7 @@ class SharedBackbone(nn.Module):
     def __init__(self,nf,ws,hd=256,nl=3,do=.1,attn=True):
         super().__init__()
         self.ws=ws; self.nf=nf; self.hd=hd
+        self.input_norm=nn.LayerNorm(nf)
         self.conv=nn.Sequential(
             nn.Conv1d(nf,hd,3,padding=1),nn.GELU(),nn.BatchNorm1d(hd),nn.Dropout(do),
             nn.Conv1d(hd,hd,3,padding=1),nn.GELU(),nn.BatchNorm1d(hd),nn.Dropout(do))
@@ -954,6 +958,7 @@ class SharedBackbone(nn.Module):
     def forward(self,x):
         B=x.shape[0]
         if x.dim()==2: x=x.view(B,self.ws,self.nf)
+        x=self.input_norm(x)
         x=self.conv(x.permute(0,2,1)).permute(0,2,1)
         if self.use_attn: x=self.attention(x)
         return self.fc(x.reshape(B,-1))
@@ -969,6 +974,7 @@ class TransformerBackbone(nn.Module):
     def __init__(self, nf, ws, hd=256, nl=2, do=0.1, nh=4):
         super().__init__()
         self.ws = ws; self.nf = nf; self.hd = hd
+        self.input_norm = nn.LayerNorm(nf)
         # Project features to model dimension
         self.embedding = nn.Linear(nf, hd)
         # Learnable positional encoding (more flexible than sinusoidal for finance)
@@ -999,7 +1005,8 @@ class TransformerBackbone(nn.Module):
         if x.dim() == 2:
             x = x.view(B, self.ws, self.nf)
         T = x.shape[1]
-        # Embed + positional
+        # Normalize + Embed + positional
+        x = self.input_norm(x)
         x = self.embedding(x) + self.pos_encoding[:, :T, :]
         # Causal mask
         mask = self._get_causal_mask(T, x.device)
@@ -1022,6 +1029,13 @@ class AlphaTradeNet(nn.Module):
         self.policy_head=nn.Sequential(nn.Linear(h,h//2),nn.GELU(),nn.Linear(h//2,cfg.n_actions))
         self.value_head=nn.Sequential(nn.Linear(h,h//2),nn.GELU(),nn.Linear(h//2,1))
         self.risk_head=nn.Sequential(nn.Linear(h,h//2),nn.GELU(),nn.Linear(h//2,1),nn.Softplus())
+        # Orthogonal init: small gain keeps initial outputs numerically safe
+        nn.init.orthogonal_(self.policy_head[-1].weight, gain=0.01)
+        nn.init.constant_(self.policy_head[-1].bias, 0.0)
+        nn.init.orthogonal_(self.value_head[-1].weight, gain=1.0)
+        nn.init.constant_(self.value_head[-1].bias, 0.0)
+        nn.init.orthogonal_(self.risk_head[-2].weight, gain=0.01)  # -2: before Softplus
+        nn.init.constant_(self.risk_head[-2].bias, 0.0)
     def forward(self,x):
         f=self.backbone(x)
         return self.policy_head(f),self.value_head(f).squeeze(-1),self.risk_head(f).squeeze(-1)
@@ -1196,6 +1210,17 @@ class TradingEnv(gym.Env):
 
         trend = float(past_closes[-1] / (past_closes[-min(50, len(past_closes))] + 1e-12) - 1.0)
         trending = abs(trend) > 0.01
+
+        # Adaptive block size: preserve autocorrelation in trending markets.
+        # Variance-ratio Hurst proxy: |cumulative_return| / sum(|returns|).
+        # Near 1.0 = pure trend (use large blocks), near 0 = mean-reverting (small blocks).
+        r20 = log_rets[-20:]
+        trend_strength = abs(float(r20.sum())) / (float(np.sum(np.abs(r20))) + 1e-10)
+        if trend_strength > 0.40:       # strong trend — preserve momentum
+            block_size = max(block_size, 10)
+        elif trend_strength < 0.15:      # mean-reverting — shorter blocks OK
+            block_size = max(3, block_size - 2)
+        # else: keep configured block_size (random-walk-like)
 
         # Collect blocks of returns matching similar regime conditions
         # Use simple affinity: returns from high-vol or low-vol periods
@@ -2231,6 +2256,374 @@ class VectorizedEnvs:
 
 
 # ============================================================================
+# GPU-VECTORIZED TRADING ENV (TorchVecEnv — RTX 3090 parallel stepping)
+# ============================================================================
+# Runs ALL N environments on GPU as batched tensor operations.
+# One env.step() = one GPU kernel on (N, ...) tensors — 10,000 CUDA cores active.
+# Training-only: evaluation uses full TradingEnv for accurate trade logging.
+
+class TorchVecEnv:
+    """GPU-native vectorized trading environment.
+
+    All N environments step in parallel via batched PyTorch tensor operations.
+    Replaces sequential Python TradingEnv.step() calls with GPU kernels.
+
+    Drop-in replacement for VectorizedEnvs (returns numpy arrays).
+    """
+
+    def __init__(self, env_args_list, cfg):
+        self.n = len(env_args_list)
+        self.obs_dim = cfg.obs_dim
+        self._cfg = cfg
+        dev = torch.device('cuda' if HAS_CUDA else 'cpu')
+        self._dev = dev
+        N = self.n
+        w = cfg.window_size
+        F = NUM_FEATURES
+
+        # --- Load features & prices onto GPU (one-time, padded to max_T) ---
+        feat_list = [a[0] for a in env_args_list]  # (T_i, F) numpy arrays
+        price_list = [a[1] for a in env_args_list]  # (T_i, 5) numpy arrays
+        lengths = [f.shape[0] for f in feat_list]
+        max_T = max(lengths)
+
+        # Pad and stack to (N, max_T, F) and (N, max_T, 5)
+        feat_pad = np.zeros((N, max_T, F), dtype=np.float32)
+        price_pad = np.zeros((N, max_T, 5), dtype=np.float32)
+        for i, (f, p) in enumerate(zip(feat_list, price_list)):
+            feat_pad[i, :f.shape[0]] = f
+            price_pad[i, :p.shape[0]] = p
+
+        self._features = torch.from_numpy(feat_pad).to(dev)  # (N, max_T, F)
+        self._prices = torch.from_numpy(price_pad).to(dev)    # (N, max_T, 5)
+        self._lengths = torch.tensor(lengths, dtype=torch.long, device=dev)  # (N,)
+        self._max_T = max_T
+        self._w = w
+        self._F = F
+
+        # --- Config constants as tensors ---
+        self._action_targets = torch.tensor(cfg.action_targets, dtype=torch.float32, device=dev)
+        self._starting_capital = float(cfg.starting_capital)
+        self._max_position_pct = float(cfg.max_position_pct)
+        self._max_leverage = float(cfg.max_leverage)
+        self._slippage_pct = float(cfg.slippage_pct)
+        self._commission_pct = float(cfg.commission_pct)
+        self._reward_scale = float(cfg.reward_scale)
+        self._reward_turnover_cost = float(cfg.reward_turnover_cost)
+        self._reward_dd_penalty = float(cfg.reward_drawdown_penalty)
+        self._reward_cvar_penalty = float(cfg.reward_cvar_penalty)
+        self._reward_hold_bonus = float(cfg.reward_holding_bonus)
+        self._reward_soft_clip = float(cfg.reward_soft_clip_scale)
+        self._cvar_quantile = float(cfg.cvar_quantile)
+        self._max_episode_steps = int(cfg.max_episode_steps)
+        self._borrow_cost_per_bar = float(cfg.borrow_bps_daily * 1e-4) * (252.0 / cfg.bars_per_year)
+        self._cash_yield_per_bar = float(cfg.cash_yield_bps_annual * 1e-4) / cfg.bars_per_year
+
+        # --- Window index template (reusable) ---
+        self._widx = torch.arange(w, device=dev)  # (w,)
+        self._eidx = torch.arange(N, device=dev)   # (N,)
+
+        # --- Per-env state tensors ---
+        self._cs = torch.zeros(N, dtype=torch.long, device=dev)
+        self._cash = torch.full((N,), self._starting_capital, dtype=torch.float32, device=dev)
+        self._shares = torch.zeros(N, dtype=torch.float32, device=dev)
+        self._exposure = torch.zeros(N, dtype=torch.float32, device=dev)
+        self._entry_vwap = torch.zeros(N, dtype=torch.float32, device=dev)
+        self._entry_step = torch.zeros(N, dtype=torch.long, device=dev)
+        self._peak_value = torch.full((N,), self._starting_capital, dtype=torch.float32, device=dev)
+        self._prev_value = torch.full((N,), self._starting_capital, dtype=torch.float32, device=dev)
+        self._max_dd = torch.zeros(N, dtype=torch.float32, device=dev)
+        self._episode_start_cs = torch.zeros(N, dtype=torch.long, device=dev)
+        # Rolling return buffer for CVaR (ring buffer)
+        self._ret_buf = torch.zeros(N, 100, dtype=torch.float32, device=dev)
+        self._ret_buf_ptr = torch.zeros(N, dtype=torch.long, device=dev)
+        self._ret_buf_len = torch.zeros(N, dtype=torch.long, device=dev)
+
+        # Initialize with random start positions
+        self._reset_all()
+
+    def _reset_all(self):
+        """Reset all environments to random starting positions."""
+        N = self.n; dev = self._dev; w = self._w
+        mx = (self._lengths - self._max_episode_steps - 10).clamp(min=w + 1)
+        self._cs = torch.randint(w, int(mx.min().item()), (N,), device=dev).clamp(min=w)
+        for i in range(N):
+            hi = max(w + 1, mx[i].item())
+            self._cs[i] = torch.randint(w, hi, (1,), device=dev)
+        self._episode_start_cs = self._cs.clone()
+        self._cash.fill_(self._starting_capital)
+        self._shares.zero_()
+        self._exposure.zero_()
+        self._entry_vwap.zero_()
+        self._entry_step.zero_()
+        self._peak_value.fill_(self._starting_capital)
+        self._prev_value.fill_(self._starting_capital)
+        self._max_dd.zero_()
+        self._ret_buf.zero_()
+        self._ret_buf_ptr.zero_()
+        self._ret_buf_len.zero_()
+
+    def _reset_envs(self, mask):
+        """Reset specific environments (where mask is True)."""
+        if not mask.any():
+            return
+        w = self._w
+        idx = mask.nonzero(as_tuple=True)[0]
+        mx = (self._lengths[idx] - self._max_episode_steps - 10).clamp(min=w + 1)
+        for j, i in enumerate(idx):
+            hi = max(w + 1, mx[j].item())
+            self._cs[i] = torch.randint(w, hi, (1,), device=self._dev)
+        self._episode_start_cs[idx] = self._cs[idx]
+        self._cash[idx] = self._starting_capital
+        self._shares[idx] = 0.0
+        self._exposure[idx] = 0.0
+        self._entry_vwap[idx] = 0.0
+        self._entry_step[idx] = 0
+        self._peak_value[idx] = self._starting_capital
+        self._prev_value[idx] = self._starting_capital
+        self._max_dd[idx] = 0.0
+        self._ret_buf[idx] = 0.0
+        self._ret_buf_ptr[idx] = 0
+        self._ret_buf_len[idx] = 0
+
+    @torch.no_grad()
+    def _get_obs(self):
+        """Batched observation construction on GPU. Returns (N, obs_dim) float32."""
+        N = self.n; w = self._w; F = self._F; dev = self._dev
+        # Gather feature windows: obs[i] = features[i, cs[i]-w : cs[i]]
+        # Build index matrix: (N, w) where each row is [cs_i-w, cs_i-w+1, ..., cs_i-1]
+        windows = self._widx.unsqueeze(0) + (self._cs - w).unsqueeze(1)  # (N, w)
+        windows = windows.clamp(0, self._max_T - 1)
+        # Advanced indexing: gather (N, w, F) from (N, max_T, F)
+        ei = self._eidx.unsqueeze(1).expand(-1, w)  # (N, w)
+        obs = self._features[ei, windows]  # (N, w, F)
+
+        # Inject position state into last row (last 4 features: NUM_FEATURES-4 .. NUM_FEATURES-1)
+        ps = F - 4  # position state start index
+        has_pos = self._shares.abs() > 1e-8
+        has_pos_f = has_pos.float()
+        mid = self._prices[self._eidx, self._cs, 3]  # (N,) close prices
+
+        # Unrealized P&L fraction
+        safe_vwap = self._entry_vwap.clamp(min=1e-6)
+        unreal_long = (mid - self._entry_vwap) / safe_vwap
+        unreal_short = (self._entry_vwap - mid) / safe_vwap
+        unreal_pnl = torch.where(self._shares > 0, unreal_long, unreal_short) * has_pos_f
+
+        obs[:, -1, ps]     = self._exposure.clamp(-1.0, 1.0) * has_pos_f
+        obs[:, -1, ps + 1] = unreal_pnl.clamp(-0.5, 0.5)
+        obs[:, -1, ps + 2] = ((self._cs - self._entry_step).float() / 20.0).clamp(0.0, 1.0) * has_pos_f
+        obs[:, -1, ps + 3] = self._shares.sign()
+
+        # Flatten to (N, w*F)
+        obs = obs.reshape(N, -1)
+        # NaN safety
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+        return obs
+
+    @torch.no_grad()
+    def step(self, actions):
+        """Step all N envs in parallel. actions: numpy (N,) int."""
+        N = self.n; dev = self._dev
+
+        # Convert actions to GPU tensor
+        act_t = torch.from_numpy(actions.astype(np.int64)).to(dev)
+
+        # --- Pre-step portfolio value ---
+        mid = self._prices[self._eidx, self._cs, 3]  # (N,) close
+        mid = mid.clamp(min=1e-6)
+        port_value = self._cash + self._shares * mid
+
+        # --- Execution: rebalance to target exposure ---
+        target_exp = self._action_targets[act_t]  # (N,)
+        max_notional = port_value * self._max_position_pct * self._max_leverage
+        max_notional = max_notional.clamp(min=1.0)
+        target_notional = target_exp * max_notional
+        current_notional = self._shares * mid
+
+        # Target shares
+        buy_fill = mid * (1.0 + self._slippage_pct)
+        sell_fill = mid * (1.0 - self._slippage_pct)
+        buy_fill = buy_fill.clamp(min=1e-6)
+        sell_fill = sell_fill.clamp(min=1e-6)
+
+        # Desired target shares (positive = long, negative = short)
+        target_shares = torch.where(
+            target_exp >= 0,
+            target_notional / buy_fill,
+            target_notional / sell_fill
+        )
+        delta_shares_raw = target_shares - self._shares
+
+        # Minimum trade threshold: skip tiny trades
+        trade_mask = delta_shares_raw.abs() >= 0.5
+        delta_shares_raw = delta_shares_raw * trade_mask.float()
+
+        # --- Split into CLOSING and OPENING portions ---
+        # Closing: reduces |shares| toward zero (always allowed, no constraint)
+        is_reducing = (self._shares * delta_shares_raw) < 0  # opposite signs = reducing
+        reduce_amount = torch.min(delta_shares_raw.abs(), self._shares.abs())
+        close_shares = torch.where(is_reducing, delta_shares_raw.sign() * reduce_amount, torch.zeros_like(delta_shares_raw))
+
+        # Opening: new position beyond zero (constrained by cash/margin)
+        open_shares = delta_shares_raw - close_shares
+
+        # Execute closing portion (always allowed, earns/spends cash)
+        close_fill = torch.where(close_shares > 0, buy_fill, sell_fill)  # buy to cover or sell to close
+        close_cost = self._commission_pct * (close_shares.abs() * close_fill)
+        close_cash_delta = -close_shares * close_fill - close_cost  # selling gives cash, buying costs cash
+        cash_after_close = self._cash + close_cash_delta
+
+        # Constrain opening portion by available capital
+        open_buy = open_shares > 1e-8   # new long
+        open_sell = open_shares < -1e-8  # new short
+        open_buy_cost = open_shares * buy_fill
+        open_margin = open_shares.abs() * sell_fill * 0.5
+        max_capital = (cash_after_close * 0.95).clamp(min=0.0)
+
+        # Scale down if over budget
+        buy_scale = torch.where(open_buy & (open_buy_cost > max_capital),
+                                max_capital / open_buy_cost.clamp(min=1e-6),
+                                torch.ones_like(open_shares))
+        sell_scale = torch.where(open_sell & (open_margin > max_capital),
+                                 max_capital / open_margin.clamp(min=1e-6),
+                                 torch.ones_like(open_shares))
+        open_scale = torch.where(open_buy, buy_scale, torch.where(open_sell, sell_scale, torch.ones_like(open_shares)))
+        open_shares = open_shares * open_scale
+
+        # Execute opening portion
+        open_fill = torch.where(open_shares > 0, buy_fill, sell_fill)
+        open_cost = self._commission_pct * (open_shares.abs() * open_fill)
+        open_cash_delta = -open_shares * open_fill - open_cost
+
+        # Total delta
+        total_delta_shares = close_shares + open_shares
+        total_cost = close_cost + open_cost
+        traded_notional = total_delta_shares.abs() * mid
+
+        # Update shares & cash
+        old_shares = self._shares.clone()
+        self._shares = self._shares + total_delta_shares
+        self._cash = cash_after_close + open_cash_delta
+
+        # Update exposure
+        new_port_value = self._cash + self._shares * mid
+        self._exposure = torch.where(
+            max_notional > 1e-6,
+            (self._shares * mid) / max_notional,
+            torch.zeros_like(self._exposure)
+        )
+
+        # Update entry VWAP (simplified: set on new position open)
+        opened = (old_shares.abs() < 1e-8) & (self._shares.abs() > 1e-8)
+        open_fill_used = torch.where(self._shares > 0, buy_fill, sell_fill)
+        self._entry_vwap = torch.where(opened, open_fill_used, self._entry_vwap)
+        self._entry_step = torch.where(opened, self._cs, self._entry_step)
+
+        # --- Short borrow cost ---
+        is_short = self._shares < -1e-8
+        borrow = self._borrow_cost_per_bar * self._shares.abs() * mid * is_short.float()
+        self._cash = self._cash - borrow
+
+        # --- Cash yield when flat ---
+        is_flat = self._shares.abs() < 1e-8
+        self._cash = self._cash + self._cash * self._cash_yield_per_bar * is_flat.float()
+
+        # --- Reward (BEFORE advancing cs — matches TradingEnv timing) ---
+        new_port_value = (self._cash + self._shares * mid).clamp(min=1.0)
+
+        # Base: log return
+        log_ret = torch.log(new_port_value / self._prev_value.clamp(min=1.0))
+        base_reward = log_ret * self._reward_scale
+
+        # Turnover penalty
+        turnover_frac = traded_notional / port_value.clamp(min=1.0)
+        turnover_pen = self._reward_turnover_cost * turnover_frac
+
+        # Drawdown penalty (quadratic)
+        dd = ((self._peak_value - new_port_value) / self._peak_value.clamp(min=1.0)).clamp(min=0.0)
+        self._peak_value = torch.max(self._peak_value, new_port_value)
+        self._max_dd = torch.max(self._max_dd, dd)
+        dd_pen = self._reward_dd_penalty * dd * dd
+
+        # CVaR penalty from rolling return buffer
+        step_ret = (new_port_value - self._prev_value) / self._prev_value.clamp(min=1.0)
+        # Update ring buffer
+        ptr = self._ret_buf_ptr
+        self._ret_buf[self._eidx, ptr] = step_ret
+        self._ret_buf_ptr = (ptr + 1) % 100
+        self._ret_buf_len = (self._ret_buf_len + 1).clamp(max=100)
+        # Compute CVaR for envs with enough history
+        cvar_pen = torch.zeros(N, device=dev)
+        has_hist = self._ret_buf_len >= 20
+        if has_hist.any():
+            # Sort returns, take worst quantile
+            sorted_rets, _ = self._ret_buf.sort(dim=1)  # (N, 100) sorted ascending
+            cutoff = (self._ret_buf_len.float() * self._cvar_quantile).long().clamp(min=1)
+            # Vectorized CVaR: mean of worst `cutoff` returns
+            # Use a fixed cutoff approximation for batched efficiency
+            k = max(1, int(100 * self._cvar_quantile))  # = 5 for 5% quantile
+            worst_k = sorted_rets[:, :k]  # (N, k) worst returns
+            cvar = (-worst_k.mean(dim=1)).clamp(min=0.0)
+            cvar_pen = torch.where(has_hist, self._reward_cvar_penalty * cvar * cvar, cvar_pen)
+
+        # Holding bonus
+        hold_bonus = torch.where(
+            turnover_frac < 0.001,
+            torch.full((N,), self._reward_hold_bonus, device=dev),
+            torch.zeros(N, device=dev)
+        )
+
+        reward = base_reward - turnover_pen - dd_pen - cvar_pen + hold_bonus
+        # Soft tanh clip
+        reward = torch.tanh(reward / self._reward_soft_clip) * self._reward_soft_clip
+        # NaN safety
+        reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self._prev_value = new_port_value.clone()
+
+        # --- Advance step (AFTER reward, matching TradingEnv) ---
+        self._cs = self._cs + 1
+
+        # --- Terminal / truncation detection ---
+        at_end = self._cs >= (self._lengths - 1)
+        ruin = new_port_value < (self._starting_capital * 0.3)
+        ep_too_long = (self._cs - self._episode_start_cs) >= self._max_episode_steps
+        done = at_end | ruin | ep_too_long
+
+        # --- Observations (before reset so done envs get their final obs) ---
+        obs = self._get_obs()
+
+        # --- Auto-reset done envs ---
+        self._reset_envs(done)
+
+        # --- Build info dicts ---
+        # Compact: risk_target, turnover_frac, dd_frac, cvar_est
+        risk_tgt = torch.full((N,), 0.01, device=dev)  # default
+        turnover_np = turnover_frac.cpu().numpy()
+        dd_np = dd.cpu().numpy()
+        cvar_np = cvar_pen.cpu().numpy()
+
+        obs_np = obs.cpu().numpy()
+        rw_np = reward.cpu().numpy().astype(np.float32)
+        dn_np = done.cpu().numpy()
+        inf = [{'risk_target': 0.01, 'turnover_frac': float(turnover_np[i]),
+                'dd_frac': float(dd_np[i]), 'cvar_est': float(cvar_np[i])} for i in range(N)]
+
+        return obs_np, rw_np, dn_np, inf
+
+    def reset(self):
+        """Reset all environments. Returns (N, obs_dim) numpy array."""
+        self._reset_all()
+        obs = self._get_obs()
+        return obs.cpu().numpy()
+
+    def close(self):
+        """No-op: GPU tensors freed by garbage collection."""
+        pass
+
+
+# ============================================================================
 # GPU ROLLOUT BUFFER (pinned memory + vectorized GAE)
 # ============================================================================
 class GPURolloutBuffer:
@@ -2451,7 +2844,7 @@ class GPUPPOTrainer:
         else:
             self.sched = None
         self.use_amp = cfg.use_amp and HAS_AMP
-        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp) if self.use_amp else None
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp, init_scale=1024) if self.use_amp else None
         self.gs = 0
         # Lagrangian multipliers (3A)
         self.lam_turn = 0.0
@@ -2494,13 +2887,14 @@ class GPUPPOTrainer:
                         dd_fr[i] = inf_i.get("dd_frac", 0.0)
                         cv_est[i] = inf_i.get("cvar_est", 0.0)
                     else:
-                        # Fallback (should not happen since VecEnv now always returns info)
-                        risk_tgts[i] = venv.envs[i].get_risk_target()
+                        # Fallback: use default (SubprocVecEnv has no .envs access)
+                        risk_tgts[i] = 0.01
                 buf.add(obs, an, ln, rw, vn, dn.astype(np.float32), risk_tgts, turn_fr, dd_fr, cv_est)
-                # Replay buffer for value/risk head (4B)
-                for i in range(ne):
-                    self.replay_states.append(obs[i].copy())
-                    self.replay_risk.append(float(risk_tgts[i]))
+                # Replay buffer for value/risk head (4B) — subsample every 4th step
+                if step % 4 == 0:
+                    for i in range(ne):
+                        self.replay_states.append(obs[i].copy())
+                        self.replay_risk.append(float(risk_tgts[i]))
                 for i in range(ne):
                     ep_rw[eids[i]] += rw[i]
                     if dn[i]:
@@ -2527,36 +2921,32 @@ class GPUPPOTrainer:
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                     _, nlp, ent, val, risk_pred = self.net.get_action_and_value(st, ac)
 
-                    # PPO policy loss
+                    # PPO policy loss (float16 inside autocast)
                     ratio = torch.exp(torch.clamp(nlp - olp, -5.0, 5.0))
                     s1 = ratio * adv
                     s2 = torch.clamp(ratio, 1 - self.cfg.clip_range, 1 + self.cfg.clip_range) * adv
                     pl = -torch.min(s1, s2).mean()
-
-                    # Value loss
-                    vl = F.mse_loss(val, ret)
-
-                    # Entropy loss (uses dynamic ent_coef)
                     el = -ent.mean()
 
-                    # Risk head auxiliary loss
-                    risk_loss = F.mse_loss(risk_pred, risk_tgt)
+                # All losses in float32 (prevents AMP overflow during backward)
+                pl = pl.float(); el = el.float()
+                vl = F.smooth_l1_loss(val.float(), ret)  # Huber: bounded gradient for large errors
+                risk_loss = F.mse_loss(risk_pred.float(), risk_tgt)
 
-                    # Base loss
-                    loss = (pl + self.cfg.vf_coef * vl
-                            + ent_coef * el
-                            + self.cfg.risk_coef * risk_loss)
+                loss = (pl + self.cfg.vf_coef * vl
+                        + ent_coef * el
+                        + self.cfg.risk_coef * risk_loss)
 
-                    # Lagrangian constraint penalties (3A)
-                    if self.cfg.use_lagrangian:
-                        v_turn = torch.relu(turn_f - self.cfg.target_turnover_frac)
-                        v_dd = torch.relu(dd_f - self.cfg.target_dd)
-                        v_cv = torch.relu(cv_e - self.cfg.target_cvar)
-                        lag_pen = (self.lam_turn * v_turn.mean()
-                                  + self.lam_dd * v_dd.mean()
-                                  + self.lam_cvar * v_cv.mean())
-                        loss = loss + lag_pen
-                    last_turn_f = turn_f; last_dd_f = dd_f; last_cv_e = cv_e
+                # Lagrangian constraint penalties (3A)
+                if self.cfg.use_lagrangian:
+                    v_turn = torch.relu(turn_f - self.cfg.target_turnover_frac)
+                    v_dd = torch.relu(dd_f - self.cfg.target_dd)
+                    v_cv = torch.relu(cv_e - self.cfg.target_cvar)
+                    lag_pen = (self.lam_turn * v_turn.mean()
+                              + self.lam_dd * v_dd.mean()
+                              + self.lam_cvar * v_cv.mean())
+                    loss = loss + lag_pen
+                last_turn_f = turn_f; last_dd_f = dd_f; last_cv_e = cv_e
 
                 # Skip update if loss is non-finite (prevents NaN from corrupting weights)
                 if not torch.isfinite(loss):
@@ -2600,13 +2990,17 @@ class GPUPPOTrainer:
             rt_r = torch.FloatTensor(np.array([self.replay_risk[i] for i in idx_r])).to(DEVICE)
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 _, _, risk_pred_r = self.net.forward(st_r)
-                aux_loss = self.cfg.risk_coef * F.mse_loss(risk_pred_r, rt_r)
+                aux_loss = self.cfg.risk_coef * F.mse_loss(risk_pred_r.float(), rt_r)
             self.opt.zero_grad(set_to_none=True)
             if self.scaler:
                 self.scaler.scale(aux_loss).backward()
+                self.scaler.unscale_(self.opt)
+                nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
                 self.scaler.step(self.opt); self.scaler.update()
             else:
-                aux_loss.backward(); self.opt.step()
+                aux_loss.backward()
+                nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
+                self.opt.step()
 
         if self.sched:
             self.sched.step()
@@ -2648,6 +3042,8 @@ class GPUPPOTrainer:
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 logits, _, _ = self.net.forward(st[ix])
                 log_probs = F.log_softmax(logits, dim=-1)
+                if not torch.isfinite(log_probs).all():
+                    continue  # Skip batch with non-finite log_probs (extreme logits)
                 kl_loss = F.kl_div(log_probs, target[ix], reduction='batchmean')
                 if not torch.isfinite(kl_loss):
                     continue  # Skip non-finite KL loss
@@ -3025,13 +3421,25 @@ class AlphaTradeSystem:
                 tprint(f"DriftMonitor init skipped: {e}", "warn")
 
     def _vec(self,dss,ev=False):
-        nt=self.cfg.n_envs if not ev else len(dss); envs=[]
+        nt=self.cfg.n_envs if not ev else len(dss)
+        env_args = []
         for i in range(nt):
             d=dss[i%len(dss)]
-            env = TradingEnv(d.features_test if ev else d.features_train,
-                             d.prices_test if ev else d.prices_train,self.cfg,d.symbol,ev)
-            env.drift_monitor = self.drift_monitor  # Fix #3: share drift monitor with envs
-            envs.append(env)
+            features = d.features_test if ev else d.features_train
+            prices = d.prices_test if ev else d.prices_train
+            env_args.append((features, prices, self.cfg, d.symbol, ev))
+
+        # GPU-vectorized env for training, full TradingEnv for evaluation
+        if not ev and HAS_CUDA:
+            try:
+                return TorchVecEnv(env_args, self.cfg)
+            except Exception as e:
+                tprint(f"TorchVecEnv failed ({e}), falling back to sequential", "warn")
+
+        # Fallback: sequential VectorizedEnvs (used for eval + CPU fallback)
+        envs = [TradingEnv(*args) for args in env_args]
+        for e in envs:
+            e.drift_monitor = self.drift_monitor
         return VectorizedEnvs(envs)
 
     @torch.no_grad()
@@ -3191,6 +3599,7 @@ class AlphaTradeSystem:
             # Train
             tprint(f"PPO training ({self.cfg.total_timesteps_per_iter:,} steps)...","info")
             venv=self._vec(sel); res=trainer.train_iteration(venv,self.cfg.total_timesteps_per_iter)
+            if hasattr(venv, 'close'): venv.close()  # Free subprocess resources
             tt=time.time()-t0; tp=res["steps"]/tt
             tprint(f"Done: {tt:.1f}s | {tp:,.0f} steps/s | reward:{res['mean_reward']:+.4f}","ok")
             # --- Per-iteration diagnostics dashboard ---
@@ -3935,11 +4344,39 @@ class AlphaTradeSystem:
 # delisted, acquired, or dropped from the index during the backtest period.
 # For valid historical backtests, use a point-in-time index membership dataset.
 # Estimated bias: +0.3 to +0.5 annualized Sharpe for US large-cap equities.
-DEFAULT_SYMBOLS=["SPY","QQQ","DIA","AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","AVGO","AMD","ADBE",
-    "JPM","BAC","GS","MS","BLK","V","MA","AXP","PYPL","COF",
-    "JNJ","UNH","PFE","ABT","MRK","WMT","COST","PG","PEP","KO",
-    "HD","LOW","NKE","SBUX","MCD","DIS","NFLX","CRM","ORCL","INTC",
-    "XOM","CVX","COP","SLB","EOG","CAT","DE","HON","UPS","UNP"]
+# Top 100 US stocks by market cap (Feb 2026)
+DEFAULT_SYMBOLS=[
+    # Mega-cap tech
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","BRK-B","LLY",
+    # Top 11-20
+    "WMT","JPM","V","UNH","XOM","MA","COST","ORCL","HD","PG",
+    # Top 21-30
+    "JNJ","ABBV","NFLX","BAC","CRM","CVX","MRK","KO","AMD","PEP",
+    # Top 31-40
+    "TMO","LIN","ADBE","MCD","CSCO","ABT","ACN","WFC","IBM","GE",
+    # Top 41-50
+    "MS","PM","ISRG","NOW","TXN","QCOM","INTU","GS","DHR","CAT",
+    # Top 51-60
+    "AMGN","VZ","AXP","BKNG","PFE","T","BLK","SPGI","NEE","LOW",
+    # Top 61-70
+    "DE","AMAT","SYK","UNP","HON","SCHW","BA","COP","UBER","MDLZ",
+    # Top 71-80
+    "LRCX","ADP","TJX","VRTX","GILD","BSX","CB","MMC","PLD","ADI",
+    # Top 81-90
+    "SBUX","FI","BX","PANW","MU","INTC","KKR","SO","TMUS","DUK",
+    # Top 91-100
+    "CME","ICE","REGN","CI","BMY","EL","APD","MCK","PYPL","NKE",
+    # ETF benchmarks
+    "SPY","QQQ","DIA",
+    # Leveraged ETFs (2x bull)
+    "SSO","QLD","DDM",
+    # Leveraged ETFs (3x bull)
+    "UPRO","TQQQ","UDOW",
+    # Leveraged ETFs (2x inverse/bear)
+    "SDS","QID","DXD",
+    # Leveraged ETFs (3x inverse/bear)
+    "SPXU","SQQQ","SDOW",
+]
 
 YF_INTRADAY_MAX_PERIOD={"1m":"7d","2m":"60d","5m":"60d","15m":"60d","30m":"60d",
     "60m":"730d","1h":"730d","90m":"60d","1d":"max","5d":"max","1wk":"max","1mo":"max"}
@@ -4170,8 +4607,8 @@ def parse_args():
                    help="Enable Yahoo Finance data caching (disabled by default)")
     p.add_argument("--symbols",type=str,default="",
                    help="Comma-separated symbols to load (filters Norgate, or selects Yahoo symbols)")
-    p.add_argument("--n-symbols",type=int,default=50,
-                   help="Number of default symbols for --yahoo mode (default: 50)")
+    p.add_argument("--n-symbols",type=int,default=100,
+                   help="Number of default symbols for --yahoo mode (default: 100)")
     p.add_argument("--timeframes",type=str,default="5m,15m,30m,1h,1d")
     p.add_argument("--iterations",type=int,default=3)        # v7.0 optimal: 3 iterations
     p.add_argument("--steps-per-iter",type=int,default=50_000)  # v7.0 optimal: 50k per iter (3 × 50k = 150k total)
@@ -4226,7 +4663,7 @@ def main():
         if not HAS_YF:
             tprint("--yahoo requires yfinance: pip install yfinance", "err"); return
         syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-                if args.symbols else DEFAULT_SYMBOLS[:min(args.n_symbols, 50)])
+                if args.symbols else DEFAULT_SYMBOLS[:args.n_symbols])
         tprint(f"Data source: {data_source}", "warn")
         tprint("  Backtest results will be upward-biased. Use Norgate PIT data for valid results.", "warn")
         data = download_data(syms, cfg, use_cache=args.cache)
@@ -4240,10 +4677,10 @@ def main():
         data = SyntheticMarketGenerator(cfg).generate_multiple(args.n_synthetic, 2000)
     else:
         norgate_dir = args.norgate_dir or NORGATE_DIR
-        norgate_dbs = ([d.strip() for d in args.norgate_db.split(",") if d.strip()]
+        norgate_dbs = ([db.strip() for db in args.norgate_db.split(",") if db.strip()]
                        if args.norgate_db else None)
         norgate_syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-                        if args.symbols else None)
+                        if args.symbols else DEFAULT_SYMBOLS[:args.n_symbols])
 
         if not Path(norgate_dir).exists():
             tprint(f"Norgate data not found at: {norgate_dir}", "err")
