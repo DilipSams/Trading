@@ -4,7 +4,7 @@
 
 **From Absolute Zero to Understanding Every Moving Part**
 
-*Last Updated: February 18, 2026 — Includes RL observation fix, horizon optimization, Tier 1-3 alpha improvements, 3 dead alpha resurrections, ICIR/HitRate/Persistence quality metrics, no-trade threshold optimization, auto-flip mechanism, **asymmetric stop losses (8 bugs fixed), zero-trades bug fix (6 bugs fixed), crowding detection, professional table formatting, RL engine NaN fixes (4 bugs), CV parallelization (10x speedup), RL zero-trades policy collapse (5 bugs), training budget increase, and local optima detection (3 improvements)***
+*Last Updated: February 19, 2026 — Includes RL observation fix, horizon optimization, Tier 1-3 alpha improvements, 3 dead alpha resurrections, ICIR/HitRate/Persistence quality metrics, no-trade threshold optimization, auto-flip mechanism, **asymmetric stop losses (8 bugs fixed), zero-trades bug fix (6 bugs fixed), crowding detection, professional table formatting, RL engine NaN fixes (4 bugs), CV parallelization (10x speedup), RL zero-trades policy collapse (5 bugs), training budget increase, local optima detection (3 improvements), wave-batched MCTS (GPU optimization), KS/ADWIN drift detection (4-detector majority vote), horizon blender fix (dead code revived), neural net stability (LayerNorm + orthogonal init), and adaptive block bootstrap***
 
 *If you've never written a trading algorithm, never heard of "alpha," and aren't sure what a neural network does — this guide is for you. We start from scratch and build up, one concept at a time.*
 
@@ -44,6 +44,7 @@ If something doesn't make sense, skip ahead — it's often explained more fully 
 17. [Configuration Reference](#17-configuration-reference)
 18. [What's New in v7.0? (February 2026 Update)](#18-whats-new-in-v70-february-2026-update)
 19. [RL Engine Deep Fix (February 18, 2026)](#19-rl-engine-deep-fix-february-18-2026)
+20. [GPU, Drift Detection, and Horizon Blender Upgrades (February 19, 2026)](#20-gpu-drift-detection-and-horizon-blender-upgrades-february-19-2026)
 
 ---
 
@@ -4359,6 +4360,217 @@ The system also warns if it detects:
 | Feb 17: Zero-Trades (Pipeline) | 6 | Alpha warmup, thresholds |
 | **Feb 18: RL Engine** | **13** | **NaN (4), Speed (1), Policy (5), Training (1), Optima (3)** |
 | **Total** | **27** | |
+
+---
+
+## 20. GPU, Drift Detection, and Horizon Blender Upgrades (February 19, 2026)
+
+This section documents 6 upgrades spanning GPU efficiency, drift detection, horizon blending, neural network stability, adaptive simulation, and leveraged ETF support. Think of this session as a building renovation — some rooms were rebuilt for speed (MCTS), some got new alarm systems (drift detection), and one room that was listed on the blueprints but never actually wired up finally got its electricity connected (horizon blender).
+
+---
+
+### 20.1 Wave-Batched MCTS: "The Bus vs. Uber Problem"
+
+**Where:** `alphago_mcts_parallel.py` — `_run_rollouts()` method
+
+**The Problem:** The MCTS planner (the component that looks ahead 15-20 moves to find the best action) was sending work to the GPU one tiny package at a time. With 256 rollouts (exploration paths), each rollout triggered a separate GPU call with a small batch. The RTX 3090 GPU can process batches of 256-512 at once, but we were only sending 16-64 items per call. That's like ordering 256 separate Ubers for 256 people going to the same stadium — expensive and slow.
+
+**Analogy:** Imagine a restaurant kitchen (the GPU) that can cook 256 meals simultaneously on a giant grill. But the old system had waiters (rollouts) going to the kitchen one at a time: "Cook this one steak, please." The kitchen fires up the grill for one steak, waits, serves it, then fires up again for the next one. 256 trips to the kitchen, each using 5% of the grill capacity.
+
+**The Fix — Wave Batching:** Instead of sending one rollout at a time, we now group rollouts into "waves" of K rollouts. Each wave:
+
+1. **Select K paths** through the search tree (K rollouts explore different branches)
+2. **One GPU call** evaluates all K paths at once (batch size = K x B instead of just B)
+3. **Expand and back up** all K results
+
+With K=16 and B=16 environments, each GPU call now processes 256 items instead of 16. The number of GPU calls drops from 257 to about 17.
+
+**But wait — won't K rollouts all explore the same path?** That's where **virtual loss** comes in. It's like a "wet paint" sign. When rollout #1 walks down a branch, it puts up a sign saying "this path is temporarily bad." Rollout #2 sees the sign and picks a different branch. Rollout #3 sees two signs and picks a third branch. After the wave finishes, all the "wet paint" signs come down.
+
+The virtual loss code was already in the system but **it was never actually working** — it was putting up signs and taking them down within the same rollout, so no other rollout ever saw them. Wave batching is what makes virtual loss actually functional, because multiple rollouts now overlap in time.
+
+| Metric | Before | After (K=16, B=16) |
+|--------|--------|---------------------|
+| GPU calls per search | 257 | 17 |
+| Batch size per call | 16 | 256 |
+| GPU utilization | ~3% | ~50% |
+
+**New config:** `mcts_wave_size` (default: auto-calculated to target batch ~256)
+
+**Code location:** `alphago_mcts_parallel.py` — `_run_rollouts()` (lines ~189-362)
+
+---
+
+### 20.2 KS/ADWIN Drift Detection: "The Smoke Detector Upgrade"
+
+**Where:** `alphago_architecture.py` — `DriftDetector` class, `ks_2sample_test()`, `ADWIN` class
+
+**The Problem:** The system had only 2 ways to detect when the market changes and its predictions go stale (called "drift"):
+1. **PSI (Population Stability Index):** Checks if the data distribution shifted
+2. **IC Decay:** Checks if prediction accuracy dropped
+
+Two detectors isn't bad, but here's the issue: each one can give false alarms. PSI might trigger during a volatile week that's actually normal. IC decay might miss a subtle shift. It's like having a house with only a smoke detector and a carbon monoxide detector — decent, but you'd feel safer with a few more sensors.
+
+**Analogy:** Think of your body's immune system. It doesn't rely on just one type of white blood cell to fight infection. It has multiple detection mechanisms — some look for bacteria, some look for viruses, some watch for abnormal cell behavior. If multiple mechanisms agree "something is wrong," your body mounts a response. If only one fires, it might be a false alarm.
+
+**The Fix — 4 Detectors + Majority Vote:**
+
+We added two new detectors and changed the decision rule:
+
+| Detector | What It Checks | Analogy |
+|----------|---------------|---------|
+| **PSI** (existing) | Did the data distribution change? | Thermometer: "Is the patient's temperature unusual?" |
+| **IC Decay** (existing) | Are predictions getting worse? | Blood test: "Are the antibody levels dropping?" |
+| **KS Test** (new) | Did the shape of the IC curve change? | X-ray: "Does the lung look different from last month?" |
+| **ADWIN** (new) | Is there a sudden break point in recent data? | Heart monitor: "Was there a sudden spike or drop?" |
+
+**The KS (Kolmogorov-Smirnov) Test** splits your recent prediction accuracy history in half — the first half vs. the second half — and asks: "Do these two halves look like they came from the same distribution?" If the answer is "no" (p-value below 0.01), something changed.
+
+**ADWIN (Adaptive Windowing)** is like a sliding window that automatically shrinks when it detects a change. Imagine watching a river's water level. ADWIN keeps a memory of recent levels. If the average of the old readings is statistically different from the average of the new readings, it sounds the alarm and forgets the old data (because it's no longer relevant).
+
+**Majority Vote Decision Rule:**
+
+| Detectors Firing | Response | Analogy |
+|------------------|----------|---------|
+| 0 of 4 | Full speed ahead (scale = 1.0) | All clear, no symptoms |
+| 1 of 4 | Log it, but don't change positions | One sensor beeped — probably a false alarm, but note it |
+| 2 of 4 | Moderate reduction (50% position cut) | Two sensors agree — something's off, be cautious |
+| 3-4 of 4 | Severe reduction (75% cut) + 20-bar cooldown | Multiple alarms — take shelter, wait for things to calm down |
+
+**Per-Alpha Monitoring:** Each individual alpha (strategy) also gets its own mini drift monitor. If 30% or more of your alphas are drifting, the system knows the problem is systemic, not isolated.
+
+**New configs:**
+- `drift_ks_sensitivity: 0.01` — KS test p-value threshold
+- `drift_adwin_delta: 0.002` — ADWIN sensitivity (lower = more sensitive)
+- `drift_min_signals_for_trigger: 2` — How many detectors must agree
+
+**Code locations:**
+- `alphago_architecture.py` — `ks_2sample_test()` (lines ~3815-3850)
+- `alphago_architecture.py` — `ADWIN` class (lines ~3853-3940)
+- `alphago_architecture.py` — `AlphaDriftMonitor` class (lines ~3943-4040)
+- `alphago_architecture.py` — `DriftDetector.is_drifting()` (lines ~4157-4230)
+
+---
+
+### 20.3 Horizon Blender Fix: "The Room That Was Never Wired"
+
+**Where:** `alphago_architecture.py` — `HorizonBlender.blend()`, `SignalEnsemble.combine()`
+
+**The Problem:** This one was a surprise discovery. The system has a component called `HorizonBlender` that's supposed to blend predictions from different time horizons — some alphas predict what happens tomorrow (5 bars), others predict what happens in 3 weeks (15 bars). The blender groups them into "horizon buckets" (1-bar, 5-bar, 15-bar) and combines them with configured weights (was: 30%, 30%, 40%).
+
+Sounds great. **But it was completely dead code.** Here's why:
+
+Before signals reach the blender, a function called `_normalize_horizon()` converts every signal to "per-bar" units (horizon=1). This is necessary so the meta-learner can compare apples to apples. But the blender groups signals by their `sig.horizon` value — which is now **always 1** for every signal. So every signal lands in the 1-bar bucket. The 5-bar and 15-bar buckets are permanently empty.
+
+**Analogy:** Imagine a mail sorting facility with three bins: "Local," "Domestic," and "International." A well-meaning employee stamps every incoming package "Local" before it reaches the sorting room — even if it's actually going to Germany. The sorting room faithfully reads the stamp, puts everything in the "Local" bin, and the "Domestic" and "International" bins stay empty forever. The sorting room was built correctly and working hard — it just never received properly labeled mail.
+
+**The irony:** The original horizon information was already saved! When `_normalize_horizon()` converts a signal, it tucks the original horizon into `metadata['original_horizon']`. The fix was embarrassingly simple: make the blender read from `metadata['original_horizon']` instead of `sig.horizon`.
+
+**What this means in practice:**
+- The 5-bar bucket now gets 4 alphas: RL, Mean Reversion, Calendar, Reversal
+- The 15-bar bucket now gets 7 alphas: Trend, Value, Carry, Seasonality, VolPremium, Amihud, Hurst
+- The 1-bar bucket stays empty (no alpha operates at horizon=1)
+
+**Additional improvements from the research:**
+
+1. **sqrt(h) weighting:** Within each bucket, signals are now weighted by `sqrt(native_horizon) * confidence`. Why sqrt? Longer-horizon predictions have a better signal-to-noise ratio (like how a weather forecast for "will it rain this week?" is more reliable than "will it rain at 3:47 PM tomorrow?"). The square root is a standard statistical scaling for how information grows with time.
+
+2. **Max confidence blending:** The blended confidence equals the maximum confidence across all active signals. If your 15-bar alpha is very confident ("strong uptrend"), but your 5-bar alpha is uncertain ("short-term noise"), the blend keeps the 15-bar conviction. This naturally implements "if the long-term view is confident, hold the position."
+
+3. **Weight rebalancing:** Since no alpha has native horizon=1, the bucket weights changed from `(0.3, 0.3, 0.4)` to `(0.0, 0.35, 0.65)`. The 30% that was being wasted on an empty bucket is now redistributed to the 5-bar and 15-bar buckets.
+
+**New config:**
+- `horizon_blend_weights: (0.0, 0.35, 0.65)` — 1d/5d/15d bucket weights
+
+**Code locations:**
+- `alphago_architecture.py` — `HorizonBlender.blend()` (lines ~3526-3572)
+- `alphago_architecture.py` — `SignalEnsemble.combine()` (lines ~3692-3695)
+- `alphago_architecture.py` — `ArchitectureConfig.horizon_blend_weights` (line ~335)
+
+---
+
+### 20.4 Neural Network Stability: "Washing the Ingredients"
+
+**Where:** `alphago_trading_system.py` — `SharedBackbone`, `TransformerBackbone`, `AlphaTradeNet`
+
+**The Problem:** The neural network sometimes produced wild outputs early in training, especially with the first few batches. Raw financial data has very different scales across features — a stock price might be 150.0 while a volume ratio is 0.003. When you dump numbers of wildly different magnitudes into a neural network, the first layer's weights have to work overtime to balance everything, and early gradients can explode.
+
+**Analogy:** Imagine pouring flour, salt, baking soda, and water into a mixer. If you dump them all in at once at random quantities, the first few seconds are a mess — lumps everywhere, powder flying. But if you first measure each ingredient to the right scale and pre-mix similar ones, the mixer works smoothly from the start.
+
+**The Fixes:**
+
+**Fix A — LayerNorm on inputs:** Both the `SharedBackbone` (CNN) and `TransformerBackbone` now apply `LayerNorm` to the raw input features before any processing. LayerNorm is like a "normalizer" that rescales each feature so they're all on a similar scale. It learns the best scale automatically during training.
+
+**Fix B — Orthogonal initialization:** The policy, value, and risk heads now use orthogonal weight initialization instead of PyTorch's default random init. Think of it like pre-positioning the knobs on a mixing board — orthogonal init starts the weights in an arrangement where different neurons don't interfere with each other, making early training much more stable.
+
+- Policy head: small gain (0.01) — starts near-uniform over actions
+- Value head: standard gain (1.0) — starts responsive but stable
+- Risk head: small gain (0.01) — starts predicting low risk
+
+**Code location:** `alphago_trading_system.py` — `SharedBackbone.__init__()` (line ~948), `TransformerBackbone.__init__()` (line ~974), `AlphaTradeNet.__init__()` (lines ~1029-1035)
+
+---
+
+### 20.5 Adaptive Block Bootstrap: "Matching the Wind Conditions"
+
+**Where:** `alphago_trading_system.py` — `TradingEnv.stochastic_clone()`
+
+**The Problem:** When the MCTS planner looks ahead, it creates simulated copies of the market environment using "block bootstrap" — taking chunks of real historical returns and shuffling them to create plausible future scenarios. The chunk size (block_size) matters a lot:
+
+- **Too small (3 bars):** Destroys momentum. In a trending market, this simulates random noise instead of continued trend.
+- **Too large (10 bars):** In a choppy market, this makes the simulation look artificially smooth and trending.
+
+The old code used the same block size regardless of whether the market was trending or choppy.
+
+**Analogy:** Imagine you're a flight simulator instructor creating wind scenarios. In calm weather (low turbulence), you simulate gentle, random puffs — small blocks of wind data, shuffled. In a storm with sustained strong winds from the north, you need to use larger blocks that preserve the wind direction and strength. If you use tiny random puffs during a storm simulation, your pilots will train for the wrong conditions.
+
+**The Fix — Variance-Ratio Trend Proxy:**
+
+The system now checks: "Is the market trending or choppy?" It uses a simple metric:
+
+```
+trend_strength = |sum of last 20 returns| / sum of |each return|
+```
+
+- **Trending market (trend_strength > 0.40):** Returns mostly go in the same direction, so their absolute sum is large. Use large blocks (at least 10 bars) to preserve the momentum.
+- **Choppy market (trend_strength < 0.15):** Returns flip-flop up and down, so they cancel out. Use smaller blocks (as low as 3) since there's no momentum to preserve.
+- **Normal market (0.15-0.40):** Use the default configured block size.
+
+**Code location:** `alphago_trading_system.py` — `stochastic_clone()` (lines ~1211-1218)
+
+---
+
+### 20.6 Leveraged ETF Support
+
+**Where:** `alphago_trading_system.py` — `DEFAULT_SYMBOLS`
+
+**What changed:** Added 12 leveraged ETFs to the default symbol list so the system can trade them during backtests:
+
+| Type | SPY-based | QQQ-based | DIA-based |
+|------|-----------|-----------|-----------|
+| 2x Bull | SSO | QLD | DDM |
+| 3x Bull | UPRO | TQQQ | UDOW |
+| 2x Bear | SDS | QID | DXD |
+| 3x Bear | SPXU | SQQQ | SDOW |
+
+**What are leveraged ETFs?** Regular ETFs track an index 1-to-1 (SPY tracks the S&P 500). Leveraged ETFs use financial derivatives to multiply the daily return. A 3x bull ETF like TQQQ aims to return 3 times the daily return of QQQ — if QQQ goes up 1%, TQQQ goes up ~3%. But if QQQ goes down 1%, TQQQ goes down ~3%.
+
+**Warning:** Leveraged ETFs are not simple "multiply your gains" instruments. Over time, they suffer from "volatility decay" — even if the underlying index returns to the same price, a leveraged ETF can lose value due to the daily rebalancing math. They're tools for short-term directional bets, which is exactly what this system's alpha signals try to capture.
+
+**Code location:** `alphago_trading_system.py` — `DEFAULT_SYMBOLS` (lines ~4369-4380)
+
+---
+
+### 20.7 Summary of Changes
+
+| Change | Layer | Impact | Analogy |
+|--------|-------|--------|---------|
+| Wave-batched MCTS | L4 (RL Engine) | 15x fewer GPU calls, ~50% GPU utilization | Bus instead of 256 Ubers |
+| KS/ADWIN Drift Detection | L3 (Risk) | 4-detector majority vote, graduated response | Full alarm system instead of just a smoke detector |
+| Horizon Blender Fix | L2 (Ensemble) | Dead code revived, sqrt(h) weighting | Finally wired up the sorting room |
+| Neural Net Stability | L4 (RL Engine) | Stable early training, no gradient explosions | Pre-measured ingredients for the mixer |
+| Adaptive Block Bootstrap | L4 (RL Engine) | Trend-preserving simulations | Matching wind conditions to reality |
+| Leveraged ETFs | L0 (Data) | 12 new tradeable instruments | More tools in the toolbox |
 
 ---
 
