@@ -120,7 +120,7 @@ This system has evolved through three major generations:
 | **Alpha Count** | 1 (RL only) | 6 traditional + 1 RL | **12 alphas** (10 core + 2 advanced, all alive) |
 | **Features** | 45-dim observation | 45-dim features | **49-dim features** (Tier 1 improvements) |
 | **Horizon** | 5-bar | Mixed (5-21 bars) | **15-bar standardized** (IC-optimized) |
-| **RL Training** | 50k-100k steps | 100k steps | **150k steps** (optimal balance) |
+| **RL Training** | 50k-100k steps | 100k steps | **800k steps** (8 iterations x 100k) |
 | **RL Observation** | Direct from env | **BUG: not passed in validation** | ✅ **FIXED: properly windowed** |
 | **Risk Management** | Basic drawdown control | Kill switches | **Asymmetric stops** (1.5% loss, 5% trail, ATR-adjusted) |
 | **Validation** | Basic sharpe test | Walk-forward CV | **Multi-horizon IC + ICIR + HitRate + Persistence** |
@@ -202,7 +202,7 @@ Let's break down what changed from v6.0 to v7.0 in plain English:
 1. Fixing what was broken (8 bugs, 3 dead alphas resurrected)
 2. Adding institutional risk controls (asymmetric stops, crowding detection)
 3. Improving measurement (4 quality metrics instead of 1)
-4. Standardizing everything (15-bar horizon, 49 features, 150k training steps)
+4. Standardizing everything (15-bar horizon, 49 features, 800k training steps)
 
 The result is a system that's safer (better risk management), smarter (10 working alphas), and more reliable (comprehensive validation).
 
@@ -260,7 +260,7 @@ Imagine you're running a chocolate factory. You wouldn't have one person doing e
 │                           ▼                                          │
 │  🤝 L2 - THE INVESTMENT COMMITTEE (Ensemble Layer)                   │
 │     "Let's vote on the final recipe"                                 │
-│     • Collects all 6 analysts' opinions                              │
+│     • Collects all 12 analysts' opinions                             │
 │     • Weights them intelligently (not just average!)                  │
 │     • Gives more weight to analysts who've been right recently       │
 │     • Considers what market "regime" we're in (calm? volatile?)      │
@@ -920,7 +920,7 @@ Every alpha in the system MUST produce output in the same standardized format. T
    - **sigma (uncertainty):** Comes from the network's "risk head" which was trained to predict future volatility (with 0.01 floor)
    - **confidence:** Based on how "sure" the network is — when it puts all probability on one action, confidence is high; when it's split evenly, confidence is low
 
-**Optimal Training:** 150k steps (3 iterations × 50k) achieves IC=+0.044 at 5-bar horizon (PASS status). 100k = underfitted, 200k = overfitted.
+**Optimal Training:** 800k steps (8 iterations × 100k). Earlier experiments showed 150k was too few for PPO to learn meaningful patterns — the agent barely explored half an episode per environment before training ended.
 
 **Example:**
 ```
@@ -1364,16 +1364,17 @@ Ridge regression finds those optimal weights by looking at past data: which comb
 **Mathematically (simplified for 12 alphas):**
 ```
 mu_hat = w₁·mu_rl + w₂·mu_trend + w₃·mu_mr + w₄·mu_value + w₅·mu_carry
-         + w₆·mu_season + w₇·mu_volprem + w₈·mu_amihud + w₉·mu_hurst + w₁₀·mu_reversal
+         + w₆·mu_calendar + w₇·mu_volprem + w₈·mu_amihud + w₉·mu_hurst
+         + w₁₀·mu_reversal + w₁₁·mu_vol_term + w₁₂·mu_vol_price_div
 ```
 
-The weights w₁ through w₁₀ are learned from past data, with a penalty (called "regularization") that keeps them from getting too extreme.
+The weights w₁ through w₁₂ are learned from past data, with a penalty (called "regularization") that keeps them from getting too extreme.
 
 **The SVD Solution (why it's numerically stable):**
 
 The system solves Ridge regression using SVD (Singular Value Decomposition) instead of the normal equation. In plain English: instead of dividing by things that might be zero (which would crash), it decomposes the problem into a form where division by zero can't happen. This means the system works even when some alphas are highly correlated (saying very similar things).
 
-### 7.3 The 34-Feature Input Vector
+### 7.3 The 40-Feature Input Vector
 
 For each bar, the meta-learner sees a 40-dimensional feature vector — 3 values from each of the 12 alphas, plus 4 regime probabilities:
 
@@ -1396,9 +1397,9 @@ Total: 12 alphas × 3 values + 4 regime bits = 40 features
 
 The regime probabilities are included so the meta-learner can learn *context-dependent* weighting — e.g., "in trending markets (regime 1), trust the trend alpha more."
 
-**Why 34 features works with Ridge Regression:**
+**Why 40 features works with Ridge Regression:**
 
-A natural question is: "With only ~126 training observations in each walk-forward window, isn't 34 features too many?" The classical statistics "rule of thumb" says you need at least sqrt(n) features — which would be sqrt(126) ≈ 11 features.
+A natural question is: "With only ~126 training observations in each walk-forward window, isn't 40 features too many?" The classical statistics "rule of thumb" says you need at least sqrt(n) features — which would be sqrt(126) ≈ 11 features.
 
 However, this rule comes from Ordinary Least Squares (OLS), which has no regularization. **Ridge Regression is fundamentally different** — it adds an L2 penalty (λ × sum of squared weights) that shrinks noisy coefficients toward zero. This means:
 
@@ -1406,9 +1407,25 @@ However, this rule comes from Ordinary Least Squares (OLS), which has no regular
 - You don't lose information by *including* an alpha; you only lose information by *excluding* it
 - The regularization parameter λ controls how aggressively weights are shrunk — higher λ = more conservative, lower λ = more trust in the data
 
-**Analogy:** Think of it like a job interview where you can ask unlimited questions. With OLS, asking too many questions confuses you (overfitting). With Ridge, you can ask all 34 questions — but you have an inner skeptic that ignores answers that seem noisy or inconsistent. More information never hurts when you have a good filter.
+**Analogy:** Think of it like a job interview where you can ask unlimited questions. With OLS, asking too many questions confuses you (overfitting). With Ridge, you can ask all 40 questions — but you have an inner skeptic that ignores answers that seem noisy or inconsistent. More information never hurts when you have a good filter.
 
-### 7.4 Safety Rails: Preventing the Committee from Going Off the Rails
+### 7.4 Horizon Blender: Weighting Short-Term vs Long-Term Views
+
+The system's 12 alphas don't all predict at the same time horizon. Some are "short-sighted" (5-bar horizon: RL, Mean Reversion, Calendar, Reversal), others are "far-sighted" (15-bar horizon: Trend, Value, Carry, Seasonality, Vol Premium, Amihud, Hurst).
+
+**Why this matters:** A 15-bar prediction of "strong uptrend" is more informative than a 5-bar prediction of "slight dip" — longer horizons have a better signal-to-noise ratio (like how "will it rain this week?" is more reliable than "will it rain at 3:47 PM tomorrow?"). The HorizonBlender groups signals by their native horizon and gives more weight to longer-horizon views.
+
+**How it works:**
+1. **Bucketing:** Each signal is grouped into the nearest horizon bucket (1-bar, 5-bar, or 15-bar) using its original native horizon. Since all signals are normalized to per-bar units before reaching the ensemble, the blender reads the original horizon from saved metadata.
+2. **sqrt(h) weighting:** Within each bucket, signals are weighted by `sqrt(native_horizon) * confidence`. This means a 15-bar alpha gets sqrt(15) ≈ 3.9x the weight of a 1-bar alpha (all else equal) — reflecting the statistical principle that information grows with the square root of time.
+3. **Max confidence:** The blended confidence is the *maximum* confidence across all active signals. If the 15-bar Trend alpha says "very confident uptrend" but the 5-bar Reversal says "uncertain," the blend keeps the long-term conviction. This naturally implements "if the long-term view is confident, hold."
+4. **Bucket weights:** The configured weights `(0.0, 0.35, 0.65)` determine how much each horizon band contributes. The 1-bar bucket has weight 0 because no alpha currently operates at 1-bar horizon. The 15-bar bucket dominates at 65%.
+
+**Analogy:** Imagine planning a road trip. You have some friends who checked tomorrow's weather (short-term) and others who checked the 10-day forecast (long-term). If the 10-day forecast says "clear skies all week" but tomorrow's says "cloudy morning," you'd still pack for sunny weather. The long-term view carries more weight because it's less likely to flip. That's what sqrt(h) weighting does — it trusts the steadier, longer-horizon signals more.
+
+The final ensemble output blends 70% meta-learner (which treats all alphas equally) with 30% HorizonBlender (which upweights longer horizons). When the meta-learner is not yet trained, this ratio flips to 30/70.
+
+### 7.5 Safety Rails: Preventing the Committee from Going Off the Rails
 
 | Safety Mechanism | What It Does | Why It's Necessary |
 |---|---|---|
@@ -1455,7 +1472,7 @@ Sometimes an alpha is *consistently wrong* — it predicts UP but prices go DOWN
 
 **Code Location:** [alphago_layering.py](d:\Experiments\Trading\alphago_layering.py) — Applied before pipeline evaluation step. [alphago_architecture.py](d:\Experiments\Trading\alphago_architecture.py) — `AlphaFactory.set_signal_flip()` method.
 
-### 7.5 Alpha Correlation Management
+### 7.6 Alpha Correlation Management
 
 **The problem:** If 3 of your 12 alphas are highly correlated (they always agree), you effectively only have 9 independent opinions, not 12. Your diversification is an illusion.
 
@@ -1471,7 +1488,7 @@ Real-world: typically N_eff ≈ 4-6 (some overlap is natural)
 
 When average pairwise correlation between an alpha and others exceeds 0.7, that alpha's weight is penalized — scaled down to prevent signal-space concentration.
 
-### 7.6 Alpha Quality Metrics: Beyond IC [NEW in v7.0]
+### 7.7 Alpha Quality Metrics: Beyond IC [NEW in v7.0]
 
 IC (Information Coefficient) tells you *how well* an alpha predicts returns, but it doesn't tell the whole story. v7.0 adds three additional metrics that give a richer picture of each alpha's health:
 
@@ -1735,6 +1752,32 @@ Trade $500K: impact = $15,811 → total ≈ 3.16% of trade  ← even more expens
 The sqrt(trade_size / ADV) model (based on Almgren & Chriss, 2000) captures this: the bigger your trade relative to available liquidity, the more you move the market against yourself.
 
 **L3 uses costs proactively:** Before deciding on a position, L3 subtracts the expected round-trip trading cost from the expected return (mu_hat). If the cost exceeds the alpha, the optimal position is zero — don't trade at all!
+
+### 8.6 Drift Detection: Knowing When the Market Has Changed
+
+**The problem:** Trading models learn patterns from historical data. But markets change — what worked in 2020 might not work in 2023. When the market regime shifts enough that your model's predictions go stale, that's called "drift." If you don't detect it, you keep trading on stale signals and lose money.
+
+**Analogy:** Imagine you learned to drive on dry roads. One morning you wake up and the roads are icy, but you don't realize it because you haven't looked outside. You drive at your normal speed, brake at the normal distance, and... crash. A drift detector is like a weather alert system that says "conditions have changed — slow down."
+
+**The system uses 4 independent detectors, like 4 different sensors:**
+
+| Detector | What It Checks | Analogy |
+|----------|---------------|---------|
+| **PSI** | Did the data distribution shift? | "Is the temperature different from what we trained for?" |
+| **IC Decay** | Are predictions getting worse over time? | "Are my braking distances getting longer?" |
+| **KS Test** | Did the shape of the prediction accuracy curve change? | "Does the road surface look different from last month's?" |
+| **ADWIN** | Was there a sudden break point in recent data? | "Did the road suddenly go from dry to icy?" |
+
+**Majority vote:** Instead of trusting any single sensor (which might false-alarm), the system requires at least 2 of 4 to agree. The response is graduated:
+
+| Detectors Firing | Action | Scale |
+|------------------|--------|-------|
+| 0 of 4 | All clear — full exposure | 1.0x |
+| 1 of 4 | Log it, but keep trading normally | 1.0x |
+| 2 of 4 | Something's off — cut positions 50% | 0.5x |
+| 3-4 of 4 | Multiple alarms — severe cut + 20-bar cooldown | 0.25x |
+
+Each alpha also gets its own mini drift monitor that tracks whether its individual prediction accuracy has shifted.
 
 ---
 
@@ -2230,9 +2273,10 @@ The brain of the RL agent is a neural network with a shared backbone and three s
     └──────────────┘ └──────────┘ └──────────────┘
 ```
 
-- **Policy Head:** Outputs 5 probabilities (one per action). This is the "what to do" head.
-- **Value Head:** Estimates the expected cumulative future reward from the current state. Used during training to compute advantages ("was this action better or worse than average?").
-- **Risk Head:** Predicts forward realized volatility. This auxiliary task gives the network a richer understanding of market state and provides the sigma for the AlphaSignal.
+- **Input LayerNorm:** Before any processing, the raw features are normalized by a learned LayerNorm layer. This is like pre-measuring ingredients before mixing — it ensures all 49 features are on a similar scale, preventing gradient explosions in early training.
+- **Policy Head:** Outputs 5 probabilities (one per action). This is the "what to do" head. Initialized with small orthogonal weights (gain=0.01) so it starts near-uniform over all actions.
+- **Value Head:** Estimates the expected cumulative future reward from the current state. Used during training to compute advantages ("was this action better or worse than average?"). Initialized with orthogonal weights (gain=1.0).
+- **Risk Head:** Predicts forward realized volatility. This auxiliary task gives the network a richer understanding of market state and provides the sigma for the AlphaSignal. Initialized with small orthogonal weights (gain=0.01) to start predicting low risk.
 
 ### 10.3 The Trading Environment: TradingEnv
 
@@ -2285,6 +2329,8 @@ Repeated 32 times with different simulated futures
 ```
 
 **Critical detail:** The simulated futures are NOT the real future prices (that would be cheating). Instead, MCTS generates **synthetic future prices** using a regime-conditioned block bootstrap — it samples realistic price sequences from the training data, conditioned on the current market regime. The agent plans over *plausible* futures, not the answer key.
+
+**Wave batching for GPU efficiency:** Instead of evaluating one search path at a time (which wastes GPU capacity), MCTS groups paths into "waves" of K rollouts. Within a wave, K paths are explored in parallel using "virtual loss" — a mechanism that puts up a "wet paint" sign on visited branches so parallel paths explore different directions. Then all K paths are evaluated in one GPU call (batch size = K x B instead of just B). This reduces GPU calls from 256 to about 17 with wave size K=16. The block size adapts to market conditions — in trending markets, simulations use larger blocks to preserve momentum; in choppy markets, smaller blocks.
 
 ---
 
@@ -2819,7 +2865,7 @@ Build the neural network (~1.5M parameters with default settings). Initialize a 
 
 ### Step 5: First Training Iteration
 
-Clone the champion network → create up to 16 parallel trading environments → run PPO for 150,000 steps (optimal: 3 iterations × 50k) → collect experience → update network weights. Mean reward starts around -0.5 to +0.5. Note: 100k = underfitted (IC=+0.063), 150k = optimal (IC=+0.044, PASS status), 200k = overfitted (IC=-0.022).
+Clone the champion network → create up to 64 parallel trading environments → run PPO for 800,000 steps (8 iterations × 100k) → collect experience → update network weights. Mean reward starts around -0.5 to +0.5. Earlier experiments found 150k steps too few (barely half an episode per environment) — the 800k budget gives PPO enough time to learn meaningful trading patterns.
 
 ### Step 6: MCTS Distillation (Iterations 2+)
 
@@ -2839,13 +2885,14 @@ Best champion evaluated on all holdout datasets. Per-symbol results printed: PnL
 
 | File | Size | Layer(s) | Purpose |
 |------|------|----------|---------|
-| `alphago_trading_system.py` | ~3,300 lines | Core v3.0 | The "engine room." Contains: RL environment, PPO trainer, MCTS planner, self-play loop, feature engineering, synthetic data generation, neural network architecture. |
-| `alphago_architecture.py` | ~5,200 lines | L1-L4 | The v7.0 institutional wrapper. Contains: AlphaSignal interface, **10 alpha families** (6 base + 4 new), Ridge meta-learner, PortfolioConstructor (risk/optimizer), ExecutionEngine, kill switches, reconciliation, alerting. |
+| `alphago_trading_system.py` | ~4,700 lines | Core v3.0 | The "engine room." Contains: RL environment, PPO trainer, self-play loop, feature engineering, synthetic data generation, neural network architecture (with LayerNorm + orthogonal init). |
+| `alphago_architecture.py` | ~6,100 lines | L1-L4 | The v7.0 institutional wrapper. Contains: AlphaSignal interface, **12 alpha families** (10 core + 2 advanced), Ridge meta-learner, HorizonBlender (sqrt(h) weighting), PortfolioConstructor (risk/optimizer), DriftDetector (4-detector majority vote), ExecutionEngine, kill switches, reconciliation, alerting. |
 | `alphago_enhancements.py` | ~2,500 lines | Various | Enhanced configuration, additional risk management, monitoring dashboards, extension hooks. |
 | `alphago_cost_model.py` | ~153 lines | L3, L4 | Single source of truth for transaction costs: half-spread + sqrt-impact + fees. Used by both L3 (optimization) and L4 (execution). |
 | `alphago_stop_loss.py` | ~350 lines | L4 | **NEW in v7.0:** Asymmetric stop loss manager. Implements tight loss stops (1.5%), wide trail stops (5%), ATR-based volatility scaling, time-based tightening. Production-ready after 8 critical bug fixes. |
-| `alphago_layering.py` | ~1,800 lines | Pipeline | Wires L1→L2→L3→L4 into a single `step()` call. Contains the InstitutionalPipeline orchestrator. Includes crowding detection (>70% alpha agreement monitoring). |
-| `table_formatter.py` | ~200 lines | Utilities | **NEW in v7.0:** Professional table formatting with box-drawing characters (┌┬┐├┼┤└┴┘). Used for alpha validation tables, backtest reports, comparison tables. Supports column alignment, numeric formatting, UTF-8 encoding. |
+| `alphago_mcts_parallel.py` | ~390 lines | RL | Wave-batched MCTS planner with virtual loss, progressive widening, and continuation rollouts. K rollouts per GPU call for GPU saturation. |
+| `alphago_layering.py` | ~2,900 lines | Pipeline | Wires L1→L2→L3→L4 into a single `step()` call. Contains the InstitutionalPipeline orchestrator. Includes crowding detection (>70% alpha agreement monitoring). |
+| `table_formatter.py` | ~450 lines | Utilities | **NEW in v7.0:** Professional table formatting with box-drawing characters (┌┬┐├┼┤└┴┘). ANSI-aware for colored output. Used for alpha validation tables, backtest reports, comparison tables. |
 | `validation_engine.py` | ~990 lines | All | Anti-overfitting framework: Purged Walk-Forward CV, Combinatorial Purged CV, Deflated Sharpe, significance gates, multiple testing correction. |
 | `data_quality.py` | ~1,100 lines | L0 | Data quality scoring, missing data policies, schema validation, vendor reconciliation, universe filters. |
 | `backtest_report.py` | ~550 lines | Reporting | Report generation: performance metrics, trade analysis, equity curves, attribution. |
@@ -2861,6 +2908,7 @@ Best champion evaluated on all holdout datasets. Per-symbol results printed: PnL
 | **Alpha** | A predictive signal about future returns. Any edge over a benchmark. Like an analyst's opinion about what will happen next. |
 | **Auto-Flip** | Automatically inverting an alpha's signal (multiply by -1) when walk-forward validation reveals consistently negative IC. Turns a reliably wrong signal into a reliably right one. |
 | **Asymmetric Stop Loss** | A stop loss system with tight downside protection (1.5% loss stop) and loose upside room (5% trailing stop from peak). Lets winners run while cutting losers quickly — the opposite of amateur behavior. ATR-adjusted to market volatility. See Section 9.7. |
+| **ADWIN (Adaptive Windowing)** | A change detection algorithm that watches a stream of numbers and automatically detects when the average suddenly shifts. Like a heart monitor that alerts when the heartbeat pattern changes. Used in drift detection (Section 8.6). |
 | **ADV (Average Daily Volume)** | How much of an asset trades per day, in dollar terms. Measures liquidity — how easily you can buy/sell without moving the price. |
 | **ATR (Average True Range)** | A volatility measure that captures the typical daily price range. Calculated as the average of max(High-Low, \|High-PrevClose\|, \|Low-PrevClose\|) over 14 bars. Used to scale stop losses to market conditions — wider stops in volatile markets, tighter in calm markets. |
 | **Basis Points (bps)** | 1/100th of a percent. 100 bps = 1%. Used because traders deal with very small edges. |
@@ -2877,15 +2925,19 @@ Best champion evaluated on all holdout datasets. Per-symbol results printed: PnL
 | **GAE (Generalized Advantage Estimation)** | A PPO technique that calculates how much better (or worse) an action was compared to what was expected. |
 | **Gating** | Dynamically adjusting the weights given to different models based on context (e.g., market regime). |
 | **Hit Rate** | Fraction of active bars where the alpha correctly predicted the direction (sign) of the return. Like a baseball batting average for alpha predictions. |
+| **Horizon Blender** | A component in L2 that groups alpha signals by their native prediction horizon (5-bar vs 15-bar) and blends them with sqrt(h) weighting — longer-horizon signals get more influence because they have better signal-to-noise ratio. See Section 7.4. |
 | **ICIR (IC Information Ratio)** | mean(rolling IC) / std(rolling IC). Measures how *consistently* an alpha predicts, not just how well on average. A high ICIR means the alpha is reliable across different time periods. |
 | **Information Coefficient (IC)** | The correlation between predicted and realized returns. Measures how accurate a signal is. |
 | **Kelly Criterion** | The formula for optimal bet sizing: f* = mu / sigma². Maximizes long-term geometric growth. |
 | **Kill Switch** | A hard safety rule that immediately flattens all positions when triggered. The emergency brake. |
+| **KS Test (Kolmogorov-Smirnov)** | A statistical test that compares two sets of numbers to see if they come from the same distribution. Like comparing two photographs to see if the scene has changed. Used in drift detection (Section 8.6). |
 | **Leverage** | Using borrowed money to amplify positions. 2× leverage = $2 invested for every $1 of capital. |
 | **Log-Amihud** | A scale-invariant version of the Amihud illiquidity measure: log(1 + \|return\| / dollar_vol × 10⁸). Prevents numeric underflow for highly liquid stocks. |
 | **Lookahead Bias** | Using future information that wouldn't be available at the time of the decision. The #1 backtesting sin. |
 | **Market Impact** | The price movement caused by your own trading. Large orders move the market against you. |
-| **MCTS (Monte Carlo Tree Search)** | A planning algorithm that explores possible future scenarios. From AlphaGo. |
+| **LayerNorm** | A normalization technique that rescales neural network inputs so all features are on a similar scale. Like pre-measuring ingredients before baking. Applied at the backbone input to prevent gradient explosions. |
+| **MCTS (Monte Carlo Tree Search)** | A planning algorithm that explores possible future scenarios. From AlphaGo. Uses wave batching to group multiple search paths into one GPU call for efficiency. |
+| **Majority Vote (Drift)** | A decision rule requiring at least 2 of 4 drift detectors (PSI, IC decay, KS test, ADWIN) to agree before reducing positions. Prevents false alarms from individual noisy sensors. See Section 8.6. |
 | **Meta-Learner** | A model that learns how to combine other models. In this system, the Ridge regression in L2. |
 | **mu (μ, mu_hat)** | Expected return. Greek letter for "mean." mu_hat means the combined/estimated expected return. |
 | **PPO (Proximal Policy Optimization)** | A reinforcement learning algorithm that updates the policy in small, stable steps. |
@@ -2898,15 +2950,18 @@ Best champion evaluated on all holdout datasets. Per-symbol results printed: PnL
 | **Slippage** | The difference between the price you expected and the price you actually got due to market movement. |
 | **Spread** | The gap between the bid (buy) and ask (sell) price. The market maker's profit. |
 | **sqrt-Impact** | A market impact model where impact grows proportionally to the square root of (trade_size / ADV). Based on Almgren & Chriss (2000). |
-| **Stacking** | Training a meta-model on the outputs of base models. The Ridge regression in L2 "stacks" the 10 alpha outputs. |
-| **Stochastic Clone** | A copy of the trading environment with synthetic future price paths (sampled from historical distribution) used for MCTS planning. Peak PnL must be reset since the price path is now fictional, not historical. |
+| **sqrt(h) Weighting** | Weighting signals by the square root of their prediction horizon. A 15-bar signal gets sqrt(15) ≈ 3.9x the weight of a 1-bar signal, reflecting that longer horizons have better signal-to-noise ratio. Used in HorizonBlender (Section 7.4). |
+| **Stacking** | Training a meta-model on the outputs of base models. The Ridge regression in L2 "stacks" the 12 alpha outputs. |
+| **Stochastic Clone** | A copy of the trading environment with synthetic future price paths (sampled from historical distribution) used for MCTS planning. Peak PnL must be reset since the price path is now fictional, not historical. Uses adaptive block bootstrap — larger blocks in trending markets to preserve momentum, smaller blocks in choppy markets. |
 | **Survivorship Bias** | The bias from only studying assets that survived (ignoring bankruptcies, delistings). Makes backtests look better than reality. |
 | **Time-Based Tightening** | Gradually tightening stop losses the longer a position is held without progress. After 10 bars in a trade, stops tighten by 20%. Rationale: if a trade isn't working after reasonable time, free up capital for better opportunities. |
 | **Trail Stop (Trailing Stop)** | A stop loss that "trails" behind the peak profit, set at 5% below the highest price reached. Allows winners to run (up to 10%, 20%, etc.) while protecting against giving back ALL gains. Only active once position is profitable. |
 | **TWAP (Time-Weighted Average Price)** | An order execution strategy that splits an order into equal pieces spread over time. |
 | **VWAP (Volume-Weighted Average Price)** | An order execution strategy that sizes pieces proportional to expected volume. |
+| **Virtual Loss** | A trick for parallel MCTS search. When one search path visits a tree branch, it temporarily marks that branch as "worse" so other parallel paths explore different directions. Like putting a "wet paint" sign on a bench so others sit elsewhere. Removed after the GPU evaluation wave completes. |
 | **Vol Scalar** | A multiplier applied to stop losses based on realized volatility vs baseline. Formula: min(2.0, realized_vol / baseline_vol). Widens stops in volatile markets (up to 2×), tightens in calm markets. Prevents getting stopped out by normal noise. |
 | **Vol Targeting** | Scaling positions so portfolio volatility matches a target (e.g., 15% annual). Keeps risk roughly constant. |
+| **Wave Batching** | Grouping K MCTS rollouts into a single "wave" and evaluating them all in one GPU call. Reduces GPU calls from 256 to ~17 while maintaining search quality through virtual loss diversity. See Section 10.5 and Section 20.1. |
 | **Walk-Forward CV** | Cross-validation that respects time order: always train on past, test on future. Never lets future data contaminate training. |
 | **Yang-Zhang Volatility** | A volatility estimator that uses OHLC bars (not just close-to-close). 14× more statistically efficient than standard deviation of returns. Combines overnight gaps, intraday range (Rogers-Satchell), and close-to-close variance. Used in v7.0 for improved volatility measurement. |
 
@@ -2934,12 +2989,13 @@ All system behavior is controlled by two configuration objects. No magic numbers
 | `n_steps` | 2,048 | Steps per PPO rollout collection |
 | `batch_size` | 512 | Mini-batch size for PPO updates |
 | `n_epochs` | 10 | PPO epochs per update cycle |
-| `mcts_rollouts` | 32 | Number of MCTS simulations per decision |
+| `mcts_rollouts` | 256 | Number of MCTS simulations per decision |
+| `mcts_wave_size` | 0 (auto) | Rollouts per GPU batch wave. When 0, auto-calculated as 256/B to saturate GPU. See Section 20.1. |
 | `window_size` | 60 | Observation window (60 bars of history) |
 | `n_actions` | 5 | Number of discrete actions |
 | `reward_scale` | 100.0 | Multiplier for log-return rewards |
 | `reward_drawdown_penalty` | 2.0 | Quadratic drawdown penalty weight |
-| `reward_turnover_cost` | 0.5 | Turnover penalty weight in reward |
+| `reward_turnover_cost` | 0.05 | Turnover penalty weight in reward (lowered from 0.5 — was killing all trading) |
 | `train_ratio` | 0.70 | Fraction of data for training (70%) |
 | `embargo_bars` | 200 | Gap between data splits for leakage prevention |
 | `spread_bps` | 1.0 | Bid-ask spread in basis points |
@@ -2965,6 +3021,10 @@ All system behavior is controlled by two configuration objects. No magic numbers
 | `cvar_limit` | -0.10 | Max daily CVaR limit |
 | `cost_spread_bps` | 1.0 | Full bid-ask spread for cost model |
 | `cost_impact_coef` | 0.1 | Sqrt-impact coefficient |
+| `horizon_blend_weights` | (0.0, 0.35, 0.65) | Bucket weights for 1d/5d/15d horizons. 1d is 0 because no alpha operates at 1-bar horizon. See Section 7.4. |
+| `drift_ks_sensitivity` | 0.01 | KS test p-value threshold for drift detection. Lower = less sensitive. |
+| `drift_adwin_delta` | 0.002 | ADWIN confidence parameter. Lower = more sensitive to change. |
+| `drift_min_signals_for_trigger` | 2 | Number of drift detectors (out of 4) that must agree before reducing positions. See Section 8.6. |
 | `benchmark_name` | "cash" | Strategy benchmark (absolute return) |
 
 ### 17.3 Asymmetric Stop Loss Configuration (NEW in v7.0)
@@ -3108,7 +3168,7 @@ Price rises to $110 (+10%):
 | **150k** ✅    | **+0.044**    | **PASS (t=+3.46)** |
 | 200k           | -0.022        | REJECT (overfitting) |
 
-**Impact:** RL alpha now functional in validation. Optimal training: **3 iterations × 50k steps = 150k total**.
+**Impact:** RL alpha now functional in validation. Training budget later increased to **8 iterations × 100k steps = 800k total** (see Section 19.6).
 
 **Code Locations:**
 - [alphago_layering.py:847-868](d:\Experiments\Trading\alphago_layering.py) - Feature matrix construction
@@ -4032,7 +4092,7 @@ print(table.render())
 | **Crowding Detection** | N/A | N/A | N/A | **✅ Active (>70% agreement)** |
 | **Table Formatting** | ASCII tables | ASCII tables | ASCII tables | **✅ Box-drawing (16 tables)** |
 | **Horizon** | Mixed (5-21 bars) | **15-bar** | 15-bar | 15-bar (stable) |
-| **RL Training** | 100k steps | **150k steps** | 150k | 150k (optimal) |
+| **RL Training** | 100k steps | **150k steps** | 800k | 800k (8 iter x 100k) |
 | **Validation** | Basic WF-CV | Multi-horizon IC | + Quality metrics | + Stop loss validation |
 | **Meta-Learner** | 22-dim (6×3+4) | **34-dim** (10×3+4) | **40-dim** (12×3+4) | **40-dim** (12 alphas, stable) |
 
@@ -4073,7 +4133,7 @@ print(table.render())
 │  LAYERS: L0  →  L0/L1  →   L1   →    L2    →  L3  →   L4       │
 │                                                                  │
 │  ALPHAS: 10 total (1 RL + 9 traditional) — ALL ALIVE ✅          │
-│    ✅ RL (150k steps), Trend (corrected), MR, Value              │
+│    ✅ RL (800k steps), Trend (corrected), MR, Value              │
 │    ✅ Carry (vol-modulated), Vol Premium                         │
 │    ✅ Calendar (3-bug fix, IC=+0.042)                            │
 │    ✅ Amihud (log-scale, IC≈-0.006)                              │
