@@ -1918,32 +1918,37 @@ class TradingEnv(gym.Env):
         if not self.cfg.use_action_masking:
             return mask
 
+        flat_idx = int(np.argmin(np.abs(self.action_targets - 0.0)))
+
         # If kill triggered, only allow FLAT
         if self.kill_triggered:
             mask[:] = 0.0
-            mask[2] = 1.0  # FLAT
+            mask[flat_idx] = 1.0  # FLAT
             return mask
 
         # Use CURRENT drawdown (not historical max) so masking relaxes after recovery
         dd = (self.peak_value - self._portfolio_value()) / (self.peak_value + 1e-10)
         if dd >= self.cfg.dd_mask_threshold:
             # Restrict to FLAT + reduced positions only
-            # Mask out full-size actions (FULL_SHORT=0, FULL_LONG=4)
-            mask[0] = 0.0  # No FULL_SHORT
-            mask[4] = 0.0  # No FULL_LONG
+            # Mask out extreme actions (first and last)
+            mask[0] = 0.0   # No FULL_SHORT
+            mask[-1] = 0.0  # No FULL_LONG
         if dd >= self.cfg.max_drawdown_pct:
             # Only allow FLAT
             mask[:] = 0.0
-            mask[2] = 1.0
+            mask[flat_idx] = 1.0
         return mask
 
     def step(self, action):
+        # Dynamic flat action index (works with any action grid size)
+        _flat_action = int(np.argmin(np.abs(self.action_targets - 0.0)))
+
         # #8: Action masking -- override action if masked
         if self.cfg.use_action_masking:
             mask = self._get_action_mask()
             if mask[action] < 0.5:
                 # Action is masked -- force to FLAT (safest)
-                action = 2
+                action = _flat_action
 
         # Fix #1: Capture risk target BEFORE step changes cs or triggers terminal logic
         pre_step_risk_target = self.get_risk_target()
@@ -1960,7 +1965,7 @@ class TradingEnv(gym.Env):
             if hit:
                 # Force flat - we've been stopped out
                 stopped_out = True
-                action = 2  # Flat action
+                action = _flat_action  # Dynamic flat (works with any action grid)
                 # Log stop exit in trade_entries
                 self.trade_entries.append({
                     'step': self.cs,
@@ -2045,7 +2050,7 @@ class TradingEnv(gym.Env):
             if stop_result['should_exit']:
                 # Asymmetric stop triggered - force flat
                 stopped_out = True
-                action = 2  # Flat action
+                action = _flat_action  # Dynamic flat (works with any action grid)
                 # FIX Bug #10: Save stop info for logging AFTER execution completes
                 asymmetric_stop_info = {
                     'triggered': True,

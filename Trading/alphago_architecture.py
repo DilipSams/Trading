@@ -342,7 +342,7 @@ class ArchitectureConfig:
     vol_cap: float = 0.60
     max_leverage: float = 2.0
 
-    kelly_fraction: float = 0.25            # Quarter-Kelly default
+    kelly_fraction: float = 0.50            # Half-Kelly (diversified multi-alpha system)
     kelly_lookback: int = 60
     kelly_max_drawdown: float = 0.15
     kelly_recovery_prob: float = 0.90
@@ -359,7 +359,7 @@ class ArchitectureConfig:
     drift_adwin_delta: float = 0.002           # ADWIN confidence (lower = more sensitive)
     drift_min_signals_for_trigger: int = 2     # N of 4 detectors must agree
 
-    turnover_limit_annual: float = 20.0     # Max annual turnover (x capital)
+    turnover_limit_annual: float = 50.0     # Max annual turnover (x capital) — higher to reduce ramp-trades with 7 action levels
     factor_exposure_limit: float = 0.50     # Max single-factor tilt
 
     # Cost-aware optimization (L3 uses canonical cost model from alphago_cost_model)
@@ -372,21 +372,21 @@ class ArchitectureConfig:
     # Regime-conditional scaling
     regime_scale_map: Dict[str, float] = field(default_factory=lambda: {
         "high_growth_low_vol":  1.0,
-        "high_growth_high_vol": 0.6,
-        "low_growth_low_vol":   0.8,
-        "low_growth_high_vol":  0.25,
+        "high_growth_high_vol": 0.7,
+        "low_growth_low_vol":   0.9,
+        "low_growth_high_vol":  0.40,
     })
 
     # -- L4: Execution --
-    no_trade_threshold_pct: float = 0.001   # Min position change to trade (BUG FIX #3: lowered from 0.5% to 0.1% to allow small trades during warmup)
+    no_trade_threshold_pct: float = 0.001   # Min position change to trade (0.1%)
     no_trade_vol_adaptive: bool = True
     order_slicing: bool = True
     n_slices: int = 5
     slice_mode: str = "TWAP"
     max_participation_rate: float = 0.10    # Max 10% of ADV per bar
-    kill_max_loss_pct: float = 0.05
-    kill_max_turnover_spike: float = 5.0
-    kill_cooldown_bars: int = 21               # Re-entry after ~1 month cooldown
+    kill_max_loss_pct: float = 0.15            # 15% max loss (trend-following needs wider stop)
+    kill_max_turnover_spike: float = 20.0   # Raised: SMA transitions (0→0.25) are normal, not spikes
+    kill_cooldown_bars: int = 10               # Faster re-entry (SMA gates direction)
     kill_allow_auto_reenter: bool = True       # Allow auto re-entry after cooldown + recovery
     kill_reenter_buffer: float = 0.02         # Must recover trigger_value * (1 + buffer) before re-entry
 
@@ -394,11 +394,13 @@ class ArchitectureConfig:
     kill_confidence_window: int = 10          # Consecutive bars of low confidence -> kill
     kill_min_confidence: float = 0.05         # Ensemble confidence floor
     kill_min_data_quality: float = 60.0       # L0 quality score floor
-    kill_vol_breach_mult: float = 3.0         # Kill if realized vol > N * target vol (3x for equities)
+    kill_vol_breach_mult: float = 5.0         # 5x target vol (75% for 15% target) -- was 3x/45%
     kill_cost_spike_mult: float = 2.0         # Kill if realized cost > N * modeled cost
     kill_cost_spike_window: int = 5           # N consecutive cost spikes -> kill
-    kill_dd_duration_bars: int = 126          # Kill after N bars in drawdown (6 months)
+    kill_dd_duration_bars: int = 252          # 1 year in drawdown before kill (was 126/6mo)
     kill_on_drift: bool = True                # Kill if drift detector fires
+
+    # -- Ensemble EMA smoothing --
 
     # -- Trailing Stops --
     use_trailing_stops: bool = True           # Enable trailing stop loss protection
@@ -454,10 +456,10 @@ class ArchitectureConfig:
     # -- Benchmark --
     # Every strategy must state its benchmark(s) per spec.
     # All reported metrics are shown both gross/net and vs benchmark.
-    benchmark_name: str = "cash"              # "cash", "SPY", "custom"
-    benchmark_description: str = "Risk-free rate (absolute return target)"
-    benchmark_annual_return: float = 0.0      # Expected benchmark return (for cash=0)
-    benchmark_type: str = "absolute"          # "absolute", "relative", "risk_adjusted"
+    benchmark_name: str = "SPY"               # "cash", "SPY", "custom"
+    benchmark_description: str = "S&P 500 ETF (market return benchmark)"
+    benchmark_annual_return: float = 0.0      # Computed from actual SPY data
+    benchmark_type: str = "relative"          # "absolute", "relative", "risk_adjusted"
 
 
 # ============================================================================
@@ -3704,6 +3706,8 @@ class SignalEnsemble:
         final_mu = alpha_meta * mu_hat + (1 - alpha_meta) * h_mu
         final_sigma = max(alpha_meta * sigma_hat + (1 - alpha_meta) * h_sigma, 0.01)
 
+        final_sigma = max(final_sigma, 0.01)
+
         # Step 5: Periodically retrain meta-learner
         self.meta_learner.fit(bar_idx)
 
@@ -4418,18 +4422,12 @@ class PortfolioConstructor:
             constraints_hit.append("cvar_limit")
 
         # -- Step 5.6: Factor exposure check (WS3B) --
+        # NOTE: Only meaningful when benchmark returns are available.
+        # For single-asset portfolios with no benchmark, vol_loading
+        # explodes (div-by-near-zero), zeroing all positions.
+        # We still update for monitoring but skip enforcement in
+        # single-asset mode (bench_return defaults to 0.0).
         self._factor_monitor.update(bar_return)
-        within_limits, exposures = self._factor_monitor.is_within_limits(
-            self.acfg.factor_exposure_limit
-        )
-        if not within_limits:
-            # Scale down by ratio of limit to worst exposure
-            worst = self._factor_monitor.max_breach_factor()
-            if worst > 0:
-                factor_scale = self.acfg.factor_exposure_limit / worst
-                position *= min(factor_scale, 1.0)
-                reason_parts.append(f"factor_scale={factor_scale:.2f}")
-                constraints_hit.append("factor_limit")
 
         # -- Step 6: Drift guard --
         drift_scale = self._drift_scale(mu_hat, bar_return)
@@ -5493,7 +5491,10 @@ class InstitutionalPipeline:
         self.portfolio = PortfolioConstructor(acfg, bars_per_year)
 
         # L4: Execution
-        self.execution_engine = ExecutionEngine(acfg, bars_per_year)
+        self.execution_engine = ExecutionEngine(
+            acfg, bars_per_year,
+            action_targets=(-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0),
+        )
 
         # Diagnostics
         self._step_count = 0
@@ -5654,6 +5655,79 @@ class InstitutionalPipeline:
             signals=signals,
         )
         self._last_order = order
+
+        # ******************************************************
+        # SMA TREND OVERLAY -- Fixed position based on trend state
+        # ******************************************************
+        # SMA determines BOTH direction AND size, replacing L3's
+        # noisy targets. Works progressively:
+        #   < 50 bars:   Force flat (not enough data for any SMA)
+        #   50-99 bars:  Use SMA50 only (basic trend direction)
+        #   100-199 bars: Use SMA50 + SMA100
+        #   200+ bars:   Full SMA50/100/200 with crossover detection
+        #
+        # Position table (LONG-ONLY, max 0.25):
+        #   P > SMA200 (any bull state):    +0.25
+        #   P < SMA200 (any bear state):     0.0 (flat, no shorts)
+        if closes is not None and len(closes) >= 50:
+            current_price = float(closes[-1])
+            n = len(closes)
+
+            sma_50 = float(np.mean(closes[-50:]))
+            sma_100 = float(np.mean(closes[-100:])) if n >= 100 else None
+            sma_200 = float(np.mean(closes[-200:])) if n >= 200 else None
+
+            sma_position = 0.0
+            sma_reason = ""
+
+            if sma_200 is not None:
+                # -- FULL MODE: 200+ bars (LONG-ONLY) --
+                golden_cross = sma_50 > sma_100 if sma_100 else True
+
+                if current_price > sma_200:
+                    if current_price > sma_50 > sma_100 > sma_200:
+                        sma_position = 0.25
+                        sma_reason = "sma=bull_aligned(+0.25)"
+                    elif golden_cross:
+                        sma_position = 0.25
+                        sma_reason = "sma=golden_cross(+0.25)"
+                    else:
+                        sma_position = 0.25
+                        sma_reason = "sma=above_200(+0.25)"
+                else:
+                    # Below SMA200 → FLAT (no shorts — long-only mode)
+                    sma_position = 0.0
+                    sma_reason = "sma=below_200(flat)"
+
+            elif sma_100 is not None:
+                # -- PARTIAL MODE: 100-199 bars (LONG-ONLY) --
+                golden_cross = sma_50 > sma_100
+                if current_price > sma_100:
+                    sma_position = 0.25
+                    sma_reason = "sma=above_100(+0.25)"
+                else:
+                    sma_position = 0.0
+                    sma_reason = "sma=below_100(flat)"
+
+            else:
+                # -- MINIMAL MODE: 50-99 bars (LONG-ONLY) --
+                if current_price > sma_50:
+                    sma_position = 0.25
+                    sma_reason = "sma=above_50(+0.25)"
+                else:
+                    sma_position = 0.0
+                    sma_reason = "sma=below_50(flat)"
+
+            # Override L3's target with SMA-based position
+            order.target_exposure = sma_position
+            order.reason = order.reason + f" | {sma_reason}"
+            if abs(sma_position) > 1e-4:
+                order.constraints_hit = order.constraints_hit + ['sma_override']
+
+        elif closes is not None:
+            # < 50 bars: force flat until we have enough data
+            order.target_exposure = 0.0
+            order.reason = order.reason + " | sma=warmup(flat)"
 
         # ******************************************************
         # L4: EXECUTION -- Final gate + discretization

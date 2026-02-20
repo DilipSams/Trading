@@ -195,7 +195,7 @@ def print_subsection(title):
 # ============================================================================
 
 def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
-                           verbose=0):
+                           verbose=0, spy_returns_lookup=None):
     """
     Evaluate a trained network through the full institutional pipeline.
 
@@ -232,6 +232,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
     # every BacktestReport metric fabricated.
     all_bar_returns_gross = []   # Per-bar portfolio return BEFORE costs
     all_bar_returns_net = []     # Per-bar portfolio return AFTER costs (realized)
+    all_spy_returns = []         # SPY return for same dates (benchmark)
     # FIX Ãƒâ€šÃ‚Â§4.7: Track per-symbol return series separately to avoid
     # inflated observation counts from cross-symbol concatenation.
     per_symbol_returns_net = {}   # symbol -> list of per-bar net returns
@@ -254,6 +255,11 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         sim_cfg = copy(cfg)
         sim_cfg.use_kill_switches = False
         sim_cfg.use_action_masking = False
+        sim_cfg.use_trailing_stops = False       # L4 owns risk — env stops interfere
+        sim_cfg.use_asymmetric_stops = False     # L4 owns risk — env stops interfere
+        # Match env action space to Pipeline's 7-level discretization
+        sim_cfg.action_targets = (-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0)
+        sim_cfg.n_actions = 7                    # Must match action_targets length
         env = TradingEnv(d.features_test, d.prices_test, sim_cfg, d.symbol, ev=True)
         # FIX Ãƒâ€šÃ‚Â§4.4: Flag env as pipeline eval mode ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â prevents get_risk_target() future access
         env._pipeline_eval_mode = True
@@ -277,6 +283,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         episode_audit = []
         sym_bar_returns_gross = []   # Per-bar returns for this symbol
         sym_bar_returns_net = []
+        sym_spy_returns = []         # SPY return for same dates
 
         while not done:
             bar_idx = env.cs
@@ -397,6 +404,13 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
                 sym_bar_returns_net.append(float(bar_return_net))
                 sym_bar_returns_gross.append(float(bar_return_gross))
 
+            # -- SPY benchmark return for this bar's date --
+            spy_ret_this_bar = 0.0
+            if spy_returns_lookup and d.timestamps_test is not None:
+                date_str = str(d.timestamps_test[bar_idx])[:10]
+                spy_ret_this_bar = spy_returns_lookup.get(date_str, 0.0)
+            sym_spy_returns.append(spy_ret_this_bar)
+
             # -- FIX Ãƒâ€šÃ‚Â§5.4: Position reconciliation --
             # In backtesting, "external" = env ground truth. Verifies L4 tracking.
             if hasattr(pipeline, '_reconciler') and pipeline._reconciler is not None:
@@ -446,6 +460,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         per_symbol_returns_gross[d.symbol] = sym_bar_returns_gross
         all_bar_returns_gross.extend(sym_bar_returns_gross)
         all_bar_returns_net.extend(sym_bar_returns_net)
+        all_spy_returns.extend(sym_spy_returns)
 
         per_sym[d.symbol] = {
             "pnl": info["net_pnl"],
@@ -587,6 +602,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         "per_symbol_returns_gross": {
             sym: np.array(rets, dtype=np.float64) for sym, rets in per_symbol_returns_gross.items()
         },
+        "spy_returns": np.array(all_spy_returns, dtype=np.float64),
     }
 
 
@@ -1891,7 +1907,7 @@ Examples:
                    help="Enable Yahoo Finance data caching (disabled by default)")
     g.add_argument("--no-cache", action="store_true",
                    help="(Deprecated, caching is already off by default)")
-    g.add_argument("--kelly-fraction", type=float, default=0.25)
+    g.add_argument("--kelly-fraction", type=float, default=0.50)
     g.add_argument("--no-trade-threshold", type=float, default=0.005)  # Lowered from 0.02 (2%) to 0.005 (0.5%) based on persistence analysis
 
     # Output
@@ -2024,6 +2040,28 @@ def _run_self_tests():
 
 def main():
     args = parse_args()
+
+    # -- Fixed random seed for reproducible results --
+    import random, shutil, glob as _glob
+    _SEED = 42
+    random.seed(_SEED)
+    np.random.seed(_SEED)
+    torch.manual_seed(_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(_SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # -- Clear stale caches at start of each run --
+    _cache_dir = os.path.join(os.path.dirname(__file__), "__pycache__")
+    if os.path.isdir(_cache_dir):
+        shutil.rmtree(_cache_dir, ignore_errors=True)
+    _data_cache = os.path.join(os.path.dirname(__file__), "data_cache")
+    for _f in _glob.glob(os.path.join(_data_cache, "*.pkl")) + _glob.glob(os.path.join(_data_cache, "*.txt")):
+        try:
+            os.remove(_f)
+        except OSError:
+            pass
 
     # -- Self-test: run integrity checks before launch --
     if args.self_test:
@@ -2218,6 +2256,34 @@ def main():
         tprint("Check your data source or use --synthetic", "err"); return
 
     tprint(f"Loaded {len(data)} datasets", "ok")
+
+    # -- Load SPY benchmark returns --
+    spy_returns_lookup = {}  # date_str -> daily return
+    try:
+        _spy_base = norgate_dir if 'norgate_dir' in dir() else NORGATE_DIR
+        spy_path = Path(_spy_base) / "US_Equities" / "SPY.parquet"
+        if spy_path.exists():
+            import pandas as _spy_pd
+            spy_df = _spy_pd.read_parquet(spy_path)
+            col_map = {}
+            for c in spy_df.columns:
+                cl = c.lower().strip()
+                if cl == "close" and "unadj" not in cl.replace(" ", ""):
+                    col_map[c] = "Close"
+            spy_df = spy_df.rename(columns=col_map)
+            if "Close" in spy_df.columns:
+                spy_closes = spy_df["Close"].values.astype(np.float64)
+                spy_dates = np.array(spy_df.index.astype(str))
+                spy_rets = np.diff(spy_closes) / (spy_closes[:-1] + 1e-12)
+                for i, r in enumerate(spy_rets):
+                    spy_returns_lookup[spy_dates[i + 1][:10]] = float(r)
+                tprint(f"SPY benchmark loaded: {len(spy_returns_lookup)} daily returns", "ok")
+            else:
+                tprint("SPY parquet missing Close column, using cash benchmark", "warn")
+        else:
+            tprint(f"SPY data not found at {spy_path}, using cash benchmark", "warn")
+    except Exception as e:
+        tprint(f"Failed to load SPY benchmark: {e}, using cash benchmark", "warn")
 
     # -- L0 DATA QUALITY CHECKS --
     quality_results = []
@@ -2417,6 +2483,7 @@ def main():
         acfg=acfg,
         label="Pipeline v7.0",
         verbose=args.verbose,
+        spy_returns_lookup=spy_returns_lookup,
     )
 
     print_results(pipeline_results)
@@ -2471,11 +2538,15 @@ def main():
                     period_start_str = str(all_timestamps[0])[:10]   # YYYY-MM-DD
                     period_end_str = str(all_timestamps[-1])[:10]
 
+            spy_rets = pipeline_results.get('spy_returns', np.array([]))
+            has_spy = len(spy_rets) > 0 and np.any(spy_rets != 0.0)
+
             report = compute_backtest_report(
                 daily_returns_gross=actual_gross,
                 daily_returns_net=actual_net,
+                benchmark_returns=spy_rets if has_spy else None,
                 strategy_name="Alpha-Trade v7.0",
-                benchmark="cash",
+                benchmark="SPY" if has_spy else "cash",
                 period_start=period_start_str,
                 period_end=period_end_str,
                 n_configs=1,
@@ -2497,6 +2568,43 @@ def main():
             )
             tprint(f"Estimated capacity (Sharpe>0.5): "
                    f"${cap['capacity_at_sharpe_05']/1e6:.0f}M", "info")
+
+    # -- Compute SPY buy-and-hold P&L for comparison table --
+    # NOTE: spy_rets_arr is concatenated across symbols (duplicated dates) — correct
+    # for benchmark-relative metrics (aligned 1:1 with strategy returns), but NOT
+    # for computing actual SPY buy-and-hold P&L. Use unique test-period dates instead.
+    spy_rets_arr = pipeline_results.get('spy_returns', np.array([]))
+    has_spy_bench = len(spy_rets_arr) > 0 and np.any(spy_rets_arr != 0.0)
+    spy_total_pnl = 0.0
+    spy_cagr_str = "N/A"
+    if has_spy_bench and spy_returns_lookup:
+        # Collect unique test-period dates from all datasets
+        _test_dates = set()
+        for d in datasets:
+            if hasattr(d, 'timestamps_test') and d.timestamps_test is not None:
+                for ts in d.timestamps_test:
+                    _test_dates.add(str(ts)[:10])
+        _test_dates_sorted = sorted(_test_dates)
+        # Get SPY returns for those unique dates only
+        _spy_unique = [spy_returns_lookup.get(dt, 0.0) for dt in _test_dates_sorted]
+        if _spy_unique:
+            _spy_unique_arr = np.array(_spy_unique, dtype=np.float64)
+            spy_cum = float(np.prod(1 + _spy_unique_arr) - 1)
+            spy_total_pnl = spy_cum * cfg.starting_capital
+            n_spy = len(_spy_unique_arr)
+            spy_cagr = float(np.prod(1 + _spy_unique_arr) ** (252 / max(n_spy, 1)) - 1)
+            spy_cagr_str = f"{spy_cagr:+.2%}"
+
+    # -- Build per-symbol test period date ranges --
+    _sym_periods = {}  # symbol -> (start_date, end_date)
+    for d in datasets:
+        if hasattr(d, 'timestamps_test') and d.timestamps_test is not None and len(d.timestamps_test) > 0:
+            _sym_periods[d.symbol] = (str(d.timestamps_test[0])[:10], str(d.timestamps_test[-1])[:10])
+
+    # SPY test period (union of all symbol test dates)
+    _spy_period_str = ""
+    if has_spy_bench and '_test_dates_sorted' in dir() and _test_dates_sorted:
+        _spy_period_str = f"{_test_dates_sorted[0]} to {_test_dates_sorted[-1]}"
 
     # -- Show comparison if training was done --
     if base_results is not None:
@@ -2573,6 +2681,35 @@ def main():
                           f"{C.CYAN}${base_cash_yield:>+13,.2f}{C.RESET}",
                           f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}"])
 
+            # Per-symbol Trade P&L (cash yield stripped out)
+            _base_per_sym = base_results.get('per_sym', {})
+            all_syms = sorted(set(list(_base_per_sym.keys()) + list(_pip_per_sym.keys())))
+            if all_syms:
+                table.add_row([f"{C.BOLD}--- Trade P&L by Symbol ---{C.RESET}", "", ""])
+                for sym in all_syms:
+                    b_total = _base_per_sym.get(sym, {}).get('pnl', 0)
+                    b_cash = _base_per_sym.get(sym, {}).get('cash_yield_pnl', 0)
+                    b_trade = b_total - b_cash
+                    p_total = _pip_per_sym.get(sym, {}).get('pnl', 0)
+                    p_cash = _pip_per_sym.get(sym, {}).get('cash_yield_pnl', 0)
+                    p_trade = p_total - p_cash
+                    b_c = C.GREEN if b_trade > 0 else C.RED
+                    p_c = C.GREEN if p_trade > 0 else C.RED
+                    period = _sym_periods.get(sym, None)
+                    period_str = f" ({period[0]} to {period[1]})" if period else ""
+                    table.add_row([f"  {sym}{period_str}",
+                                  f"{b_c}${b_trade:>+13,.2f}{C.RESET}",
+                                  f"{p_c}${p_trade:>+13,.2f}{C.RESET}"])
+
+            if has_spy_bench:
+                spy_pnl_c = C.GREEN if spy_total_pnl > 0 else C.RED
+                _spy_hdr = f"--- SPY Benchmark ({_spy_period_str}) ---" if _spy_period_str else "--- SPY Benchmark ---"
+                table.add_row([f"{C.BOLD}{_spy_hdr}{C.RESET}", "", ""])
+                table.add_row(['  SPY Buy & Hold P&L',
+                              f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}",
+                              f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}"])
+                table.add_row(['  SPY CAGR', spy_cagr_str, spy_cagr_str])
+
             table.add_row([f"{C.BOLD}--- Trading ---{C.RESET}", "", ""])
             table.add_row(['Trades Executed', f"{base_n_trades:>14d}", f"{pip_n_trades:>14d}"])
 
@@ -2613,6 +2750,36 @@ def main():
             print(f"  {'  Cash Yield':<22s}  "
                   f"{C.CYAN}${base_cash_yield:>+13,.2f}{C.RESET}  "
                   f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}")
+
+            # Per-symbol Trade P&L (cash yield stripped out)
+            _base_per_sym_fb = base_results.get('per_sym', {})
+            _all_syms_fb = sorted(set(list(_base_per_sym_fb.keys()) + list(_pip_per_sym.keys())))
+            if _all_syms_fb:
+                print(f"  {C.BOLD}{'--- Trade P&L by Symbol ---':<22s}{C.RESET}")
+                for sym in _all_syms_fb:
+                    b_total = _base_per_sym_fb.get(sym, {}).get('pnl', 0)
+                    b_cash = _base_per_sym_fb.get(sym, {}).get('cash_yield_pnl', 0)
+                    b_trade = b_total - b_cash
+                    p_total = _pip_per_sym.get(sym, {}).get('pnl', 0)
+                    p_cash = _pip_per_sym.get(sym, {}).get('cash_yield_pnl', 0)
+                    p_trade = p_total - p_cash
+                    b_c = C.GREEN if b_trade > 0 else C.RED
+                    p_c = C.GREEN if p_trade > 0 else C.RED
+                    period = _sym_periods.get(sym, None)
+                    period_str = f" ({period[0]} to {period[1]})" if period else ""
+                    print(f"  {'  ' + sym + period_str:<22s}  "
+                          f"{b_c}${b_trade:>+13,.2f}{C.RESET}  "
+                          f"{p_c}${p_trade:>+13,.2f}{C.RESET}")
+
+            if has_spy_bench:
+                spy_pnl_c = C.GREEN if spy_total_pnl > 0 else C.RED
+                _spy_hdr_fb = f"--- SPY Benchmark ({_spy_period_str}) ---" if _spy_period_str else "--- SPY Benchmark ---"
+                print(f"  {C.BOLD}{_spy_hdr_fb}{C.RESET}")
+                print(f"  {'  SPY Buy & Hold P&L':<22s}  "
+                      f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}  "
+                      f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}")
+                print(f"  {'  SPY CAGR':<22s}  "
+                      f"{spy_cagr_str:>14s}  {spy_cagr_str:>14s}")
 
             # --- Trading Activity ---
             print(f"  {C.BOLD}{'--- Trading ---':<22s}{C.RESET}")
