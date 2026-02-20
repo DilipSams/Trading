@@ -4349,29 +4349,134 @@ class AlphaTradeSystem:
 # delisted, acquired, or dropped from the index during the backtest period.
 # For valid historical backtests, use a point-in-time index membership dataset.
 # Estimated bias: +0.3 to +0.5 annualized Sharpe for US large-cap equities.
-# Top 100 US stocks by market cap (Feb 2026)
+# Top 100 US stocks by market cap (Feb 2026), organized by GICS sector.
+# SMA trend overlay performance note: works best on cyclical/growth sectors
+# (Technology, Industrials, Financials) with persistent trends; weakest on
+# defensive/stable sectors (Healthcare, Energy, Utilities) that mean-revert.
 DEFAULT_SYMBOLS=[
-    # Mega-cap tech
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","BRK-B","LLY",
-    # Top 11-20
-    "WMT","JPM","V","UNH","XOM","MA","COST","ORCL","HD","PG",
-    # Top 21-30
-    "JNJ","ABBV","NFLX","BAC","CRM","CVX","MRK","KO","AMD","PEP",
-    # Top 31-40
-    "TMO","LIN","ADBE","MCD","CSCO","ABT","ACN","WFC","IBM","GE",
-    # Top 41-50
-    "MS","PM","ISRG","NOW","TXN","QCOM","INTU","GS","DHR","CAT",
-    # Top 51-60
-    "AMGN","VZ","AXP","BKNG","PFE","T","BLK","SPGI","NEE","LOW",
-    # Top 61-70
-    "DE","AMAT","SYK","UNP","HON","SCHW","BA","COP","UBER","MDLZ",
-    # Top 71-80
-    "LRCX","ADP","TJX","VRTX","GILD","BSX","CB","MMC","PLD","ADI",
-    # Top 81-90
-    "SBUX","FI","BX","PANW","MU","INTC","KKR","SO","TMUS","DUK",
-    # Top 91-100
-    "CME","ICE","REGN","CI","BMY","EL","APD","MCK","PYPL","NKE",
-    # ETF benchmarks
+    # --- Technology (Software, Semiconductors, Internet) ---
+    "AAPL",   # Apple -- Consumer electronics / software
+    "MSFT",   # Microsoft -- Software / cloud (Azure)
+    "NVDA",   # NVIDIA -- Semiconductors (AI/GPU)
+    "AMZN",   # Amazon -- E-commerce / cloud (AWS)
+    "GOOGL",  # Alphabet -- Internet / advertising
+    "META",   # Meta Platforms -- Social media / advertising
+    "AVGO",   # Broadcom -- Semiconductors / infrastructure software
+    "ORCL",   # Oracle -- Enterprise software / cloud
+    "CRM",    # Salesforce -- Cloud CRM software
+    "AMD",    # AMD -- Semiconductors (CPU/GPU)
+    "ADBE",   # Adobe -- Creative / document software
+    "CSCO",   # Cisco -- Networking equipment / software
+    "ACN",    # Accenture -- IT consulting / services
+    "IBM",    # IBM -- Enterprise IT / hybrid cloud
+    "NOW",    # ServiceNow -- IT workflow automation
+    "TXN",    # Texas Instruments -- Analog semiconductors
+    "QCOM",   # Qualcomm -- Mobile semiconductors
+    "INTU",   # Intuit -- Financial software (TurboTax, QuickBooks)
+    "AMAT",   # Applied Materials -- Semiconductor equipment
+    "LRCX",   # Lam Research -- Semiconductor equipment
+    "PANW",   # Palo Alto Networks -- Cybersecurity
+    "MU",     # Micron -- Memory semiconductors
+    "INTC",   # Intel -- Semiconductors (CPU)
+    "ADI",    # Analog Devices -- Analog/mixed-signal semiconductors
+    "NFLX",   # Netflix -- Streaming media
+    "UBER",   # Uber -- Ride-sharing / delivery platform
+
+    # --- Financials (Banks, Insurance, Payments, Capital Markets) ---
+    "JPM",    # JPMorgan Chase -- Diversified banking
+    "V",      # Visa -- Payment processing
+    "MA",     # Mastercard -- Payment processing
+    "BAC",    # Bank of America -- Diversified banking
+    "GS",     # Goldman Sachs -- Investment banking / capital markets
+    "MS",     # Morgan Stanley -- Investment banking / wealth management
+    "WFC",    # Wells Fargo -- Diversified banking
+    "BLK",    # BlackRock -- Asset management
+    "SPGI",   # S&P Global -- Financial data / ratings
+    "SCHW",   # Charles Schwab -- Brokerage / wealth management
+    "AXP",    # American Express -- Payments / consumer finance
+    "CB",     # Chubb -- Property & casualty insurance
+    "MMC",    # Marsh McLennan -- Insurance brokerage
+    "FI",     # Fiserv -- Financial technology / payments
+    "BX",     # Blackstone -- Alternative asset management
+    "KKR",    # KKR -- Private equity / alternative assets
+    "CME",    # CME Group -- Derivatives exchange
+    "ICE",    # Intercontinental Exchange -- Financial exchanges
+    "PYPL",   # PayPal -- Digital payments
+
+    # --- Healthcare (Pharma, MedTech, Insurance) ---
+    "LLY",    # Eli Lilly -- Pharmaceuticals (GLP-1 / diabetes)
+    "UNH",    # UnitedHealth -- Health insurance / Optum
+    "JNJ",    # Johnson & Johnson -- Pharma / medical devices
+    "ABBV",   # AbbVie -- Pharmaceuticals (immunology)
+    "MRK",    # Merck -- Pharmaceuticals (oncology / vaccines)
+    "TMO",    # Thermo Fisher -- Life sciences instruments
+    "ABT",    # Abbott Labs -- Medical devices / diagnostics
+    "ISRG",   # Intuitive Surgical -- Robotic surgery
+    "SYK",    # Stryker -- Orthopedic / medical devices
+    "VRTX",   # Vertex -- Biotech (cystic fibrosis)
+    "GILD",   # Gilead Sciences -- Biotech (antiviral)
+    "BSX",    # Boston Scientific -- Medical devices
+    "AMGN",   # Amgen -- Biotech (oncology / bone)
+    "PFE",    # Pfizer -- Pharmaceuticals
+    "REGN",   # Regeneron -- Biotech (ophthalmology)
+    "CI",     # Cigna -- Health insurance
+    "BMY",    # Bristol-Myers Squibb -- Pharmaceuticals
+    "MCK",    # McKesson -- Pharma distribution
+    "DHR",    # Danaher -- Life sciences / diagnostics
+
+    # --- Consumer Staples (Food, Beverages, Household) ---
+    "WMT",    # Walmart -- Retail (grocery / general merchandise)
+    "COST",   # Costco -- Warehouse retail
+    "PG",     # Procter & Gamble -- Household products
+    "KO",     # Coca-Cola -- Beverages
+    "PEP",    # PepsiCo -- Beverages / snacks
+    "PM",     # Philip Morris -- Tobacco
+    "MCD",    # McDonald's -- Quick-service restaurants
+    "MDLZ",   # Mondelez -- Snacks (Oreo, Cadbury)
+    "EL",     # Estee Lauder -- Beauty / cosmetics
+
+    # --- Consumer Discretionary (Retail, Auto, Leisure) ---
+    "TSLA",   # Tesla -- Electric vehicles / energy
+    "HD",     # Home Depot -- Home improvement retail
+    "LOW",    # Lowe's -- Home improvement retail
+    "BKNG",   # Booking Holdings -- Online travel
+    "TJX",    # TJX Companies -- Off-price retail
+    "SBUX",   # Starbucks -- Coffee / restaurants
+    "NKE",    # Nike -- Athletic apparel / footwear
+    "BRK-B",  # Berkshire Hathaway -- Conglomerate (insurance-led)
+
+    # --- Industrials (Aerospace, Equipment, Transport) ---
+    "CAT",    # Caterpillar -- Construction / mining equipment
+    "GE",     # GE Aerospace -- Jet engines / power
+    "DE",     # Deere & Co -- Agricultural / construction equipment
+    "UNP",    # Union Pacific -- Railroad / freight transport
+    "HON",    # Honeywell -- Aerospace / building tech / industrials
+    "BA",     # Boeing -- Aerospace / defense
+    "ADP",    # ADP -- Payroll / HR services
+
+    # --- Energy (Oil & Gas, Exploration) ---
+    "XOM",    # ExxonMobil -- Oil & gas (integrated)
+    "CVX",    # Chevron -- Oil & gas (integrated)
+    "COP",    # ConocoPhillips -- Oil & gas (exploration & production)
+
+    # --- Utilities ---
+    "NEE",    # NextEra Energy -- Electric utilities / renewables
+    "SO",     # Southern Company -- Electric / gas utilities
+    "DUK",    # Duke Energy -- Electric utilities
+
+    # --- Materials ---
+    "LIN",    # Linde -- Industrial gases
+    "APD",    # Air Products -- Industrial gases
+
+    # --- Real Estate ---
+    "PLD",    # Prologis -- Industrial REIT (warehouses / logistics)
+
+    # --- Telecom ---
+    "T",      # AT&T -- Telecom / wireless
+    "VZ",     # Verizon -- Telecom / wireless
+    "TMUS",   # T-Mobile -- Wireless telecom
+
+    # --- ETF Benchmarks ---
     "SPY","QQQ","DIA",
     # Leveraged ETFs (2x bull)
     "SSO","QLD","DDM",
