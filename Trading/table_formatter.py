@@ -75,6 +75,7 @@ class TableFormatter:
         self.fixed_width = width
         self.columns: List[ColumnConfig] = []
         self.rows: List[List[Any]] = []
+        self.header_groups: Optional[List[tuple]] = None
 
     def add_column(self, name: str, width: int = 0, align: str = 'left',
                    format_spec: str = ''):
@@ -86,6 +87,23 @@ class TableFormatter:
         if len(values) != len(self.columns):
             raise ValueError(f"Row has {len(values)} values but table has {len(self.columns)} columns")
         self.rows.append(values)
+
+    def set_header_groups(self, groups: List[tuple]):
+        """
+        Set column groups for a two-row header.
+
+        Args:
+            groups: List of (group_name, n_columns) tuples.
+                    Sum of n_columns must equal len(self.columns).
+                    Use '' for groups with no spanning header.
+        """
+        total = sum(gc for _, gc in groups)
+        if self.columns and total != len(self.columns):
+            raise ValueError(
+                f"Header groups span {total} columns but table has "
+                f"{len(self.columns)} columns"
+            )
+        self.header_groups = groups
 
     def _format_value(self, value: Any, col: ColumnConfig) -> str:
         """Format a single value according to column spec."""
@@ -115,6 +133,20 @@ class TableFormatter:
                     formatted = self._format_value(row[i], col)
                     max_width = max(max_width, _visible_len(formatted))
                 widths.append(max_width + 2)  # Add padding
+
+        # Widen columns if any group header name exceeds its span
+        if self.header_groups:
+            col_idx = 0
+            for gname, gcols in self.header_groups:
+                span_width = sum(widths[col_idx:col_idx + gcols]) + (gcols - 1)
+                needed = _visible_len(gname) + 2  # 1-char padding each side
+                if needed > span_width:
+                    deficit = needed - span_width
+                    per_col = deficit // gcols
+                    remainder = deficit % gcols
+                    for k in range(gcols):
+                        widths[col_idx + k] += per_col + (1 if k < remainder else 0)
+                col_idx += gcols
 
         return widths
 
@@ -154,6 +186,16 @@ class TableFormatter:
         if not self.columns:
             return ""
 
+        # Validate group column count (deferred from set_header_groups
+        # in case groups were set before columns were added)
+        if self.header_groups:
+            total_gc = sum(gc for _, gc in self.header_groups)
+            if total_gc != len(self.columns):
+                raise ValueError(
+                    f"Header groups span {total_gc} columns but table has "
+                    f"{len(self.columns)} columns"
+                )
+
         widths = self._calculate_widths()
         total_width = sum(widths) + len(widths) + 1
 
@@ -172,20 +214,75 @@ class TableFormatter:
             lines.append(self.DOUBLE_HORIZONTAL * total_width)
             lines.append('')
 
-        # Top border
-        lines.append(self._render_separator(widths, self.TOP_LEFT, self.T_DOWN,
-                                            self.TOP_RIGHT, self.HORIZONTAL))
+        if self.header_groups:
+            # === Two-row header with column groups ===
 
-        # Header row
-        header_parts = [self.VERTICAL]
-        for col, width in zip(self.columns, widths):
-            header_parts.append(self._align_text(col.name, width, 'center'))
-            header_parts.append(self.VERTICAL)
-        lines.append(''.join(header_parts))
+            # Row 1 top border: group boundaries get ┬, internal sub-cols get ─
+            top_parts = [self.TOP_LEFT]
+            col_idx = 0
+            for gi, (gname, gcols) in enumerate(self.header_groups):
+                span_width = sum(widths[col_idx:col_idx + gcols]) + (gcols - 1)
+                top_parts.append(self.HORIZONTAL * span_width)
+                col_idx += gcols
+                if col_idx < len(widths):
+                    top_parts.append(self.T_DOWN)
+            top_parts.append(self.TOP_RIGHT)
+            lines.append(''.join(top_parts))
 
-        # Header separator
-        lines.append(self._render_separator(widths, self.T_RIGHT, self.CROSS,
-                                            self.T_LEFT, self.HORIZONTAL))
+            # Row 1 content: group names centered in their span
+            grp_parts = [self.VERTICAL]
+            col_idx = 0
+            for gname, gcols in self.header_groups:
+                span_width = sum(widths[col_idx:col_idx + gcols]) + (gcols - 1)
+                grp_parts.append(self._align_text(gname, span_width, 'center'))
+                col_idx += gcols
+                grp_parts.append(self.VERTICAL)
+            lines.append(''.join(grp_parts))
+
+            # Separator between group row and sub-header row
+            sep_parts = [self.T_RIGHT]
+            col_idx = 0
+            for gi, (gname, gcols) in enumerate(self.header_groups):
+                for j in range(gcols):
+                    sep_parts.append(self.HORIZONTAL * widths[col_idx])
+                    col_idx += 1
+                    if col_idx < len(widths):
+                        # Check if this is a group boundary or internal sub-col boundary
+                        next_group_start = sum(gc for _, gc in self.header_groups[:gi + 1])
+                        if col_idx == next_group_start:
+                            sep_parts.append(self.CROSS)
+                        else:
+                            sep_parts.append(self.T_DOWN)
+            sep_parts.append(self.T_LEFT)
+            lines.append(''.join(sep_parts))
+
+            # Row 2: sub-column names
+            header_parts = [self.VERTICAL]
+            for col, width in zip(self.columns, widths):
+                header_parts.append(self._align_text(col.name, width, 'center'))
+                header_parts.append(self.VERTICAL)
+            lines.append(''.join(header_parts))
+
+            # Separator after sub-header
+            lines.append(self._render_separator(widths, self.T_RIGHT, self.CROSS,
+                                                self.T_LEFT, self.HORIZONTAL))
+        else:
+            # === Standard single-row header ===
+
+            # Top border
+            lines.append(self._render_separator(widths, self.TOP_LEFT, self.T_DOWN,
+                                                self.TOP_RIGHT, self.HORIZONTAL))
+
+            # Header row
+            header_parts = [self.VERTICAL]
+            for col, width in zip(self.columns, widths):
+                header_parts.append(self._align_text(col.name, width, 'center'))
+                header_parts.append(self.VERTICAL)
+            lines.append(''.join(header_parts))
+
+            # Header separator
+            lines.append(self._render_separator(widths, self.T_RIGHT, self.CROSS,
+                                                self.T_LEFT, self.HORIZONTAL))
 
         # Data rows
         for row in self.rows:

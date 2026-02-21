@@ -472,15 +472,15 @@ class SelectionConfig:
     top_n: int = 15                          # Number of stocks to hold
     momentum_lookback: int = 252             # 12-month momentum window
     momentum_skip: int = 21                  # Skip last month (reversal effect)
-    min_bars: int = 300                      # Need 300+ bars for reliable ranking
+    min_bars: int = 126                      # Need 126+ bars (6 months) for ranking
     sma_alignment_required: bool = True      # Only select stocks in uptrend
-    sector_max_pct: float = 0.30             # Max 30% in any single sector
-    volatility_cap_percentile: float = 90.0  # Exclude top 10% most volatile
+    sector_max_pct: float = 0.50             # Max 50% in any single sector
+    volatility_cap_percentile: float = 95.0  # Exclude top 5% most volatile
     # Weight allocation for composite score
-    w_momentum: float = 0.40
-    w_trend: float = 0.20
-    w_rs: float = 0.25
-    w_invvol: float = 0.15
+    w_momentum: float = 0.50
+    w_trend: float = 0.15
+    w_rs: float = 0.30
+    w_invvol: float = 0.05
 
 
 class StockSelector:
@@ -5875,11 +5875,18 @@ class InstitutionalPipeline:
         #   P < SMA200 (any bear state):     0.0 (flat, no shorts)
         if self.use_sma and closes is not None and len(closes) >= 50:
             current_price = float(closes[-1])
-            n = len(closes)
 
-            sma_50 = float(np.mean(closes[-50:]))
-            sma_100 = float(np.mean(closes[-100:])) if n >= 100 else None
-            sma_200 = float(np.mean(closes[-200:])) if n >= 200 else None
+            # v8.0: Prepend training prices so SMA200 is available from bar 0
+            if (self.use_v8_sizing and hasattr(self, '_v8_train_closes')
+                    and self._v8_train_closes is not None):
+                _sma_closes = np.concatenate([self._v8_train_closes, closes])
+            else:
+                _sma_closes = closes
+            n = len(_sma_closes)
+
+            sma_50 = float(np.mean(_sma_closes[-50:]))
+            sma_100 = float(np.mean(_sma_closes[-100:])) if n >= 100 else None
+            sma_200 = float(np.mean(_sma_closes[-200:])) if n >= 200 else None
 
             sma_position = 0.0
             sma_reason = ""
@@ -5922,15 +5929,44 @@ class InstitutionalPipeline:
                     sma_position = 0.0
                     sma_reason = "sma=below_50(flat)"
 
-            # v8.0: Scale position by selection rank (top stocks get more)
+            # v8.0: Aggressive trend-strength + rank-based position sizing
             if self.use_v8_sizing and self._v8_rank and self._current_symbol:
                 rank_idx = self._v8_rank.get(self._current_symbol, -1)
                 if rank_idx >= 0 and sma_position > 0:
                     n_selected = max(len(self._v8_rank), 1)
-                    # Top-ranked → 0.50, bottom-ranked → 0.15
-                    rank_scale = 0.15 + 0.35 * (1.0 - rank_idx / n_selected)
-                    sma_position = min(rank_scale, 0.50)
-                    sma_reason = sma_reason.replace("0.25", f"{sma_position:.2f}")
+
+                    # Step 1: Trend-strength base position (replaces flat 0.25)
+                    #   Bull aligned (P > SMA50 > SMA100 > SMA200) → 0.80
+                    #   Golden cross (SMA50 > SMA100, P > SMA200)  → 0.60
+                    #   Just above SMA200                          → 0.40
+                    if sma_200 is not None and current_price > sma_200:
+                        if current_price > sma_50 > sma_100 > sma_200:
+                            base_pos = 0.80
+                            sma_reason = "sma=v8_bull_aligned"
+                        elif sma_100 is not None and sma_50 > sma_100:
+                            base_pos = 0.60
+                            sma_reason = "sma=v8_golden_cross"
+                        else:
+                            base_pos = 0.40
+                            sma_reason = "sma=v8_above_200"
+                    else:
+                        base_pos = sma_position  # Partial/minimal modes keep 0.25
+
+                    # Step 2: Distance-from-SMA200 boost (strong trends get more)
+                    trend_boost = 1.0
+                    if sma_200 is not None and sma_200 > 0:
+                        dist_pct = (current_price / sma_200) - 1.0
+                        # 0-10% above → 1.0x, 10-30% above → up to 1.3x
+                        trend_boost = 1.0 + min(max(dist_pct - 0.10, 0.0) * 1.5, 0.30)
+
+                    # Step 3: Rank-based multiplier (top stocks get more)
+                    # Rank 0 (best) → 1.0, Rank N-1 (worst selected) → 0.60
+                    rank_mult = 0.60 + 0.40 * (1.0 - rank_idx / n_selected)
+
+                    # Final position = base × trend_boost × rank
+                    sma_position = min(base_pos * trend_boost * rank_mult, 1.0)
+                    sma_reason = f"{sma_reason}({sma_position:+.2f})"
+
 
             # Override L3's target with SMA-based position
             order.target_exposure = sma_position
