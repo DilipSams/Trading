@@ -3128,57 +3128,79 @@ def main():
             _sector_pnls.sort(key=lambda x: x[1], reverse=True)
             hbar_chart(_sector_pnls, title="Sector Performance (Pipeline v7.0)")
 
-    # (c) Cumulative % return chart — equal-weight portfolio vs SPY
-    # Each symbol gets $10k. We average per-symbol daily returns by date
-    # (equal-weight portfolio), then cumprod to get cumulative % return.
-    # SPY: cumprod of its daily returns over the same dates.
-    # Both start at 0% — directly comparable regardless of dollar amounts.
+    # (c) Cumulative % return chart — per-symbol equity summation
+    # Build per-symbol equity curves, sum them, convert to cumulative %.
+    # This is EXACT: chart_final_% × total_capital = table Total P&L.
+    # SPY: cumprod on same dates, also as cumulative %.
     _date_rets = pipeline_results.get("per_symbol_date_returns", {})
     if _date_rets:
-        from collections import defaultdict
-        _by_date = defaultdict(list)
-        for _pairs in _date_rets.values():
+        _n_syms = len(_date_rets)
+        _total_capital = cfg.starting_capital * _n_syms
+
+        # Build per-symbol equity indexed by date
+        _sym_equity_by_date = {}
+        for _sym, _pairs in _date_rets.items():
+            _eq = cfg.starting_capital
+            _sym_eq = {}
             for _dt, _ret in _pairs:
-                _by_date[_dt].append(_ret)
-        _dates_sorted = sorted(_by_date.keys())
+                _eq *= (1 + _ret)
+                _sym_eq[_dt] = _eq
+            _sym_equity_by_date[_sym] = _sym_eq
+
+        # Collect all unique dates
+        _all_dates = set()
+        for _sym_eq in _sym_equity_by_date.values():
+            _all_dates.update(_sym_eq.keys())
+        _dates_sorted = sorted(_all_dates)
 
         if len(_dates_sorted) > 2:
-            # Equal-weight portfolio return per date (average across active symbols)
-            _port_rets = np.array([np.mean(_by_date[_dt]) for _dt in _dates_sorted])
-            _port_cum_pct = (np.cumprod(1 + _port_rets) - 1) * 100  # cumulative %
+            # Sum equity across symbols per date → cumulative %
+            _last_eq = {s: cfg.starting_capital for s in _sym_equity_by_date}
+            _total_eq = []
+            for _dt in _dates_sorted:
+                for _sym, _sym_eq in _sym_equity_by_date.items():
+                    if _dt in _sym_eq:
+                        _last_eq[_sym] = _sym_eq[_dt]
+                _total_eq.append(sum(_last_eq.values()))
+            _port_cum_pct = np.array([(v - _total_capital) / _total_capital * 100
+                                      for v in _total_eq])
 
-            # SPY cumulative % over the same dates
+            # SPY cumulative % over the same dates (on same total capital)
             _spy_cum_pct = None
             if has_spy_bench and spy_returns_lookup:
-                _spy_rets = np.array([spy_returns_lookup.get(_dt, 0.0) for _dt in _dates_sorted])
-                _spy_cum_pct = (np.cumprod(1 + _spy_rets) - 1) * 100
+                _spy_eq = _total_capital
+                _spy_vals = []
+                for _dt in _dates_sorted:
+                    _spy_eq *= (1 + spy_returns_lookup.get(_dt, 0.0))
+                    _spy_vals.append(_spy_eq)
+                _spy_cum_pct = np.array([(v - _total_capital) / _total_capital * 100
+                                         for v in _spy_vals])
 
-            # Compute summary values for annotation
-            _n_syms_chart = len(_date_rets)
-            _invested = cfg.starting_capital * _n_syms_chart
+            # Summary values
             _port_final_pct = float(_port_cum_pct[-1])
-            _port_return_dollar = _invested * _port_final_pct / 100
+            _port_pnl = _total_capital * _port_final_pct / 100
+            _p_sign = "+" if _port_pnl >= 0 else "-"
+            _p_c = C.GREEN if _port_final_pct > 0 else C.RED
 
             if _spy_cum_pct is not None:
                 dual_line_chart(_port_cum_pct, _spy_cum_pct, width=70, height=14,
-                               title="Cumulative Return: Portfolio vs SPY (equal $10k base)",
-                               label1="Pipeline v7.0", label2="SPY", fmt="%")
+                               title=f"Cumulative Return: Portfolio vs SPY ({_n_syms} syms × ${cfg.starting_capital/1e3:.0f}k)",
+                               label1="Pipeline v7.0", label2="SPY", fmt="%",
+                               dates=_dates_sorted)
                 _spy_final_pct = float(_spy_cum_pct[-1])
-                _spy_return_dollar = cfg.starting_capital * _spy_final_pct / 100
-                # Summary: % return (Return $ / Invested $)
-                _p_c = C.GREEN if _port_final_pct > 0 else C.RED
+                _spy_pnl = _total_capital * _spy_final_pct / 100
+                _s_sign = "+" if _spy_pnl >= 0 else "-"
                 _s_c = C.GREEN if _spy_final_pct > 0 else C.RED
                 print(f"    Pipeline v7.0: {_p_c}{_port_final_pct:+.1f}%{C.RESET}"
-                      f" (${_port_return_dollar:+,.0f} / ${_invested:,.0f})"
+                      f" ({_p_sign}${abs(_port_pnl):,.0f} / ${_total_capital:,.0f})"
                       f"    SPY: {_s_c}{_spy_final_pct:+.1f}%{C.RESET}"
-                      f" (${_spy_return_dollar:+,.0f} / ${cfg.starting_capital:,.0f})")
+                      f" ({_s_sign}${abs(_spy_pnl):,.0f} / ${_total_capital:,.0f})")
             else:
                 line_chart(_port_cum_pct, width=70, height=14,
-                          title="Cumulative Return: Portfolio ($10k/symbol)",
-                          fmt="%")
-                _p_c = C.GREEN if _port_final_pct > 0 else C.RED
+                          title=f"Cumulative Return: Portfolio ({_n_syms} syms × ${cfg.starting_capital/1e3:.0f}k)",
+                          fmt="%", dates=_dates_sorted)
                 print(f"    Portfolio: {_p_c}{_port_final_pct:+.1f}%{C.RESET}"
-                      f" (${_port_return_dollar:+,.0f} / ${_invested:,.0f})")
+                      f" ({_p_sign}${abs(_port_pnl):,.0f} / ${_total_capital:,.0f})")
 
     # (d) Training loss chart (only when training was run)
     if training_hist:

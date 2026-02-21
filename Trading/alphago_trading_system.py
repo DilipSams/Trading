@@ -237,15 +237,43 @@ def hbar_chart(items, width=40, title="", indent=4):
     print("\n".join(lines))
 
 
-def _chart_common(values, width, fmt):
+def _chart_common(values, width, fmt, dates=None):
     """Shared setup for line charts: downsample, compute range, format labels."""
     arr = np.array(values, dtype=float)
     arr = arr[np.isfinite(arr)]
+    ds_dates = None
     if len(arr) > width:
         bucket = len(arr) / width
+        if dates is not None and len(dates) == len(np.array(values, dtype=float)[np.isfinite(np.array(values, dtype=float))]):
+            ds_dates = [dates[int(i * bucket)] for i in range(width)]
         arr = np.array([np.mean(arr[int(i * bucket):int((i + 1) * bucket)])
                         for i in range(width)])
-    return arr
+    elif dates is not None and len(dates) == len(arr):
+        ds_dates = list(dates)
+    return arr, ds_dates
+
+
+def _year_axis(ds_dates, n, label_width, indent=4):
+    """Build an X-axis string with year labels at year-boundary positions."""
+    if ds_dates is None or len(ds_dates) < 2:
+        return None
+    # Extract year from each date string (YYYY-MM-DD)
+    years = [d[:4] for d in ds_dates]
+    # Find positions where year changes
+    markers = []  # [(column, year_str), ...]
+    markers.append((0, years[0]))
+    for i in range(1, len(years)):
+        if years[i] != years[i - 1]:
+            markers.append((i, years[i]))
+    # Build label line — place year strings at marker positions
+    axis = [" "] * n
+    for col, yr in markers:
+        for j, ch in enumerate(yr):
+            pos = col + j
+            if 0 <= pos < n:
+                axis[pos] = ch
+    pad = " " * indent
+    return f"{pad}{' ' * label_width}  {''.join(axis)}"
 
 
 def _fmt_y(v, fmt):
@@ -299,9 +327,9 @@ def _draw_line_on_canvas(canvas, rows, n):
 _LINE_CHARS = set("╮╰╭╯│─")
 
 
-def line_chart(values, width=60, height=10, title="", indent=4, fmt="$"):
+def line_chart(values, width=60, height=10, title="", indent=4, fmt="$", dates=None):
     """Print ASCII line chart in the terminal using box-drawing characters."""
-    arr = _chart_common(values, width, fmt)
+    arr, ds_dates = _chart_common(values, width, fmt, dates=dates)
     if len(arr) < 2:
         return
 
@@ -337,14 +365,18 @@ def line_chart(values, width=60, height=10, title="", indent=4, fmt="$"):
         lines.append(f"{pad}{C.DIM}{label}{C.RESET} ┤{colored}│")
 
     lines.append(f"{pad}{' ' * label_width} └{'─' * n}┘")
+    year_line = _year_axis(ds_dates, n, label_width, indent)
+    if year_line:
+        lines.append(year_line)
     print("\n".join(lines))
 
 
 def dual_line_chart(values1, values2, width=60, height=12, title="",
-                    label1="Strategy", label2="SPY", indent=4, fmt="$"):
+                    label1="Strategy", label2="SPY", indent=4, fmt="$",
+                    dates=None):
     """Print ASCII line chart with two overlaid series using box-drawing chars."""
-    arr1 = _chart_common(values1, width, fmt)
-    arr2 = _chart_common(values2, width, fmt)
+    arr1, ds_dates = _chart_common(values1, width, fmt, dates=dates)
+    arr2, _ = _chart_common(values2, width, fmt)
     if len(arr1) < 2:
         return
 
@@ -352,6 +384,8 @@ def dual_line_chart(values1, values2, width=60, height=12, title="",
     n = min(len(arr1), len(arr2)) if len(arr2) > 1 else len(arr1)
     arr1 = arr1[:n]
     arr2 = arr2[:n] if len(arr2) > 1 else None
+    if ds_dates is not None:
+        ds_dates = ds_dates[:n]
 
     # Global min/max across both series
     vmin, vmax = float(np.min(arr1)), float(np.max(arr1))
@@ -408,6 +442,9 @@ def dual_line_chart(values1, values2, width=60, height=12, title="",
         lines.append(f"{pad}{C.DIM}{label}{C.RESET} ┤{row_str}│")
 
     lines.append(f"{pad}{' ' * label_width} └{'─' * n}┘")
+    year_line = _year_axis(ds_dates, n, label_width, indent)
+    if year_line:
+        lines.append(year_line)
     print("\n".join(lines))
 
 
