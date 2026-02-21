@@ -416,7 +416,7 @@ def dual_line_chart(values1, values2, width=60, height=12, title="",
 # ============================================================================
 @dataclass
 class Config:
-    starting_capital: float = 100_000.0
+    starting_capital: float = 10_000.0
     max_position_pct: float = 0.95        # Max fraction of capital in position
     max_leverage: float = 1.0             # Max leverage (1.0 = no leverage)
     commission_pct: float = 0.001         # Commission as fraction of notional

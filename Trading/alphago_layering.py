@@ -1903,7 +1903,7 @@ Examples:
     g = p.add_argument_group("Training")
     g.add_argument("--iterations", type=int, default=3)        # v7.0 optimal: 3 iterations
     g.add_argument("--steps-per-iter", type=int, default=50_000)  # v7.0 optimal: 50k/iter (150k total)
-    g.add_argument("--capital", type=float, default=100_000)
+    g.add_argument("--capital", type=float, default=10_000)
     g.add_argument("--hidden-dim", type=int, default=256)
     g.add_argument("--batch-size", type=int, default=2048)  # GPU-optimized (Config default=4096)
     g.add_argument("--n-envs", type=int, default=64)
@@ -2675,19 +2675,25 @@ def main():
     spy_total_pnl = 0.0
     spy_cagr_str = "N/A"
     if has_spy_bench and spy_returns_lookup:
-        # Collect unique test-period dates from all datasets
+        # Collect unique TRADING dates (after lookback window) from per_symbol_date_returns.
+        # This matches the equity curve chart which uses the same date source.
+        # Using all timestamps_test would include the lookback window (~w bars)
+        # where no trading occurs, inflating SPY compounding vs the chart.
+        _date_rets_for_spy = pipeline_results.get("per_symbol_date_returns", {})
         _test_dates = set()
-        for d in datasets:
-            if hasattr(d, 'timestamps_test') and d.timestamps_test is not None:
-                for ts in d.timestamps_test:
-                    _test_dates.add(str(ts)[:10])
+        for _sym, _pairs in _date_rets_for_spy.items():
+            for _dt, _ret in _pairs:
+                _test_dates.add(_dt)
         _test_dates_sorted = sorted(_test_dates)
         # Get SPY returns for those unique dates only
         _spy_unique = [spy_returns_lookup.get(dt, 0.0) for dt in _test_dates_sorted]
         if _spy_unique:
             _spy_unique_arr = np.array(_spy_unique, dtype=np.float64)
             spy_cum = float(np.prod(1 + _spy_unique_arr) - 1)
-            spy_total_pnl = spy_cum * cfg.starting_capital
+            # SPY P&L on total capital (N × starting_capital) for fair
+            # comparison with strategy Total P&L (sum across all symbols)
+            _n_syms_spy = len(datasets)
+            spy_total_pnl = spy_cum * cfg.starting_capital * _n_syms_spy
             n_spy = len(_spy_unique_arr)
             spy_cagr = float(np.prod(1 + _spy_unique_arr) ** (252 / max(n_spy, 1)) - 1)
             spy_cagr_str = f"{spy_cagr:+.2%}"
@@ -2786,11 +2792,17 @@ def main():
             nosma_trade_c = C.GREEN if nosma_trade_pnl > 0 else C.RED
             pip_trade_c = C.GREEN if pip_trade_pnl > 0 else C.RED
 
-            # Starting capital
-            table.add_row(['Starting Capital',
+            # Starting capital — show per-symbol and total
+            _n_syms_table = len(_pip_per_sym) if _pip_per_sym else len(datasets)
+            _total_cap = cfg.starting_capital * _n_syms_table
+            table.add_row(['Capital / Symbol',
                           f"${cfg.starting_capital:>13,.0f}",
                           f"${cfg.starting_capital:>13,.0f}",
                           f"${cfg.starting_capital:>13,.0f}", _E, _E, _E])
+            table.add_row([f'Total Capital ({_n_syms_table} syms)',
+                          f"${_total_cap:>13,.0f}",
+                          f"${_total_cap:>13,.0f}",
+                          f"${_total_cap:>13,.0f}", _E, _E, _E])
 
             # Add rows with section headers
             table.add_row([f"{C.BOLD}--- P&L ---{C.RESET}", _E, _E, _E, _E, _E, _E])
@@ -2833,9 +2845,13 @@ def main():
                     _steps = _pip_per_sym.get(sym, {}).get('step_count', 0)
                     if _peak > 0 and _steps > 0:
                         _years = _steps / 252
-                        _sym_cagr = (1 + p_trade / _peak) ** (1 / max(_years, 0.01)) - 1
-                        _cagr_c = C.GREEN if _sym_cagr > 0 else C.RED
-                        cagr_str = f"{_cagr_c}{_sym_cagr:>+8.1%}{C.RESET}"
+                        _return_ratio = 1 + p_trade / _peak
+                        if _return_ratio > 0:
+                            _sym_cagr = _return_ratio ** (1 / max(_years, 0.01)) - 1
+                            _cagr_c = C.GREEN if _sym_cagr > 0 else C.RED
+                            cagr_str = f"{_cagr_c}{_sym_cagr:>+8.1%}{C.RESET}"
+                        else:
+                            cagr_str = f"{C.RED}  -100%+{C.RESET}"
                         used_str = f"${_peak:>10,.0f}"
                     else:
                         cagr_str = "N/A"
@@ -2915,11 +2931,17 @@ def main():
             print(f"  {'Metric':<22s}  {'Base v3.0':>{W}s}  {'v7.0 (no SMA)':>{W}s}  {'Pipeline v7.0':>{W}s}  {'# Trades':>{TW}s}")
             print(f"  {'='*22}  {'='*W}  {'='*W}  {'='*W}  {'='*TW}")
 
-            # Starting Capital
-            print(f"  {'Starting Capital':<22s}  "
+            # Starting Capital — show per-symbol and total
+            _n_syms_fb_tbl = len(_pip_per_sym) if _pip_per_sym else len(datasets)
+            _total_cap_fb = cfg.starting_capital * _n_syms_fb_tbl
+            print(f"  {'Capital / Symbol':<22s}  "
                   f"${cfg.starting_capital:>{W-1},.0f}  "
                   f"${cfg.starting_capital:>{W-1},.0f}  "
                   f"${cfg.starting_capital:>{W-1},.0f}")
+            print(f"  {f'Total Capital ({_n_syms_fb_tbl} syms)':<22s}  "
+                  f"${_total_cap_fb:>{W-1},.0f}  "
+                  f"${_total_cap_fb:>{W-1},.0f}  "
+                  f"${_total_cap_fb:>{W-1},.0f}")
 
             # --- P&L Breakdown ---
             print(f"  {C.BOLD}{'--- P&L ---':<22s}{C.RESET}")
@@ -2967,8 +2989,12 @@ def main():
                     _steps_fb = _pip_per_sym.get(sym, {}).get('step_count', 0)
                     if _peak_fb > 0 and _steps_fb > 0:
                         _yrs_fb = _steps_fb / 252
-                        _cagr_fb = (1 + p_trade / _peak_fb) ** (1 / max(_yrs_fb, 0.01)) - 1
-                        cagr_fb_str = f"{_cagr_fb:>+8.1%}"
+                        _rr_fb = 1 + p_trade / _peak_fb
+                        if _rr_fb > 0:
+                            _cagr_fb = _rr_fb ** (1 / max(_yrs_fb, 0.01)) - 1
+                            cagr_fb_str = f"{_cagr_fb:>+8.1%}"
+                        else:
+                            cagr_fb_str = "  -100%+"
                         used_fb_str = f"${_peak_fb:>10,.0f}"
                     else:
                         cagr_fb_str = "     N/A"
@@ -3104,38 +3130,63 @@ def main():
             _sector_pnls.sort(key=lambda x: x[1], reverse=True)
             hbar_chart(_sector_pnls, title="Sector Performance (Pipeline v7.0)")
 
-    # (c) Portfolio equity curve vs SPY — date-aligned returns
-    # FIX: Previously used concatenated per-symbol returns (4 syms × N bars =
-    # 4N compounding periods), inflating the equity curve. Now we merge by date
-    # and average across active symbols so both strategy and SPY use the same
-    # time axis with identical compounding periods.
+    # (c) Portfolio equity curve vs SPY — per-symbol equity summation
+    # Each symbol runs independently from starting_capital. The total portfolio
+    # is N * starting_capital. We build per-symbol equity curves by date, sum
+    # them, and compare against SPY buy-and-hold on the same total capital.
+    # This ensures: chart ending_value - chart starting_value == table Total P&L.
     _date_rets = pipeline_results.get("per_symbol_date_returns", {})
     if _date_rets:
-        from collections import defaultdict
-        _by_date = defaultdict(list)
-        for _, _pairs in _date_rets.items():
-            for _dt, _ret in _pairs:
-                _by_date[_dt].append(_ret)
-        _dates_sorted = sorted(_by_date.keys())
-        _portfolio_rets = np.array([np.mean(_by_date[_dt]) for _dt in _dates_sorted])
+        _n_syms = len(_date_rets)
+        _total_capital = cfg.starting_capital * _n_syms
 
-        if len(_portfolio_rets) > 2:
-            _equity = cfg.starting_capital * np.cumprod(1 + _portfolio_rets)
-            # SPY equity for the exact same dates
+        # Build per-symbol equity indexed by date
+        # Each symbol: equity[date] = starting_capital * cumprod(1 + returns up to date)
+        _sym_equity_by_date = {}  # {sym: {date: equity_value}}
+        for _sym, _pairs in _date_rets.items():
+            _eq = cfg.starting_capital
+            _sym_eq = {}
+            for _dt, _ret in _pairs:
+                _eq *= (1 + _ret)
+                _sym_eq[_dt] = _eq
+            _sym_equity_by_date[_sym] = _sym_eq
+
+        # Collect all unique dates across all symbols
+        _all_dates = set()
+        for _sym_eq in _sym_equity_by_date.values():
+            _all_dates.update(_sym_eq.keys())
+        _dates_sorted = sorted(_all_dates)
+
+        if len(_dates_sorted) > 2:
+            # For each date, sum equity across symbols. If a symbol hasn't
+            # started yet or already ended, its equity is starting_capital (idle cash).
+            _total_eq = []
+            # Track last known equity per symbol (starts at starting_capital)
+            _last_eq = {s: cfg.starting_capital for s in _sym_equity_by_date}
+            for _dt in _dates_sorted:
+                for _sym, _sym_eq in _sym_equity_by_date.items():
+                    if _dt in _sym_eq:
+                        _last_eq[_sym] = _sym_eq[_dt]
+                _total_eq.append(sum(_last_eq.values()))
+            _equity = np.array(_total_eq)
+
+            # SPY: buy-and-hold with the same total capital over the same dates
             _spy_eq = None
             if has_spy_bench and spy_returns_lookup:
-                _spy_u = np.array([spy_returns_lookup.get(_dt, 0.0) for _dt in _dates_sorted],
-                                  dtype=np.float64)
-                if len(_spy_u) > 2:
-                    _spy_eq = cfg.starting_capital * np.cumprod(1 + _spy_u)
+                _spy_cum = _total_capital
+                _spy_vals = []
+                for _dt in _dates_sorted:
+                    _spy_cum *= (1 + spy_returns_lookup.get(_dt, 0.0))
+                    _spy_vals.append(_spy_cum)
+                _spy_eq = np.array(_spy_vals)
 
             if _spy_eq is not None:
                 dual_line_chart(_equity, _spy_eq, width=70, height=14,
-                               title="Portfolio Equity vs SPY Buy & Hold",
+                               title=f"Portfolio Equity vs SPY Buy & Hold (${_total_capital/1e3:.0f}k base)",
                                label1="Pipeline v7.0", label2="SPY")
             else:
                 line_chart(_equity, width=70, height=14,
-                          title="Portfolio Equity Curve (Pipeline v7.0)")
+                          title=f"Portfolio Equity Curve (${_total_capital/1e3:.0f}k base)")
 
     # (d) Training loss chart (only when training was run)
     if training_hist:
