@@ -90,6 +90,7 @@ try:
         RLAlphaAdapter, TrendAlpha, MeanReversionAlpha,
         ValueAlpha, CarryAlpha, SeasonalityAlpha, VolatilityPremiumAlpha,
         TrendVolRegimeDetector, FutureLeakGuard, build_default_pipeline,
+        SelectionConfig, StockSelector,
     )
     HAS_ARCH = True
 except ImportError as e:
@@ -270,6 +271,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
 
         # -- Reset pipeline for this symbol --
         pipeline.reset(cfg.starting_capital)
+        pipeline._current_symbol = d.symbol  # v8.0: for rank-based sizing
 
         # -- Inject trained network into RL alpha --
         rl_alpha = None
@@ -622,6 +624,204 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         "per_symbol_date_returns": per_symbol_date_returns,
         "spy_returns": np.array(all_spy_returns, dtype=np.float64),
     }
+
+
+# ============================================================================
+# V8.0: FAILURE POST-MORTEM
+# ============================================================================
+
+def run_postmortem(base_results, nosma_results, sma_results, datasets):
+    """
+    Quantify WHY v3.0 and v7.0 (no SMA) underperform.
+
+    Analyzes:
+    1. v3.0: % of losses from trading below SMA200 (no trend awareness)
+    2. v7.0 (no SMA): Falling knife trades, bear-market signal noise
+    3. v7.0 (SMA): Why conservative (quantify cash drag)
+    """
+    print_subsection("FAILURE POST-MORTEM")
+
+    def _analyze_version(results, label, datasets):
+        """Compute bear-market loss attribution for a result set."""
+        if results is None:
+            tprint(f"  {label}: No results available", "warn")
+            return
+        per_sym = results.get('per_sym', {})
+        if not per_sym:
+            tprint(f"  {label}: No per-symbol data", "warn")
+            return
+
+        total_pnl = results.get('total_pnl', 0)
+        total_trades = results.get('total_trades', 0)
+
+        # Build price lookup from datasets
+        sym_closes = {}
+        for d in datasets:
+            if hasattr(d, 'prices_test') and d.prices_test is not None:
+                sym_closes[d.symbol] = d.prices_test[:, 3]
+
+        bear_loss_total = 0.0
+        bull_loss_total = 0.0
+        bear_trade_count = 0
+        bull_trade_count = 0
+        symbols_below_sma = 0
+
+        for sym, metrics in per_sym.items():
+            closes = sym_closes.get(sym)
+            if closes is None or len(closes) < 200:
+                continue
+
+            sma200 = float(np.mean(closes[-200:]))
+            final_price = float(closes[-1])
+            sym_pnl = metrics.get('pnl', 0)
+            sym_trades = metrics.get('trades', 0)
+
+            if final_price < sma200:
+                symbols_below_sma += 1
+                if sym_pnl < 0:
+                    bear_loss_total += sym_pnl
+                    bear_trade_count += sym_trades
+            else:
+                if sym_pnl < 0:
+                    bull_loss_total += sym_pnl
+                    bull_trade_count += sym_trades
+
+        total_loss = bear_loss_total + bull_loss_total
+        bear_pct = (bear_loss_total / min(total_loss, -0.01)) * 100 if total_loss < -0.01 else 0
+
+        tprint(f"  {label}:", "info")
+        pnl_c = C.GREEN if total_pnl > 0 else C.RED
+        tprint(f"    Total P&L: {pnl_c}${total_pnl:+,.0f}{C.RESET}  "
+               f"({total_trades} trades)", "info")
+        tprint(f"    Symbols below SMA200 at end: {symbols_below_sma}", "info")
+        if total_loss < -0.01:
+            tprint(f"    Losses from below-SMA200 stocks: "
+                   f"{C.RED}${bear_loss_total:+,.0f}{C.RESET} "
+                   f"({bear_pct:.0f}% of all losses)", "warn")
+        tprint(f"    Losses from above-SMA200 stocks: "
+               f"${bull_loss_total:+,.0f}", "info")
+
+    # Analyze each version
+    _analyze_version(base_results, "Base v3.0 (raw RL)", datasets)
+    print()
+    _analyze_version(nosma_results, "v7.0 (no SMA)", datasets)
+    print()
+
+    # v7.0+SMA: quantify conservatism
+    if sma_results is not None:
+        per_sym_sma = sma_results.get('per_sym', {})
+        n_syms = len(per_sym_sma)
+        profitable = sma_results.get('profitable_symbols', 0)
+        total_pnl = sma_results.get('total_pnl', 0)
+        pnl_c = C.GREEN if total_pnl > 0 else C.RED
+        tprint(f"  v7.0 (SMA) — Conservative but profitable:", "ok")
+        tprint(f"    Total P&L: {pnl_c}${total_pnl:+,.0f}{C.RESET}", "info")
+        tprint(f"    Profitable symbols: {profitable}/{n_syms}", "info")
+        tprint(f"    Max position: 0.25 (75% cash earning yield)", "info")
+        tprint(f"    No stock selection: equal-weight all {n_syms} symbols", "info")
+    print()
+
+
+# ============================================================================
+# V8.0: ABLATION STUDY ("KEEP OR DISCARD")
+# ============================================================================
+
+def run_ablation_study(datasets, pipeline, cfg, acfg,
+                       spy_returns_lookup, net, sector_map,
+                       v7_sma_results, spy_total_pnl):
+    """
+    Empirical validation: test each v8.0 component independently.
+
+    For each test variant:
+    - Run evaluate_with_pipeline() on the selected subset
+    - Compare score, Sharpe, Total P&L vs v7.0+SMA and SPY
+    - Print KEEP if beats both benchmarks, DISCARD otherwise
+    """
+    benchmarks = {
+        'v7_sma_score': v7_sma_results.get('score', 0),
+        'v7_sma_sharpe': v7_sma_results.get('avg_sh', 0),
+        'spy_pnl': spy_total_pnl,
+    }
+
+    # Define test configurations
+    # Each: (name, SelectionConfig with specific weight overrides)
+    tests = [
+        ("Momentum Only (top-15)",
+         SelectionConfig(top_n=15, w_momentum=1.0, w_trend=0.0, w_rs=0.0, w_invvol=0.0)),
+        ("SMA Alignment Only (top-15)",
+         SelectionConfig(top_n=15, w_momentum=0.0, w_trend=1.0, w_rs=0.0, w_invvol=0.0)),
+        ("Relative Strength Only (top-15)",
+         SelectionConfig(top_n=15, w_momentum=0.0, w_trend=0.0, w_rs=1.0, w_invvol=0.0)),
+        ("Full Composite (top-15)",
+         SelectionConfig(top_n=15)),
+        ("Top 5 stocks",
+         SelectionConfig(top_n=5)),
+        ("Top 10 stocks",
+         SelectionConfig(top_n=10)),
+        ("Top 20 stocks",
+         SelectionConfig(top_n=20)),
+        ("Top 30 stocks",
+         SelectionConfig(top_n=30)),
+    ]
+
+    tprint(f"  Benchmarks: v7.0+SMA score={benchmarks['v7_sma_score']:+.3f}  "
+           f"SPY P&L=${benchmarks['spy_pnl']:+,.0f}", "info")
+    print()
+
+    # Table header
+    hdr = (f"  {'Test':<30s} {'Score':>8s} {'Sharpe':>8s} "
+           f"{'P&L':>12s} {'DD%':>7s} {'N':>4s}  Verdict")
+    print(f"  {C.BOLD}{'-' * 90}{C.RESET}")
+    print(f"  {C.BOLD}{hdr}{C.RESET}")
+    print(f"  {'-' * 90}")
+
+    for name, sel_cfg in tests:
+        selector = StockSelector(sel_cfg, sector_map)
+        filtered = selector.select(datasets, spy_returns_lookup)
+
+        if not filtered:
+            print(f"  {name:<30s}  -- no stocks selected --")
+            continue
+
+        # Reset pipeline for fresh eval
+        pipeline.use_sma = True
+        pipeline.use_v8_sizing = False  # Flat sizing for ablation
+        pipeline.execution_engine.reset_lifetime_stats()
+
+        results = evaluate_with_pipeline(
+            net=unwrap_net(net) if HAS_TORCH else net,
+            datasets=filtered,
+            pipeline=pipeline, cfg=cfg, acfg=acfg,
+            label=f"ablation_{name}", verbose=0,
+            spy_returns_lookup=spy_returns_lookup,
+        )
+
+        if results is None:
+            print(f"  {name:<30s}  -- eval failed --")
+            continue
+
+        r_score = results.get('score', 0)
+        r_sharpe = results.get('avg_sh', 0)
+        r_pnl = results.get('total_pnl', 0)
+        r_dd = results.get('dd_max', 0)
+        n_sel = len(filtered)
+
+        beats_v7 = r_score > benchmarks['v7_sma_score']
+        beats_spy = r_pnl > benchmarks['spy_pnl']
+
+        if beats_v7 and beats_spy:
+            verdict = f"{C.GREEN}{C.BOLD}KEEP{C.RESET}"
+        elif beats_v7 or beats_spy:
+            verdict = f"{C.YELLOW}MIXED{C.RESET}"
+        else:
+            verdict = f"{C.RED}DISCARD{C.RESET}"
+
+        pnl_c = C.GREEN if r_pnl > 0 else C.RED
+        print(f"  {name:<30s} {r_score:>+8.3f} {r_sharpe:>+8.3f} "
+              f"{pnl_c}${r_pnl:>+11,.0f}{C.RESET} {r_dd:>6.1f}% {n_sel:>4d}  {verdict}")
+
+    print(f"  {'-' * 90}")
+    print()
 
 
 def print_results(r):
@@ -1939,6 +2139,16 @@ Examples:
                    help="L3 target annual volatility (default: 0.15)")
     g.add_argument("--max-leverage", type=float, default=2.0)
 
+    # v8.0 Stock Selection
+    g = p.add_argument_group("v8.0 Stock Selection")
+    g.add_argument("--version", type=str, default="v7",
+                   choices=["v7", "v8"],
+                   help="Strategy version: v7=current, v8=stock selection engine")
+    g.add_argument("--top-n", type=int, default=15,
+                   help="v8.0: number of stocks to select (default: 15)")
+    g.add_argument("--skip-ablation", action="store_true",
+                   help="v8.0: skip ablation study")
+
     # Data Caching (Yahoo Finance only)
     g = p.add_argument_group("Data Caching")
     g.add_argument("--cache", action="store_true",
@@ -2213,8 +2423,9 @@ def main():
     # BANNER
     # **********************************************************************
     print_section("", reset=True)  # Reset section counter for this run
+    _ver_label = "v8.0 -- Stock Selection Engine" if args.version == "v8" else "v7.0 -- Institutional Architecture"
     print_box(
-        "ALPHA-TRADE v7.0 -- Institutional Architecture",
+        f"ALPHA-TRADE {_ver_label}",
         f"L1->L2->L3->L4 | RL is one alpha of many | cfg:{config_hash} | {datetime.now():%Y-%m-%d %H:%M}"
     )
     print_gpu_info()
@@ -2666,6 +2877,73 @@ def main():
             tprint(f"Estimated capacity (Sharpe>0.5): "
                    f"${cap['capacity_at_sharpe_05']/1e6:.0f}M", "info")
 
+    # **********************************************************************
+    # V8.0: STOCK SELECTION ENGINE (gated behind --version v8)
+    # **********************************************************************
+    v8_results = None
+    if args.version == "v8":
+        print_section("V8.0 STOCK SELECTION ENGINE")
+
+        # Step 1: Failure post-mortem
+        tprint("Analyzing why v3.0 and v7.0 (no SMA) underperform...", "info")
+        run_postmortem(base_results, nosma_results, pipeline_results, datasets)
+
+        # Step 2: Stock selection
+        sel_cfg = SelectionConfig(top_n=args.top_n)
+        selector = StockSelector(sel_cfg, SECTOR_MAP)
+        selected_datasets = selector.select(datasets, spy_returns_lookup)
+
+        tprint(f"Selected {len(selected_datasets)} stocks from "
+               f"{len(datasets)} universe:", "ok")
+        if selector.selection_log:
+            _log = selector.selection_log[-1]
+            for _sel_sym in _log['selected']:
+                _sel_score = _log['scores'].get(_sel_sym, 0)
+                # Find component details
+                _comp_str = ""
+                for _s, _sc, _comp in _log['rankings']:
+                    if _s == _sel_sym:
+                        _comp_str = (f"mom={_comp['momentum']:+.1%} "
+                                     f"sma={_comp['sma_score']}/3 "
+                                     f"rs={_comp['rs_vs_spy']:+.1%} "
+                                     f"vol={_comp['vol_20']:.0%}")
+                        break
+                tprint(f"  {_sel_sym:<6s}: score={_sel_score:+.4f}  {_comp_str}", "info")
+
+            # Show sector allocation
+            _sec_alloc = _log.get('sector_allocation', {})
+            if _sec_alloc:
+                tprint(f"  Sector allocation: {dict(_sec_alloc)}", "info")
+
+        # Step 3: Build v8.0 rank map for position sizing
+        _v8_rank = {}
+        for _rank_idx, _sel_sym in enumerate(_log['selected'] if selector.selection_log else []):
+            _v8_rank[_sel_sym] = _rank_idx
+
+        # Step 4: Evaluate v8.0 with rank-based sizing
+        pipeline.use_sma = True
+        pipeline.use_v8_sizing = True
+        pipeline._v8_rank = _v8_rank
+        pipeline.execution_engine.reset_lifetime_stats()
+
+        v8_results = evaluate_with_pipeline(
+            net=unwrap_net(net) if HAS_TORCH else net,
+            datasets=selected_datasets,
+            pipeline=pipeline, cfg=cfg, acfg=acfg,
+            label="Pipeline v8.0", verbose=args.verbose,
+            spy_returns_lookup=spy_returns_lookup,
+        )
+        v8_lt = dict(pipeline.execution_engine.lifetime_stats)
+
+        print_results(v8_results)
+
+        # Restore pipeline to v7.0 mode
+        pipeline.use_v8_sizing = False
+        pipeline._v8_rank = {}
+        pipeline.execution_engine.reset_lifetime_stats()
+        pipeline.execution_engine._lifetime_trades = pip_sma_lt['n_trades']
+        pipeline.execution_engine._lifetime_suppressed = pip_sma_lt['n_suppressed']
+
     # -- Compute SPY buy-and-hold P&L for comparison table --
     # NOTE: spy_rets_arr is concatenated across symbols (duplicated dates) — correct
     # for benchmark-relative metrics (aligned 1:1 with strategy returns), but NOT
@@ -2706,6 +2984,18 @@ def main():
     _spy_period_str = ""
     if has_spy_bench and '_test_dates_sorted' in dir() and _test_dates_sorted:
         _spy_period_str = f"{_test_dates_sorted[0]} to {_test_dates_sorted[-1]}"
+
+    # -- v8.0 Ablation study (needs spy_total_pnl computed above) --
+    if args.version == "v8" and not args.skip_ablation and pipeline_results is not None:
+        print_section("V8.0 ABLATION STUDY")
+        tprint("Testing each selection factor independently — KEEP or DISCARD.", "info")
+        run_ablation_study(
+            datasets=datasets, pipeline=pipeline, cfg=cfg, acfg=acfg,
+            spy_returns_lookup=spy_returns_lookup, net=net,
+            sector_map=SECTOR_MAP,
+            v7_sma_results=pipeline_results,
+            spy_total_pnl=spy_total_pnl,
+        )
 
     # -- Show comparison if training was done --
     if base_results is not None:
@@ -2767,20 +3057,44 @@ def main():
         nosma_n_suppressed = nosma_lt.get('n_suppressed', 0)
         nosma_suppression_pct = nosma_lt.get('suppression_rate', 0) * 100
 
-        print_section("COMPARISON: v3.0 vs v7.0")
+        # v8.0 stats (conditional)
+        _has_v8 = v8_results is not None
+        if _has_v8:
+            _v8_per_sym = v8_results.get('per_sym', {})
+            v8_cash_yield = sum(s.get('cash_yield_pnl', 0) for s in _v8_per_sym.values())
+            v8_trade_pnl = v8_results['total_pnl'] - v8_cash_yield
+            v8_n_trades = v8_lt.get('n_trades', 0)
+            v8_n_suppressed = v8_lt.get('n_suppressed', 0)
+            v8_suppression_pct = v8_lt.get('suppression_rate', 0) * 100
+            _v8_n_syms = len(_v8_per_sym) if _v8_per_sym else args.top_n
+            _v8_total_cap = cfg.starting_capital * _v8_n_syms
+
+        _cmp_title = "COMPARISON: v3.0 vs v7.0 vs v8.0" if _has_v8 else "COMPARISON: v3.0 vs v7.0"
+        print_section(_cmp_title)
         print(f"  {C.DIM}Side-by-side: raw AI decisions vs. the full system with risk controls.{C.RESET}")
         print(f"  {C.DIM}Like comparing a driver without seatbelts (v3.0) vs. with full safety gear (v7.0).{C.RESET}")
 
         if HAS_TABLE_FORMATTER:
             _E = ""  # shorthand for empty trailing columns
-            table = TableFormatter(title="BASE V3.0 VS PIPELINE V7.0")
+            _tbl_title = "BASE V3.0 VS PIPELINE V7.0 VS V8.0" if _has_v8 else "BASE V3.0 VS PIPELINE V7.0"
+            table = TableFormatter(title=_tbl_title)
             table.add_column('Metric', align='left')
             table.add_column('Base v3.0', align='right')
             table.add_column('v7.0 (no SMA)', align='right')
             table.add_column('Pipeline v7.0', align='right')
+            if _has_v8:
+                table.add_column('v8.0 (Select)', align='right')
             table.add_column('# Trades', align='right')
             table.add_column('$ Used', align='right')
             table.add_column('CAGR', align='right')
+
+            # Helper: build row with optional v8 column
+            def _tr(metric, base, nosma, pip, v8=_E, trades=_E, used=_E, cagr=_E):
+                row = [metric, base, nosma, pip]
+                if _has_v8:
+                    row.append(v8)
+                row.extend([trades, used, cagr])
+                return row
 
             # Prepare colored strings
             base_pnl_c = C.GREEN if base_results.get('total_pnl', 0) > 0 else C.RED
@@ -2793,35 +3107,42 @@ def main():
             # Starting capital — show per-symbol and total
             _n_syms_table = len(_pip_per_sym) if _pip_per_sym else len(datasets)
             _total_cap = cfg.starting_capital * _n_syms_table
-            table.add_row(['Capital / Symbol',
+            table.add_row(_tr('Capital / Symbol',
                           f"${cfg.starting_capital:>13,.0f}",
                           f"${cfg.starting_capital:>13,.0f}",
-                          f"${cfg.starting_capital:>13,.0f}", _E, _E, _E])
-            table.add_row([f'Total Capital ({_n_syms_table} syms)',
+                          f"${cfg.starting_capital:>13,.0f}",
+                          f"${cfg.starting_capital:>13,.0f}" if _has_v8 else _E))
+            table.add_row(_tr(f'Total Capital ({_n_syms_table} syms)',
                           f"${_total_cap:>13,.0f}",
                           f"${_total_cap:>13,.0f}",
-                          f"${_total_cap:>13,.0f}", _E, _E, _E])
+                          f"${_total_cap:>13,.0f}",
+                          f"${_v8_total_cap:>13,.0f}" if _has_v8 else _E))
 
             # Add rows with section headers
-            table.add_row([f"{C.BOLD}--- P&L ---{C.RESET}", _E, _E, _E, _E, _E, _E])
-            table.add_row(['Total P&L',
+            table.add_row(_tr(f"{C.BOLD}--- P&L ---{C.RESET}"))
+            _v8_pnl_c = (C.GREEN if v8_results['total_pnl'] > 0 else C.RED) if _has_v8 else ""
+            table.add_row(_tr('Total P&L',
                           f"{base_pnl_c}${base_results.get('total_pnl', 0):>+13,.2f}{C.RESET}",
                           f"{nosma_pnl_c}${nosma_results['total_pnl']:>+13,.2f}{C.RESET}",
-                          f"{pip_pnl_c}${pipeline_results['total_pnl']:>+13,.2f}{C.RESET}", _E, _E, _E])
-            table.add_row(['  Trade P&L',
+                          f"{pip_pnl_c}${pipeline_results['total_pnl']:>+13,.2f}{C.RESET}",
+                          f"{_v8_pnl_c}${v8_results['total_pnl']:>+13,.2f}{C.RESET}" if _has_v8 else _E))
+            _v8_tc = (C.GREEN if v8_trade_pnl > 0 else C.RED) if _has_v8 else ""
+            table.add_row(_tr('  Trade P&L',
                           f"{base_trade_c}${base_trade_pnl:>+13,.2f}{C.RESET}",
                           f"{nosma_trade_c}${nosma_trade_pnl:>+13,.2f}{C.RESET}",
-                          f"{pip_trade_c}${pip_trade_pnl:>+13,.2f}{C.RESET}", _E, _E, _E])
-            table.add_row(['  Cash Yield',
+                          f"{pip_trade_c}${pip_trade_pnl:>+13,.2f}{C.RESET}",
+                          f"{_v8_tc}${v8_trade_pnl:>+13,.2f}{C.RESET}" if _has_v8 else _E))
+            table.add_row(_tr('  Cash Yield',
                           f"{C.CYAN}${base_cash_yield:>+13,.2f}{C.RESET}",
                           f"{C.CYAN}${nosma_cash_yield:>+13,.2f}{C.RESET}",
-                          f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}", _E, _E, _E])
+                          f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}",
+                          f"{C.CYAN}${v8_cash_yield:>+13,.2f}{C.RESET}" if _has_v8 else _E))
 
             # Per-symbol Trade P&L (cash yield stripped out) + $ Used + CAGR
             _base_per_sym = base_results.get('per_sym', {})
             all_syms = sorted(set(list(_base_per_sym.keys()) + list(_pip_per_sym.keys())))
             if all_syms:
-                table.add_row([f"{C.BOLD}--- Trade P&L by Symbol ---{C.RESET}", _E, _E, _E, _E, _E, _E])
+                table.add_row(_tr(f"{C.BOLD}--- Trade P&L by Symbol ---{C.RESET}"))
                 for sym in all_syms:
                     b_total = _base_per_sym.get(sym, {}).get('pnl', 0)
                     b_cash = _base_per_sym.get(sym, {}).get('cash_yield_pnl', 0) or _base_cash_per_sym.get(sym, 0)
@@ -2838,6 +3159,18 @@ def main():
                     sym_trades = _pip_per_sym.get(sym, {}).get('pipeline_trades', 0)
                     period = _sym_periods.get(sym, None)
                     period_str = f" ({period[0]} to {period[1]})" if period else ""
+                    # v8.0 per-symbol P&L (only for selected symbols)
+                    _v8_sym_str = _E
+                    if _has_v8:
+                        v8_s = _v8_per_sym.get(sym, {})
+                        if v8_s:
+                            v8_s_total = v8_s.get('pnl', 0)
+                            v8_s_cash = v8_s.get('cash_yield_pnl', 0)
+                            v8_s_trade = v8_s_total - v8_s_cash
+                            v8_s_c = C.GREEN if v8_s_trade > 0 else C.RED
+                            _v8_sym_str = f"{v8_s_c}${v8_s_trade:>+13,.2f}{C.RESET}"
+                        else:
+                            _v8_sym_str = f"{C.DIM}{'--':>14s}{C.RESET}"
                     # $ Used (peak notional) and CAGR
                     _peak = _pip_per_sym.get(sym, {}).get('peak_notional', 0)
                     _steps = _pip_per_sym.get(sym, {}).get('step_count', 0)
@@ -2854,68 +3187,97 @@ def main():
                     else:
                         cagr_str = "N/A"
                         used_str = "N/A"
-                    table.add_row([f"  {sym}{period_str}",
+                    table.add_row(_tr(f"  {sym}{period_str}",
                                   f"{b_c}${b_trade:>+13,.2f}{C.RESET}",
                                   f"{n_c}${n_trade:>+13,.2f}{C.RESET}",
                                   f"{p_c}${p_trade:>+13,.2f}{C.RESET}",
-                                  f"{sym_trades:>8d}", used_str, cagr_str])
+                                  _v8_sym_str,
+                                  f"{sym_trades:>8d}", used_str, cagr_str))
 
             if has_spy_bench:
                 spy_pnl_c = C.GREEN if spy_total_pnl > 0 else C.RED
                 _spy_hdr = f"--- SPY Benchmark ({_spy_period_str}) ---" if _spy_period_str else "--- SPY Benchmark ---"
-                table.add_row([f"{C.BOLD}{_spy_hdr}{C.RESET}", _E, _E, _E, _E, _E, _E])
-                table.add_row(['  SPY Buy & Hold P&L',
+                table.add_row(_tr(f"{C.BOLD}{_spy_hdr}{C.RESET}"))
+                table.add_row(_tr('  SPY Buy & Hold P&L',
                               f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}",
                               f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}",
-                              f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}", _E, _E, _E])
-                table.add_row(['  SPY CAGR', spy_cagr_str, spy_cagr_str, spy_cagr_str, _E, _E, _E])
+                              f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}",
+                              f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}" if _has_v8 else _E))
+                table.add_row(_tr('  SPY CAGR', spy_cagr_str, spy_cagr_str, spy_cagr_str,
+                              spy_cagr_str if _has_v8 else _E))
 
-            table.add_row([f"{C.BOLD}--- Trading ---{C.RESET}", _E, _E, _E, _E, _E, _E])
-            table.add_row(['Trades Executed',
+            # --- Stock Selection (v8.0 only) ---
+            if _has_v8:
+                table.add_row(_tr(f"{C.BOLD}--- Stock Selection ---{C.RESET}"))
+                table.add_row(_tr('Universe Size',
+                              f"{_n_syms_table:>14d}", f"{_n_syms_table:>14d}", f"{_n_syms_table:>14d}",
+                              f"{_v8_n_syms:>14d}"))
+                # Avg momentum for v8 selected stocks
+                if selector.selection_log:
+                    _sel_rankings = selector.selection_log[-1]['rankings']
+                    _sel_set = set(selector.selection_log[-1]['selected'])
+                    _sel_moms = [c['momentum'] for s, sc, c in _sel_rankings if s in _sel_set]
+                    _sel_smas = [c['sma_score'] for s, sc, c in _sel_rankings if s in _sel_set]
+                    _avg_mom = np.mean(_sel_moms) if _sel_moms else 0
+                    _avg_sma = np.mean(_sel_smas) if _sel_smas else 0
+                    table.add_row(_tr('Avg Momentum',
+                                  "N/A", "N/A", "N/A", f"{_avg_mom:>+13.1%}"))
+                    table.add_row(_tr('Avg SMA Score',
+                                  "N/A", "N/A", "N/A", f"{_avg_sma:>14.1f}"))
+
+            table.add_row(_tr(f"{C.BOLD}--- Trading ---{C.RESET}"))
+            table.add_row(_tr('Trades Executed',
                           f"{base_n_trades:>14d}",
                           f"{nosma_n_trades:>14d}",
                           f"{pip_n_trades:>14d}",
-                          f"{pip_n_trades:>8d}", _E, _E])
+                          f"{v8_n_trades:>14d}" if _has_v8 else _E,
+                          f"{pip_n_trades:>8d}"))
 
             base_n_suppressed = 0
-            table.add_row(['Trades Suppressed',
+            table.add_row(_tr('Trades Suppressed',
                           f"{base_n_suppressed:>14d}",
                           f"{nosma_n_suppressed:>14d}",
-                          f"{pip_n_suppressed:>14d}", _E, _E, _E])
-            table.add_row(['Suppression Rate',
+                          f"{pip_n_suppressed:>14d}",
+                          f"{v8_n_suppressed:>14d}" if _has_v8 else _E))
+            table.add_row(_tr('Suppression Rate',
                           f"{0.0:>13.1f}%",
                           f"{nosma_suppression_pct:>13.1f}%",
-                          f"{pip_suppression_pct:>13.1f}%", _E, _E, _E])
+                          f"{pip_suppression_pct:>13.1f}%",
+                          f"{v8_suppression_pct:>13.1f}%" if _has_v8 else _E))
 
             base_wr_str = f"{base_win_rate:>13.1f}%" if not np.isnan(base_win_rate) else "N/A (0 closed)"
             pip_wr_str = f"{pip_win_rate:>13.1f}%" if not np.isnan(pip_win_rate) else f"N/A ({pip_n_closed_trades} closed)"
-            table.add_row(['Win Rate', base_wr_str, _E, pip_wr_str, _E, _E, _E])
+            table.add_row(_tr('Win Rate', base_wr_str, _E, pip_wr_str))
 
             base_pf_str = f"{base_profit_factor:>14.2f}" if not np.isnan(base_profit_factor) else "N/A"
             pip_pf_str = f"{pip_profit_factor:>14.2f}" if not np.isnan(pip_profit_factor) else "N/A"
-            table.add_row(['Profit Factor', base_pf_str, _E, pip_pf_str, _E, _E, _E])
+            table.add_row(_tr('Profit Factor', base_pf_str, _E, pip_pf_str))
 
             # --- Risk ---
-            table.add_row([f"{C.BOLD}--- Risk ---{C.RESET}", _E, _E, _E, _E, _E, _E])
-            table.add_row(['Sharpe',
+            table.add_row(_tr(f"{C.BOLD}--- Risk ---{C.RESET}"))
+            table.add_row(_tr('Sharpe',
                           f"{base_results.get('avg_sh', 0):>+14.3f}",
                           f"{nosma_results['avg_sh']:>+14.3f}",
-                          f"{pipeline_results['avg_sh']:>+14.3f}", _E, _E, _E])
-            table.add_row(['Max Drawdown',
+                          f"{pipeline_results['avg_sh']:>+14.3f}",
+                          f"{v8_results['avg_sh']:>+14.3f}" if _has_v8 else _E))
+            table.add_row(_tr('Max Drawdown',
                           f"{base_results.get('dd_max', 0):>13.1f}%",
                           f"{nosma_results['dd_max']:>13.1f}%",
-                          f"{pipeline_results['dd_max']:>13.1f}%", _E, _E, _E])
-            table.add_row(['Breadth',
+                          f"{pipeline_results['dd_max']:>13.1f}%",
+                          f"{v8_results['dd_max']:>13.1f}%" if _has_v8 else _E))
+            table.add_row(_tr('Breadth',
                           f"{base_results.get('breadth', 0):>13.0f}%",
                           f"{nosma_results['breadth']:>13.0f}%",
-                          f"{pipeline_results['breadth']:>13.0f}%", _E, _E, _E])
+                          f"{pipeline_results['breadth']:>13.0f}%",
+                          f"{v8_results['breadth']:>13.0f}%" if _has_v8 else _E))
 
             # --- Score ---
-            table.add_row([f"{C.BOLD}--- Score ---{C.RESET}", _E, _E, _E, _E, _E, _E])
-            table.add_row([f"{C.BOLD}Score{C.RESET}",
+            table.add_row(_tr(f"{C.BOLD}--- Score ---{C.RESET}"))
+            table.add_row(_tr(f"{C.BOLD}Score{C.RESET}",
                           f"{C.BOLD}{base_results.get('score', 0):>+14.3f}{C.RESET}",
                           f"{C.BOLD}{nosma_results['score']:>+14.3f}{C.RESET}",
-                          f"{C.BOLD}{pipeline_results['score']:>+14.3f}{C.RESET}", _E, _E, _E])
+                          f"{C.BOLD}{pipeline_results['score']:>+14.3f}{C.RESET}",
+                          f"{C.BOLD}{v8_results['score']:>+14.3f}{C.RESET}" if _has_v8 else _E))
 
             rendered = "  " + table.render().replace("\n", "\n  ")
             try:
@@ -2923,23 +3285,41 @@ def main():
             except UnicodeEncodeError:
                 print(rendered.encode('ascii', errors='replace').decode('ascii'))
         else:
-            # Fallback to old format (5 columns)
+            # Fallback to old format (plain text columns)
             W = 16  # column width
             TW = 10  # trades column width
-            print(f"  {'Metric':<22s}  {'Base v3.0':>{W}s}  {'v7.0 (no SMA)':>{W}s}  {'Pipeline v7.0':>{W}s}  {'# Trades':>{TW}s}")
-            print(f"  {'='*22}  {'='*W}  {'='*W}  {'='*W}  {'='*TW}")
+
+            # Pre-compute v8 formatted strings for clean insertion
+            if _has_v8:
+                _v8_pnl_str = f"  {C.GREEN if v8_results['total_pnl'] > 0 else C.RED}${v8_results['total_pnl']:>+13,.2f}{C.RESET}"
+                _v8_tpnl_str = f"  {C.GREEN if v8_trade_pnl > 0 else C.RED}${v8_trade_pnl:>+13,.2f}{C.RESET}"
+                _v8_cy_str = f"  {C.CYAN}${v8_cash_yield:>+13,.2f}{C.RESET}"
+                _v8_sh_str = f"  {v8_results['avg_sh']:>+14.3f}"
+                _v8_dd_str = f"  {v8_results['dd_max']:>13.1f}%"
+                _v8_br_str = f"  {v8_results['breadth']:>13.0f}%"
+                _v8_sc_str = f"  {v8_results['score']:>+14.3f}"
+            else:
+                _v8_pnl_str = _v8_tpnl_str = _v8_cy_str = ""
+                _v8_sh_str = _v8_dd_str = _v8_br_str = _v8_sc_str = ""
+
+            _v8_hdr = f"  {'v8.0 (Select)':>{W}s}" if _has_v8 else ""
+            print(f"  {'Metric':<22s}  {'Base v3.0':>{W}s}  {'v7.0 (no SMA)':>{W}s}  {'Pipeline v7.0':>{W}s}{_v8_hdr}  {'# Trades':>{TW}s}")
+            _eq_v8 = f"  {'='*W}" if _has_v8 else ""
+            print(f"  {'='*22}  {'='*W}  {'='*W}  {'='*W}{_eq_v8}  {'='*TW}")
 
             # Starting Capital — show per-symbol and total
             _n_syms_fb_tbl = len(_pip_per_sym) if _pip_per_sym else len(datasets)
             _total_cap_fb = cfg.starting_capital * _n_syms_fb_tbl
+            _v8_cap_col = f"  ${cfg.starting_capital:>{W-1},.0f}" if _has_v8 else ""
+            _v8_tcap_col = f"  ${_v8_total_cap:>{W-1},.0f}" if _has_v8 else ""
             print(f"  {'Capital / Symbol':<22s}  "
                   f"${cfg.starting_capital:>{W-1},.0f}  "
                   f"${cfg.starting_capital:>{W-1},.0f}  "
-                  f"${cfg.starting_capital:>{W-1},.0f}")
+                  f"${cfg.starting_capital:>{W-1},.0f}{_v8_cap_col}")
             print(f"  {f'Total Capital ({_n_syms_fb_tbl} syms)':<22s}  "
                   f"${_total_cap_fb:>{W-1},.0f}  "
                   f"${_total_cap_fb:>{W-1},.0f}  "
-                  f"${_total_cap_fb:>{W-1},.0f}")
+                  f"${_total_cap_fb:>{W-1},.0f}{_v8_tcap_col}")
 
             # --- P&L Breakdown ---
             print(f"  {C.BOLD}{'--- P&L ---':<22s}{C.RESET}")
@@ -2949,18 +3329,18 @@ def main():
             print(f"  {'Total P&L':<22s}  "
                   f"{base_pnl_c}${base_results.get('total_pnl', 0):>+13,.2f}{C.RESET}  "
                   f"{nosma_pnl_c}${nosma_results['total_pnl']:>+13,.2f}{C.RESET}  "
-                  f"{pip_pnl_c}${pipeline_results['total_pnl']:>+13,.2f}{C.RESET}")
+                  f"{pip_pnl_c}${pipeline_results['total_pnl']:>+13,.2f}{C.RESET}{_v8_pnl_str}")
             base_trade_c = C.GREEN if base_trade_pnl > 0 else C.RED
             nosma_trade_c = C.GREEN if nosma_trade_pnl > 0 else C.RED
             pip_trade_c = C.GREEN if pip_trade_pnl > 0 else C.RED
             print(f"  {'  Trade P&L':<22s}  "
                   f"{base_trade_c}${base_trade_pnl:>+13,.2f}{C.RESET}  "
                   f"{nosma_trade_c}${nosma_trade_pnl:>+13,.2f}{C.RESET}  "
-                  f"{pip_trade_c}${pip_trade_pnl:>+13,.2f}{C.RESET}")
+                  f"{pip_trade_c}${pip_trade_pnl:>+13,.2f}{C.RESET}{_v8_tpnl_str}")
             print(f"  {'  Cash Yield':<22s}  "
                   f"{C.CYAN}${base_cash_yield:>+13,.2f}{C.RESET}  "
                   f"{C.CYAN}${nosma_cash_yield:>+13,.2f}{C.RESET}  "
-                  f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}")
+                  f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}{_v8_cy_str}")
 
             # Per-symbol Trade P&L (cash yield stripped out) + $ Used + CAGR
             _base_per_sym_fb = base_results.get('per_sym', {})
@@ -2983,6 +3363,16 @@ def main():
                     sym_trades = _pip_per_sym.get(sym, {}).get('pipeline_trades', 0)
                     period = _sym_periods.get(sym, None)
                     period_str = f" ({period[0]} to {period[1]})" if period else ""
+                    # v8 per-symbol
+                    _v8_fb_sym = ""
+                    if _has_v8:
+                        _v8s = _v8_per_sym.get(sym, {})
+                        if _v8s:
+                            _v8st = _v8s.get('pnl', 0) - _v8s.get('cash_yield_pnl', 0)
+                            _v8sc = C.GREEN if _v8st > 0 else C.RED
+                            _v8_fb_sym = f"  {_v8sc}${_v8st:>+13,.2f}{C.RESET}"
+                        else:
+                            _v8_fb_sym = f"  {C.DIM}{'--':>14s}{C.RESET}"
                     _peak_fb = _pip_per_sym.get(sym, {}).get('peak_notional', 0)
                     _steps_fb = _pip_per_sym.get(sym, {}).get('step_count', 0)
                     if _peak_fb > 0 and _steps_fb > 0:
@@ -3000,36 +3390,42 @@ def main():
                     print(f"  {'  ' + sym + period_str:<22s}  "
                           f"{b_c}${b_trade:>+13,.2f}{C.RESET}  "
                           f"{n_c}${n_trade:>+13,.2f}{C.RESET}  "
-                          f"{p_c}${p_trade:>+13,.2f}{C.RESET}  "
+                          f"{p_c}${p_trade:>+13,.2f}{C.RESET}"
+                          f"{_v8_fb_sym}  "
                           f"{sym_trades:>10d}  {used_fb_str}  {cagr_fb_str}")
 
             if has_spy_bench:
                 spy_pnl_c = C.GREEN if spy_total_pnl > 0 else C.RED
                 _spy_hdr_fb = f"--- SPY Benchmark ({_spy_period_str}) ---" if _spy_period_str else "--- SPY Benchmark ---"
                 print(f"  {C.BOLD}{_spy_hdr_fb}{C.RESET}")
+                _v8_spy_col = f"  {spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}" if _has_v8 else ""
                 print(f"  {'  SPY Buy & Hold P&L':<22s}  "
                       f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}  "
                       f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}  "
-                      f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}")
+                      f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}{_v8_spy_col}")
+                _v8_spy_cagr = f"  {spy_cagr_str:>14s}" if _has_v8 else ""
                 print(f"  {'  SPY CAGR':<22s}  "
-                      f"{spy_cagr_str:>14s}  {spy_cagr_str:>14s}  {spy_cagr_str:>14s}")
+                      f"{spy_cagr_str:>14s}  {spy_cagr_str:>14s}  {spy_cagr_str:>14s}{_v8_spy_cagr}")
 
             # --- Trading Activity ---
             print(f"  {C.BOLD}{'--- Trading ---':<22s}{C.RESET}")
+            _v8_tex = f"  {v8_n_trades:>14d}" if _has_v8 else ""
             print(f"  {'Trades Executed':<22s}  "
                   f"{base_n_trades:>14d}  "
                   f"{nosma_n_trades:>14d}  "
-                  f"{pip_n_trades:>14d}")
+                  f"{pip_n_trades:>14d}{_v8_tex}")
 
             base_n_suppressed = 0
+            _v8_tsu = f"  {v8_n_suppressed:>14d}" if _has_v8 else ""
             print(f"  {'Trades Suppressed':<22s}  "
                   f"{base_n_suppressed:>14d}  "
                   f"{nosma_n_suppressed:>14d}  "
-                  f"{pip_n_suppressed:>14d}")
+                  f"{pip_n_suppressed:>14d}{_v8_tsu}")
+            _v8_sr = f"  {v8_suppression_pct:>13.1f}%" if _has_v8 else ""
             print(f"  {'Suppression Rate':<22s}  "
                   f"{0.0:>13.1f}%  "
                   f"{nosma_suppression_pct:>13.1f}%  "
-                  f"{pip_suppression_pct:>13.1f}%")
+                  f"{pip_suppression_pct:>13.1f}%{_v8_sr}")
 
             base_wr_str = f"{base_win_rate:>13.1f}%" if not np.isnan(base_win_rate) else "      N/A (no closed trades)"
             pip_wr_str = f"{pip_win_rate:>13.1f}%" if not np.isnan(pip_win_rate) else f"      N/A ({pip_n_closed_trades} closed)"
@@ -3046,22 +3442,23 @@ def main():
             print(f"  {'Sharpe':<22s}  "
                   f"{base_results.get('avg_sh', 0):>+14.3f}  "
                   f"{nosma_results['avg_sh']:>+14.3f}  "
-                  f"{pipeline_results['avg_sh']:>+14.3f}")
+                  f"{pipeline_results['avg_sh']:>+14.3f}{_v8_sh_str}")
             print(f"  {'Max Drawdown':<22s}  "
                   f"{base_results.get('dd_max', 0):>13.1f}%  "
                   f"{nosma_results['dd_max']:>13.1f}%  "
-                  f"{pipeline_results['dd_max']:>13.1f}%")
+                  f"{pipeline_results['dd_max']:>13.1f}%{_v8_dd_str}")
             print(f"  {'Breadth':<22s}  "
                   f"{base_results.get('breadth', 0):>13.0f}%  "
                   f"{nosma_results['breadth']:>13.0f}%  "
-                  f"{pipeline_results['breadth']:>13.0f}%")
+                  f"{pipeline_results['breadth']:>13.0f}%{_v8_br_str}")
 
             # --- Score ---
-            print(f"  {'='*22}  {'='*14}  {'='*14}  {'='*14}")
+            _eq_v8_sc = f"  {'='*14}" if _has_v8 else ""
+            print(f"  {'='*22}  {'='*14}  {'='*14}  {'='*14}{_eq_v8_sc}")
             print(f"  {C.BOLD}{'Score':<22s}  "
                   f"{base_results.get('score', 0):>+14.3f}  "
                   f"{nosma_results['score']:>+14.3f}  "
-                  f"{pipeline_results['score']:>+14.3f}{C.RESET}")
+                  f"{pipeline_results['score']:>+14.3f}{_v8_sc_str}{C.RESET}")
 
         # Add explanatory note if pipeline has 0 closed trades but positive Trade P&L
         # Also show detailed trade entry breakdown
@@ -3415,9 +3812,11 @@ def main():
     if HAS_TORCH and torch.cuda.is_available():
         tprint(f"Peak GPU: {torch.cuda.max_memory_allocated()/1024**3:.2f}GB", "gpu")
 
+    _complete_ver = "v8.0" if args.version == "v8" else "v7.0"
+    _complete_score = v8_results['score'] if v8_results is not None else pipeline_results['score']
     print_box(
-        "COMPLETE -- ALPHA-TRADE v7.0",
-        f"Score:{pipeline_results['score']:+.3f} | "
+        f"COMPLETE -- ALPHA-TRADE {_complete_ver}",
+        f"Score:{_complete_score:+.3f} | "
         f"Alphas:{pipeline.alpha_factory.n_alphas} | "
         f"Suppression:{lt['suppression_rate']:.0%} | "
         f"TFs:{','.join(tfs)}"

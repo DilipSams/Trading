@@ -463,6 +463,189 @@ class ArchitectureConfig:
 
 
 # ============================================================================
+# V8.0 STOCK SELECTION ENGINE
+# ============================================================================
+
+@dataclass
+class SelectionConfig:
+    """Configuration for v8.0 stock selection engine."""
+    top_n: int = 15                          # Number of stocks to hold
+    momentum_lookback: int = 252             # 12-month momentum window
+    momentum_skip: int = 21                  # Skip last month (reversal effect)
+    min_bars: int = 300                      # Need 300+ bars for reliable ranking
+    sma_alignment_required: bool = True      # Only select stocks in uptrend
+    sector_max_pct: float = 0.30             # Max 30% in any single sector
+    volatility_cap_percentile: float = 90.0  # Exclude top 10% most volatile
+    # Weight allocation for composite score
+    w_momentum: float = 0.40
+    w_trend: float = 0.20
+    w_rs: float = 0.25
+    w_invvol: float = 0.15
+
+
+class StockSelector:
+    """
+    Pre-evaluation stock selection for v8.0.
+
+    Ranks the full universe, selects top-N high-conviction stocks.
+    Runs BEFORE the pipeline evaluation loop.
+    """
+
+    def __init__(self, sel_cfg: SelectionConfig, sector_map: dict):
+        self.cfg = sel_cfg
+        self.sector_map = sector_map
+        self.selection_log = []
+
+    def rank_universe(self, datasets, spy_returns_lookup=None):
+        """
+        Rank all symbols by composite score.
+
+        For each symbol with sufficient data:
+        1. 12-1 month momentum (skip last month to avoid reversal)
+        2. SMA alignment score (P > SMA50 > SMA100 > SMA200 = 3, partial = 1-2, below = 0)
+        3. Relative strength vs SPY (outperformance ratio over 6 months)
+        4. Inverse volatility (prefer lower-vol stocks for risk-adjusted returns)
+
+        Returns: sorted list of (symbol, score, components_dict)
+        """
+        rankings = []
+
+        # Pre-compute SPY 6-month return for relative strength
+        spy_6m_return = 0.0
+        if spy_returns_lookup:
+            spy_dates = sorted(spy_returns_lookup.keys())
+            if len(spy_dates) >= 126:
+                spy_recent = spy_dates[-126:]
+                spy_cum = 1.0
+                for dt in spy_recent:
+                    spy_cum *= (1 + spy_returns_lookup[dt])
+                spy_6m_return = spy_cum - 1.0
+
+        # Collect volatilities for percentile filtering
+        all_vols = []
+        symbol_data = []
+
+        for d in datasets:
+            if not hasattr(d, 'prices_test') or d.prices_test is None:
+                continue
+            closes = d.prices_test[:, 3]  # Close prices (OHLCV col 3)
+            if closes is None or len(closes) < self.cfg.min_bars:
+                continue
+
+            # --- Momentum (12-1 month) ---
+            if len(closes) > self.cfg.momentum_lookback:
+                mom_start_idx = -(self.cfg.momentum_lookback)
+                mom_end_idx = -(self.cfg.momentum_skip) if self.cfg.momentum_skip > 0 else len(closes)
+                momentum = (closes[mom_end_idx] / closes[mom_start_idx]) - 1.0
+            else:
+                momentum = 0.0
+
+            # --- SMA Alignment Score (0-3) ---
+            sma50 = float(np.mean(closes[-50:]))
+            sma100 = float(np.mean(closes[-100:])) if len(closes) >= 100 else None
+            sma200 = float(np.mean(closes[-200:])) if len(closes) >= 200 else None
+            price = float(closes[-1])
+
+            sma_score = 0
+            if sma200 is not None and price > sma200:
+                sma_score += 1
+            if sma100 is not None and price > sma100:
+                sma_score += 1
+            if price > sma50:
+                sma_score += 1
+
+            # Skip stocks not in uptrend (if required)
+            if self.cfg.sma_alignment_required and sma_score == 0:
+                continue
+
+            # --- Relative Strength vs SPY (6-month) ---
+            rs_vs_spy = 0.0
+            if spy_returns_lookup and hasattr(d, 'timestamps_test') and d.timestamps_test is not None:
+                ts = d.timestamps_test
+                if len(ts) >= 126 and len(closes) >= 126:
+                    stock_6m_return = (closes[-1] / closes[-126]) - 1.0
+                    rs_vs_spy = stock_6m_return - spy_6m_return
+
+            # --- Annualized Volatility (20-day) ---
+            if len(closes) >= 21:
+                log_rets = np.diff(np.log(closes[-21:]))
+                vol_20 = float(np.std(log_rets)) * np.sqrt(252)
+            else:
+                vol_20 = 0.30  # Default 30% vol
+
+            all_vols.append(vol_20)
+            symbol_data.append((d, momentum, sma_score, rs_vs_spy, vol_20))
+
+        # Filter out top-percentile volatility stocks
+        if all_vols:
+            vol_cap = float(np.percentile(all_vols, self.cfg.volatility_cap_percentile))
+        else:
+            vol_cap = 999.0
+
+        for d, momentum, sma_score, rs_vs_spy, vol_20 in symbol_data:
+            if vol_20 > vol_cap:
+                continue  # Too volatile, skip
+
+            inv_vol = 1.0 / max(vol_20, 0.01)
+
+            # --- Composite Score ---
+            score = (
+                self.cfg.w_momentum * momentum
+                + self.cfg.w_trend * (sma_score / 3.0)
+                + self.cfg.w_rs * rs_vs_spy
+                + self.cfg.w_invvol * (inv_vol / 100.0)  # Normalize inv_vol
+            )
+
+            rankings.append((d.symbol, score, {
+                'momentum': momentum,
+                'sma_score': sma_score,
+                'rs_vs_spy': rs_vs_spy,
+                'vol_20': vol_20,
+            }))
+
+        # Sort by composite score (descending)
+        rankings.sort(key=lambda x: x[1], reverse=True)
+        return rankings
+
+    def select(self, datasets, spy_returns_lookup=None):
+        """Select top-N stocks with sector diversification constraints."""
+        rankings = self.rank_universe(datasets, spy_returns_lookup)
+
+        selected = []
+        sector_counts = {}
+        max_per_sector = max(1, int(self.cfg.top_n * self.cfg.sector_max_pct))
+
+        # Build reverse lookup: symbol -> sector
+        sym_to_sector = {}
+        for sector, symbols in self.sector_map.items():
+            for s in symbols:
+                sym_to_sector[s] = sector
+
+        for sym, score, components in rankings:
+            if len(selected) >= self.cfg.top_n:
+                break
+            sector = sym_to_sector.get(sym, "other")
+            if sector_counts.get(sector, 0) >= max_per_sector:
+                continue  # Sector full, skip
+            selected.append(sym)
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
+        # Filter datasets to only selected symbols
+        sym_set = set(selected)
+        filtered = [d for d in datasets if d.symbol in sym_set]
+
+        # Log selection
+        self.selection_log.append({
+            'selected': selected,
+            'rankings': [(s, sc, comp) for s, sc, comp in rankings],
+            'scores': {s: sc for s, sc, _ in rankings},
+            'sector_allocation': dict(sector_counts),
+        })
+
+        return filtered
+
+
+# ============================================================================
 # FUTURE LEAK GUARD (Point C from feedback)
 # ============================================================================
 
@@ -5421,6 +5604,17 @@ class ExecutionEngine:
             'kill_context': self._kill_context,
         }
 
+    def reset_lifetime_stats(self):
+        """Reset lifetime accumulators (for A/B comparison runs)."""
+        self._lifetime_trades = 0
+        self._lifetime_suppressed = 0
+        self._lifetime_turnover = 0.0
+        self._lifetime_slippage = 0.0
+        self._n_trades = 0
+        self._n_suppressed = 0
+        self._total_turnover = 0.0
+        self._total_slippage = 0.0
+
     @property
     def lifetime_stats(self) -> Dict[str, Any]:
         """Aggregate stats across all episodes/symbols."""
@@ -5495,6 +5689,14 @@ class InstitutionalPipeline:
             acfg, bars_per_year,
             action_targets=(-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0),
         )
+
+        # SMA trend overlay toggle (can be disabled for A/B comparison)
+        self.use_sma = True
+
+        # v8.0: Rank-based position sizing (set externally before eval loop)
+        self.use_v8_sizing = False
+        self._v8_rank = {}        # symbol -> rank_index (0 = best)
+        self._current_symbol = None  # Set per-symbol in eval loop
 
         # Diagnostics
         self._step_count = 0
@@ -5669,7 +5871,7 @@ class InstitutionalPipeline:
         # Position table (LONG-ONLY, max 0.25):
         #   P > SMA200 (any bull state):    +0.25
         #   P < SMA200 (any bear state):     0.0 (flat, no shorts)
-        if closes is not None and len(closes) >= 50:
+        if self.use_sma and closes is not None and len(closes) >= 50:
             current_price = float(closes[-1])
             n = len(closes)
 
@@ -5718,13 +5920,23 @@ class InstitutionalPipeline:
                     sma_position = 0.0
                     sma_reason = "sma=below_50(flat)"
 
+            # v8.0: Scale position by selection rank (top stocks get more)
+            if self.use_v8_sizing and self._v8_rank and self._current_symbol:
+                rank_idx = self._v8_rank.get(self._current_symbol, -1)
+                if rank_idx >= 0 and sma_position > 0:
+                    n_selected = max(len(self._v8_rank), 1)
+                    # Top-ranked → 0.50, bottom-ranked → 0.15
+                    rank_scale = 0.15 + 0.35 * (1.0 - rank_idx / n_selected)
+                    sma_position = min(rank_scale, 0.50)
+                    sma_reason = sma_reason.replace("0.25", f"{sma_position:.2f}")
+
             # Override L3's target with SMA-based position
             order.target_exposure = sma_position
             order.reason = order.reason + f" | {sma_reason}"
             if abs(sma_position) > 1e-4:
                 order.constraints_hit = order.constraints_hit + ['sma_override']
 
-        elif closes is not None:
+        elif self.use_sma and closes is not None:
             # < 50 bars: force flat until we have enough data
             order.target_exposure = 0.0
             order.reason = order.reason + " | sma=warmup(flat)"
