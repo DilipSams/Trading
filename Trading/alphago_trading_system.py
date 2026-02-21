@@ -171,6 +171,247 @@ def print_gpu_info():
 
 
 # ============================================================================
+# Terminal chart utilities  (zero dependencies — pure Unicode + ANSI)
+# ============================================================================
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values, width=20):
+    """Render numeric series as compact Unicode sparkline string.
+
+    Returns a string of width characters using block elements ▁▂▃▄▅▆▇█.
+    If len(values) > width, downsamples by averaging buckets.
+    """
+    if values is None or len(values) == 0:
+        return ""
+    arr = np.array(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return ""
+
+    # Downsample to width by averaging buckets
+    if len(arr) > width:
+        bucket = len(arr) / width
+        arr = np.array([np.mean(arr[int(i * bucket):int((i + 1) * bucket)])
+                        for i in range(width)])
+
+    vmin, vmax = np.min(arr), np.max(arr)
+    rng = vmax - vmin
+    if rng == 0:
+        return _SPARK_CHARS[4] * len(arr)
+
+    # Map to 0..7
+    indices = np.clip(((arr - vmin) / rng * 7).astype(int), 0, 7)
+    return "".join(_SPARK_CHARS[i] for i in indices)
+
+
+def hbar_chart(items, width=40, title="", indent=4):
+    """Print horizontal bar chart with green/red bars.
+
+    Args:
+        items: list of (label, value) tuples
+        width: max bar width in characters
+        title: chart title
+        indent: left indent spaces
+    """
+    if not items:
+        return
+    pad = " " * indent
+    max_label = max(len(label) for label, _ in items)
+    max_abs = max(abs(v) for _, v in items) or 1
+
+    lines = []
+    if title:
+        lines.append(f"\n{pad}{C.BOLD}{title}{C.RESET}")
+        lines.append(f"{pad}{C.DIM}{'─' * (max_label + width + 20)}{C.RESET}")
+
+    for label, value in items:
+        bar_len = int(abs(value) / max_abs * width)
+        bar_len = max(bar_len, 1) if value != 0 else 0
+        color = C.GREEN if value >= 0 else C.RED
+        bar = "█" * bar_len
+        sign = "+" if value >= 0 else ""
+        lines.append(f"{pad}{label:<{max_label}s}  {color}{bar}{C.RESET}  {sign}${value:,.2f}")
+
+    lines.append(f"{pad}{C.DIM}{'─' * (max_label + width + 20)}{C.RESET}")
+    print("\n".join(lines))
+
+
+def _chart_common(values, width, fmt):
+    """Shared setup for line charts: downsample, compute range, format labels."""
+    arr = np.array(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) > width:
+        bucket = len(arr) / width
+        arr = np.array([np.mean(arr[int(i * bucket):int((i + 1) * bucket)])
+                        for i in range(width)])
+    return arr
+
+
+def _fmt_y(v, fmt):
+    if fmt == "$":
+        if abs(v) >= 1_000_000: return f"${v/1e6:.1f}M"
+        if abs(v) >= 1_000:     return f"${v/1e3:.0f}k"
+        return f"${v:.0f}"
+    elif fmt == "%":
+        return f"{v:.1f}%"
+    else:
+        return f"{v:.4f}" if abs(v) < 1 else f"{v:.2f}"
+
+
+def _compute_rows(arr, vmin, vmax, rng, height):
+    """Map array values to row indices (row 0 = top = vmax)."""
+    rows = []
+    for v in arr:
+        r = int((vmax - v) / rng * (height - 1) + 0.5)
+        rows.append(max(0, min(height - 1, r)))
+    return rows
+
+
+def _draw_line_on_canvas(canvas, rows, n):
+    """Draw a connected line onto a canvas using box-drawing characters.
+
+    For each transition from column c to c+1:
+      - flat: ─
+      - descending (row increases): ╮ at top, │ fill, ╰ at bottom
+      - ascending  (row decreases): ╯ at bottom, │ fill, ╭ at top
+    All transition characters are placed in column c+1.
+    """
+    # First column: start marker
+    canvas[rows[0]][0] = "─"
+
+    for c in range(1, n):
+        pr, cr = rows[c - 1], rows[c]
+        if pr == cr:
+            canvas[cr][c] = "─"
+        elif pr < cr:                       # descending (value drops)
+            canvas[pr][c] = "╮"
+            for r in range(pr + 1, cr):
+                canvas[r][c] = "│"
+            canvas[cr][c] = "╰"
+        else:                               # ascending (value rises)
+            canvas[cr][c] = "╭"
+            for r in range(cr + 1, pr):
+                canvas[r][c] = "│"
+            canvas[pr][c] = "╯"
+
+
+_LINE_CHARS = set("╮╰╭╯│─")
+
+
+def line_chart(values, width=60, height=10, title="", indent=4, fmt="$"):
+    """Print ASCII line chart in the terminal using box-drawing characters."""
+    arr = _chart_common(values, width, fmt)
+    if len(arr) < 2:
+        return
+
+    n = len(arr)
+    vmin, vmax = float(np.min(arr)), float(np.max(arr))
+    rng = vmax - vmin
+    if rng == 0:
+        rng = abs(vmax) * 0.1 or 1.0
+        vmin -= rng / 2; vmax += rng / 2; rng = vmax - vmin
+
+    pad = " " * indent
+    y_labels = [_fmt_y(vmin + rng * i / (height - 1), fmt) for i in range(height)]
+    label_width = max(len(lbl) for lbl in y_labels)
+
+    rows = _compute_rows(arr, vmin, vmax, rng, height)
+    canvas = [[" "] * n for _ in range(height)]
+    _draw_line_on_canvas(canvas, rows, n)
+
+    lines = []
+    if title:
+        lines.append(f"\n{pad}{C.BOLD}{title}{C.RESET}")
+        lines.append(f"{pad}{' ' * label_width} ┌{'─' * n}┐")
+
+    for row_idx in range(height):
+        y_idx = height - 1 - row_idx
+        label = y_labels[y_idx].rjust(label_width)
+        colored = ""
+        for ch in canvas[row_idx]:
+            if ch in _LINE_CHARS:
+                colored += f"{C.GREEN}{ch}{C.RESET}"
+            else:
+                colored += ch
+        lines.append(f"{pad}{C.DIM}{label}{C.RESET} ┤{colored}│")
+
+    lines.append(f"{pad}{' ' * label_width} └{'─' * n}┘")
+    print("\n".join(lines))
+
+
+def dual_line_chart(values1, values2, width=60, height=12, title="",
+                    label1="Strategy", label2="SPY", indent=4, fmt="$"):
+    """Print ASCII line chart with two overlaid series using box-drawing chars."""
+    arr1 = _chart_common(values1, width, fmt)
+    arr2 = _chart_common(values2, width, fmt)
+    if len(arr1) < 2:
+        return
+
+    # Align lengths (use shorter)
+    n = min(len(arr1), len(arr2)) if len(arr2) > 1 else len(arr1)
+    arr1 = arr1[:n]
+    arr2 = arr2[:n] if len(arr2) > 1 else None
+
+    # Global min/max across both series
+    vmin, vmax = float(np.min(arr1)), float(np.max(arr1))
+    if arr2 is not None:
+        vmin = min(vmin, float(np.min(arr2)))
+        vmax = max(vmax, float(np.max(arr2)))
+
+    rng = vmax - vmin
+    if rng == 0:
+        rng = abs(vmax) * 0.1 or 1.0
+        vmin -= rng / 2; vmax += rng / 2; rng = vmax - vmin
+
+    pad = " " * indent
+    y_labels = [_fmt_y(vmin + rng * i / (height - 1), fmt) for i in range(height)]
+    label_width = max(len(lbl) for lbl in y_labels)
+
+    # Draw each series on its own canvas, then merge
+    canvas1 = [[" "] * n for _ in range(height)]
+    rows1 = _compute_rows(arr1, vmin, vmax, rng, height)
+    _draw_line_on_canvas(canvas1, rows1, n)
+
+    canvas2 = None
+    if arr2 is not None:
+        canvas2 = [[" "] * n for _ in range(height)]
+        rows2 = _compute_rows(arr2, vmin, vmax, rng, height)
+        _draw_line_on_canvas(canvas2, rows2, n)
+
+    # Print
+    lines = []
+    if title:
+        lines.append(f"\n{pad}{C.BOLD}{title}{C.RESET}")
+        legend = (f"{pad}  {C.GREEN}──{C.RESET} {label1}    "
+                  f"{C.CYAN}──{C.RESET} {label2}")
+        lines.append(legend)
+        lines.append(f"{pad}{' ' * label_width} ┌{'─' * n}┐")
+
+    for row_idx in range(height):
+        y_idx = height - 1 - row_idx
+        label = y_labels[y_idx].rjust(label_width)
+        row_str = ""
+        for c in range(n):
+            c1 = canvas1[row_idx][c]
+            c2 = canvas2[row_idx][c] if canvas2 else " "
+            has1 = c1 in _LINE_CHARS
+            has2 = c2 in _LINE_CHARS
+            if has1 and has2:
+                row_str += f"{C.YELLOW}{c1}{C.RESET}"    # overlap
+            elif has1:
+                row_str += f"{C.GREEN}{c1}{C.RESET}"     # series 1
+            elif has2:
+                row_str += f"{C.CYAN}{c2}{C.RESET}"      # series 2
+            else:
+                row_str += " "
+        lines.append(f"{pad}{C.DIM}{label}{C.RESET} ┤{row_str}│")
+
+    lines.append(f"{pad}{' ' * label_width} └{'─' * n}┘")
+    print("\n".join(lines))
+
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
 @dataclass
@@ -4349,12 +4590,12 @@ class AlphaTradeSystem:
 # delisted, acquired, or dropped from the index during the backtest period.
 # For valid historical backtests, use a point-in-time index membership dataset.
 # Estimated bias: +0.3 to +0.5 annualized Sharpe for US large-cap equities.
-# Top 100 US stocks by market cap (Feb 2026), organized by GICS sector.
+# Top 200 US stocks by market cap (Feb 2026), organized by GICS sector.
 # SMA trend overlay performance note: works best on cyclical/growth sectors
 # (Technology, Industrials, Financials) with persistent trends; weakest on
 # defensive/stable sectors (Healthcare, Energy, Utilities) that mean-revert.
 DEFAULT_SYMBOLS=[
-    # --- Technology (Software, Semiconductors, Internet) ---
+    # --- Technology (45) -- Software, Semiconductors, Internet, Cybersecurity ---
     "AAPL",   # Apple -- Consumer electronics / software
     "MSFT",   # Microsoft -- Software / cloud (Azure)
     "NVDA",   # NVIDIA -- Semiconductors (AI/GPU)
@@ -4365,6 +4606,7 @@ DEFAULT_SYMBOLS=[
     "ORCL",   # Oracle -- Enterprise software / cloud
     "CRM",    # Salesforce -- Cloud CRM software
     "AMD",    # AMD -- Semiconductors (CPU/GPU)
+    "PLTR",   # Palantir -- AI / data analytics
     "ADBE",   # Adobe -- Creative / document software
     "CSCO",   # Cisco -- Networking equipment / software
     "ACN",    # Accenture -- IT consulting / services
@@ -4372,17 +4614,35 @@ DEFAULT_SYMBOLS=[
     "NOW",    # ServiceNow -- IT workflow automation
     "TXN",    # Texas Instruments -- Analog semiconductors
     "QCOM",   # Qualcomm -- Mobile semiconductors
+    "KLAC",   # KLA -- Semiconductor process control
     "INTU",   # Intuit -- Financial software (TurboTax, QuickBooks)
     "AMAT",   # Applied Materials -- Semiconductor equipment
     "LRCX",   # Lam Research -- Semiconductor equipment
+    "APH",    # Amphenol -- Electronic connectors / sensors
+    "ANET",   # Arista Networks -- Cloud networking
     "PANW",   # Palo Alto Networks -- Cybersecurity
     "MU",     # Micron -- Memory semiconductors
     "INTC",   # Intel -- Semiconductors (CPU)
     "ADI",    # Analog Devices -- Analog/mixed-signal semiconductors
     "NFLX",   # Netflix -- Streaming media
     "UBER",   # Uber -- Ride-sharing / delivery platform
+    "APP",    # AppLovin -- Mobile advertising / gaming
+    "CRWD",   # CrowdStrike -- Cybersecurity (endpoint)
+    "WDC",    # Western Digital -- Hard disk drives
+    "SNDK",   # SanDisk -- Flash storage / SSD (spun off from WDC)
+    "SNPS",   # Synopsys -- EDA / chip design software
+    "CDNS",   # Cadence Design Systems -- EDA / chip design software
+    "DELL",   # Dell Technologies -- PCs / servers / storage
+    "MSI",    # Motorola Solutions -- Public safety communications
+    "GLW",    # Corning -- Specialty glass / optical fiber
+    "DASH",   # DoorDash -- Delivery platform
+    "MRVL",   # Marvell Technology -- Semiconductors (networking/storage)
+    "NET",    # Cloudflare -- Internet security / CDN
+    "FTNT",   # Fortinet -- Cybersecurity (network)
+    "SNOW",   # Snowflake -- Cloud data platform
+    "MPWR",   # Monolithic Power Systems -- Power semiconductors
 
-    # --- Financials (Banks, Insurance, Payments, Capital Markets) ---
+    # --- Financials (33) -- Banks, Insurance, Payments, Capital Markets ---
     "JPM",    # JPMorgan Chase -- Diversified banking
     "V",      # Visa -- Payment processing
     "MA",     # Mastercard -- Payment processing
@@ -4390,10 +4650,11 @@ DEFAULT_SYMBOLS=[
     "GS",     # Goldman Sachs -- Investment banking / capital markets
     "MS",     # Morgan Stanley -- Investment banking / wealth management
     "WFC",    # Wells Fargo -- Diversified banking
+    "C",      # Citigroup -- Diversified banking
+    "AXP",    # American Express -- Payments / consumer finance
     "BLK",    # BlackRock -- Asset management
     "SPGI",   # S&P Global -- Financial data / ratings
     "SCHW",   # Charles Schwab -- Brokerage / wealth management
-    "AXP",    # American Express -- Payments / consumer finance
     "CB",     # Chubb -- Property & casualty insurance
     "MMC",    # Marsh McLennan -- Insurance brokerage
     "FI",     # Fiserv -- Financial technology / payments
@@ -4402,8 +4663,21 @@ DEFAULT_SYMBOLS=[
     "CME",    # CME Group -- Derivatives exchange
     "ICE",    # Intercontinental Exchange -- Financial exchanges
     "PYPL",   # PayPal -- Digital payments
+    "COF",    # Capital One -- Consumer banking / credit cards
+    "PGR",    # Progressive -- Auto / property insurance
+    "PNC",    # PNC Financial -- Regional banking
+    "USB",    # U.S. Bancorp -- Regional banking
+    "IBKR",   # Interactive Brokers -- Electronic brokerage
+    "BK",     # BNY Mellon -- Custody / asset servicing
+    "MCO",    # Moody's -- Credit ratings / analytics
+    "APO",    # Apollo Global Management -- Private equity
+    "HOOD",   # Robinhood -- Retail brokerage
+    "TRV",    # Travelers -- Property / casualty insurance
+    "TFC",    # Truist Financial -- Regional banking
+    "AFL",    # Aflac -- Supplemental insurance
+    "AJG",    # Arthur J. Gallagher -- Insurance brokerage
 
-    # --- Healthcare (Pharma, MedTech, Insurance) ---
+    # --- Healthcare (25) -- Pharma, MedTech, Insurance, Distribution ---
     "LLY",    # Eli Lilly -- Pharmaceuticals (GLP-1 / diabetes)
     "UNH",    # UnitedHealth -- Health insurance / Optum
     "JNJ",    # Johnson & Johnson -- Pharma / medical devices
@@ -4423,8 +4697,14 @@ DEFAULT_SYMBOLS=[
     "BMY",    # Bristol-Myers Squibb -- Pharmaceuticals
     "MCK",    # McKesson -- Pharma distribution
     "DHR",    # Danaher -- Life sciences / diagnostics
+    "CVS",    # CVS Health -- Pharmacy / health services
+    "HCA",    # HCA Healthcare -- Hospital operator
+    "ELV",    # Elevance Health -- Health insurance
+    "COR",    # Cencora -- Pharma distribution
+    "BDX",    # Becton Dickinson -- Medical devices / diagnostics
+    "ZTS",    # Zoetis -- Animal health pharmaceuticals
 
-    # --- Consumer Staples (Food, Beverages, Household) ---
+    # --- Consumer Staples (12) -- Food, Beverages, Household ---
     "WMT",    # Walmart -- Retail (grocery / general merchandise)
     "COST",   # Costco -- Warehouse retail
     "PG",     # Procter & Gamble -- Household products
@@ -4434,8 +4714,11 @@ DEFAULT_SYMBOLS=[
     "MCD",    # McDonald's -- Quick-service restaurants
     "MDLZ",   # Mondelez -- Snacks (Oreo, Cadbury)
     "EL",     # Estee Lauder -- Beauty / cosmetics
+    "MO",     # Altria -- Tobacco / nicotine
+    "MNST",   # Monster Beverage -- Energy drinks
+    "CL",     # Colgate-Palmolive -- Oral / personal care
 
-    # --- Consumer Discretionary (Retail, Auto, Leisure) ---
+    # --- Consumer Discretionary (20) -- Retail, Auto, Leisure, Media ---
     "TSLA",   # Tesla -- Electric vehicles / energy
     "HD",     # Home Depot -- Home improvement retail
     "LOW",    # Lowe's -- Home improvement retail
@@ -4444,37 +4727,101 @@ DEFAULT_SYMBOLS=[
     "SBUX",   # Starbucks -- Coffee / restaurants
     "NKE",    # Nike -- Athletic apparel / footwear
     "BRK-B",  # Berkshire Hathaway -- Conglomerate (insurance-led)
+    "DIS",    # Walt Disney -- Theme parks / streaming / media
+    "MAR",    # Marriott -- Hotels / hospitality
+    "RCL",    # Royal Caribbean -- Cruise lines / leisure
+    "ORLY",   # O'Reilly Automotive -- Auto parts retail
+    "ABNB",   # Airbnb -- Short-term rental platform
+    "GM",     # General Motors -- Automobiles
+    "HLT",    # Hilton -- Hotels / hospitality
+    "CVNA",   # Carvana -- Online auto retail
+    "ROST",   # Ross Stores -- Off-price retail
+    "AZO",    # AutoZone -- Auto parts retail
+    "F",      # Ford -- Automobiles
+    "WBD",    # Warner Bros Discovery -- Media / entertainment
 
-    # --- Industrials (Aerospace, Equipment, Transport) ---
+    # --- Industrials (30) -- Aerospace, Defense, Equipment, Transport ---
     "CAT",    # Caterpillar -- Construction / mining equipment
     "GE",     # GE Aerospace -- Jet engines / power
+    "RTX",    # RTX (Raytheon) -- Aerospace / defense systems
     "DE",     # Deere & Co -- Agricultural / construction equipment
     "UNP",    # Union Pacific -- Railroad / freight transport
     "HON",    # Honeywell -- Aerospace / building tech / industrials
     "BA",     # Boeing -- Aerospace / defense
     "ADP",    # ADP -- Payroll / HR services
+    "LMT",    # Lockheed Martin -- Defense / aerospace
+    "HWM",    # Howmet Aerospace -- Aerospace components / fasteners
+    "NOC",    # Northrop Grumman -- Defense / space systems
+    "UPS",    # UPS -- Package delivery / logistics
+    "GD",     # General Dynamics -- Defense / aerospace / marine
+    "VRT",    # Vertiv -- Data center power / cooling infrastructure
+    "WM",     # Waste Management -- Waste collection / recycling
+    "FDX",    # FedEx -- Express delivery / logistics
+    "MMM",    # 3M -- Diversified industrials / materials
+    "ITW",    # Illinois Tool Works -- Diversified manufacturing
+    "EMR",    # Emerson -- Automation / industrial software
+    "PWR",    # Quanta Services -- Electric / infrastructure construction
+    "CMI",    # Cummins -- Engines / power generation
+    "CTAS",   # Cintas -- Workplace uniforms / facility services
+    "TDG",    # TransDigm -- Aerospace components
+    "NSC",    # Norfolk Southern -- Railroad / freight transport
+    "CSX",    # CSX -- Railroad / freight transport
+    "RSG",    # Republic Services -- Waste collection / recycling
+    "PCAR",   # Paccar -- Heavy trucks (Kenworth, Peterbilt)
+    "LHX",    # L3Harris -- Defense electronics / communications
+    "PH",     # Parker-Hannifin -- Motion / control technologies
+    "URI",    # United Rentals -- Equipment rental
 
-    # --- Energy (Oil & Gas, Exploration) ---
+    # --- Energy (14) -- Oil & Gas, Midstream, Refining, Services ---
     "XOM",    # ExxonMobil -- Oil & gas (integrated)
     "CVX",    # Chevron -- Oil & gas (integrated)
     "COP",    # ConocoPhillips -- Oil & gas (exploration & production)
+    "WMB",    # Williams Companies -- Natural gas pipelines (midstream)
+    "EPD",    # Enterprise Products -- NGL pipelines / midstream MLP
+    "SLB",    # SLB (Schlumberger) -- Oilfield services / technology
+    "KMI",    # Kinder Morgan -- Natural gas pipelines (midstream)
+    "EOG",    # EOG Resources -- Oil & gas (exploration & production)
+    "ET",     # Energy Transfer -- Midstream MLP (pipelines / terminals)
+    "PSX",    # Phillips 66 -- Refining / midstream / chemicals
+    "VLO",    # Valero Energy -- Refining
+    "BKR",    # Baker Hughes -- Oilfield services / equipment
+    "MPLX",   # MPLX -- Midstream MLP (Marathon Petroleum)
+    "MPC",    # Marathon Petroleum -- Refining
 
-    # --- Utilities ---
+    # --- Utilities (9) -- Electric, Gas, Renewables ---
     "NEE",    # NextEra Energy -- Electric utilities / renewables
     "SO",     # Southern Company -- Electric / gas utilities
     "DUK",    # Duke Energy -- Electric utilities
+    "CEG",    # Constellation Energy -- Nuclear / clean energy
+    "GEV",    # GE Vernova -- Power generation / grid equipment
+    "AEP",    # American Electric Power -- Electric utilities
+    "VST",    # Vistra -- Power generation / retail electricity
+    "SRE",    # Sempra -- Electric / gas utilities
+    "D",      # Dominion Energy -- Electric / gas utilities
 
-    # --- Materials ---
+    # --- Materials (7) -- Chemicals, Mining, Coatings ---
     "LIN",    # Linde -- Industrial gases
     "APD",    # Air Products -- Industrial gases
+    "SCCO",   # Southern Copper -- Copper mining
+    "NEM",    # Newmont -- Gold mining
+    "FCX",    # Freeport-McMoRan -- Copper / gold mining
+    "SHW",    # Sherwin-Williams -- Paints / coatings
+    "ECL",    # Ecolab -- Water treatment / hygiene chemicals
 
-    # --- Real Estate ---
+    # --- Real Estate (7) -- REITs ---
     "PLD",    # Prologis -- Industrial REIT (warehouses / logistics)
+    "WELL",   # Welltower -- Healthcare REIT (senior housing)
+    "EQIX",   # Equinix -- Data center REIT
+    "AMT",    # American Tower -- Cell tower REIT
+    "SPG",    # Simon Property Group -- Retail mall REIT
+    "DLR",    # Digital Realty -- Data center REIT
+    "O",      # Realty Income -- Net lease retail REIT
 
-    # --- Telecom ---
+    # --- Telecom (4) -- Wireless, Cable, Broadband ---
     "T",      # AT&T -- Telecom / wireless
     "VZ",     # Verizon -- Telecom / wireless
     "TMUS",   # T-Mobile -- Wireless telecom
+    "CMCSA",  # Comcast -- Cable / broadband / media
 
     # --- ETF Benchmarks ---
     "SPY","QQQ","DIA",
@@ -4487,6 +4834,38 @@ DEFAULT_SYMBOLS=[
     # Leveraged ETFs (3x inverse/bear)
     "SPXU","SQQQ","SDOW",
 ]
+
+# Sector → symbol mapping (matches DEFAULT_SYMBOLS groupings above).
+# Keys are lowercase; CLI does case-insensitive lookup via .lower().
+SECTOR_MAP = {
+    "technology":    ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","AVGO","ORCL",
+                      "CRM","AMD","PLTR","ADBE","CSCO","ACN","IBM","NOW","TXN",
+                      "QCOM","KLAC","INTU","AMAT","LRCX","APH","ANET","PANW",
+                      "MU","INTC","ADI","NFLX","UBER","APP","CRWD","WDC","SNDK",
+                      "SNPS","CDNS","DELL","MSI","GLW","DASH","MRVL","NET",
+                      "FTNT","SNOW","MPWR"],
+    "financials":    ["JPM","V","MA","BAC","GS","MS","WFC","C","AXP","BLK",
+                      "SPGI","SCHW","CB","MMC","FI","BX","KKR","CME","ICE",
+                      "PYPL","COF","PGR","PNC","USB","IBKR","BK","MCO","APO",
+                      "HOOD","TRV","TFC","AFL","AJG"],
+    "healthcare":    ["LLY","UNH","JNJ","ABBV","MRK","TMO","ABT","ISRG","SYK",
+                      "VRTX","GILD","BSX","AMGN","PFE","REGN","CI","BMY","MCK",
+                      "DHR","CVS","HCA","ELV","COR","BDX","ZTS"],
+    "consumer_staples":       ["WMT","COST","PG","KO","PEP","PM","MCD","MDLZ",
+                               "EL","MO","MNST","CL"],
+    "consumer_discretionary": ["TSLA","HD","LOW","BKNG","TJX","SBUX","NKE","BRK-B",
+                               "DIS","MAR","RCL","ORLY","ABNB","GM","HLT","CVNA",
+                               "ROST","AZO","F","WBD"],
+    "industrials":   ["CAT","GE","RTX","DE","UNP","HON","BA","ADP","LMT","HWM",
+                      "NOC","UPS","GD","VRT","WM","FDX","MMM","ITW","EMR","PWR",
+                      "CMI","CTAS","TDG","NSC","CSX","RSG","PCAR","LHX","PH","URI"],
+    "energy":        ["XOM","CVX","COP","WMB","EPD","SLB","KMI","EOG","ET",
+                      "PSX","VLO","BKR","MPLX","MPC"],
+    "utilities":     ["NEE","SO","DUK","CEG","GEV","AEP","VST","SRE","D"],
+    "materials":     ["LIN","APD","SCCO","NEM","FCX","SHW","ECL"],
+    "real_estate":   ["PLD","WELL","EQIX","AMT","SPG","DLR","O"],
+    "telecom":       ["T","VZ","TMUS","CMCSA"],
+}
 
 YF_INTRADAY_MAX_PERIOD={"1m":"7d","2m":"60d","5m":"60d","15m":"60d","30m":"60d",
     "60m":"730d","1h":"730d","90m":"60d","1d":"max","5d":"max","1wk":"max","1mo":"max"}

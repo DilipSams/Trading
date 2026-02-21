@@ -70,9 +70,10 @@ try:
         Config, AlphaTradeSystem, SyntheticMarketGenerator, TradingEnv,
         prepare_datasets, download_data, load_from_dir, load_from_norgate,
         NORGATE_DIR, NORGATE_DATABASES, build_network,
-        unwrap_net, DEFAULT_SYMBOLS, HAS_YF, NUM_FEATURES,
+        unwrap_net, DEFAULT_SYMBOLS, SECTOR_MAP, HAS_YF, NUM_FEATURES,
         print_box, print_divider, print_gpu_info, tprint, C, progress_bar,
         build_feature_matrix, compute_indicators,  # For RL observation construction
+        hbar_chart, line_chart, dual_line_chart,  # Terminal charts
     )
     HAS_BASE = True
 except ImportError as e:
@@ -237,6 +238,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
     # inflated observation counts from cross-symbol concatenation.
     per_symbol_returns_net = {}   # symbol -> list of per-bar net returns
     per_symbol_returns_gross = {} # symbol -> list of per-bar gross returns
+    per_symbol_date_returns = {}  # symbol -> [(date_str, net_return), ...] for date-aligned equity
 
     for d in datasets:
         # -- Create environment as PURE SIMULATOR --
@@ -284,6 +286,9 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         sym_bar_returns_gross = []   # Per-bar returns for this symbol
         sym_bar_returns_net = []
         sym_spy_returns = []         # SPY return for same dates
+        sym_date_returns = []        # [(date_str, net_return), ...] for equity curve
+        bars_in_cash = 0             # bars where not in a position (for cash yield)
+        peak_notional = 0.0          # max abs(shares * price) for $ Used
 
         while not done:
             bar_idx = env.cs
@@ -403,6 +408,17 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
                 bar_return_gross = bar_return_net + cost_this_bar / pv_before
                 sym_bar_returns_net.append(float(bar_return_net))
                 sym_bar_returns_gross.append(float(bar_return_gross))
+                # Date-aligned return for equity curve
+                if d.timestamps_test is not None:
+                    sym_date_returns.append((str(d.timestamps_test[bar_idx])[:10],
+                                             float(bar_return_net)))
+
+            # -- Track position state for cash yield + capital used --
+            _notional = abs(env.shares * float(closes[-1]))
+            if _notional > peak_notional:
+                peak_notional = _notional
+            if abs(env.exposure) < 0.01:
+                bars_in_cash += 1
 
             # -- SPY benchmark return for this bar's date --
             spy_ret_this_bar = 0.0
@@ -458,6 +474,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         # enables correct per-symbol metrics (vol, Sharpe, drawdown).
         per_symbol_returns_net[d.symbol] = sym_bar_returns_net
         per_symbol_returns_gross[d.symbol] = sym_bar_returns_gross
+        per_symbol_date_returns[d.symbol] = sym_date_returns
         all_bar_returns_gross.extend(sym_bar_returns_gross)
         all_bar_returns_net.extend(sym_bar_returns_net)
         all_spy_returns.extend(sym_spy_returns)
@@ -470,13 +487,13 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
             "sharpe": info.get("sharpe_ratio", 0),
             "max_dd": info["max_drawdown"],
             "turnover": info.get("turnover", 0.0),
-            # FIX §SA-5: Separate cash yield from trading PnL for accurate
-            # attribution. Without this, idle capital earns phantom PnL from
-            # cash_yield_bps_annual that is reported as trading alpha.
+            # FIX: Cash yield only for bars sitting in cash (not in position)
             "step_count": step_count,
+            "bars_in_cash": bars_in_cash,
+            "peak_notional": peak_notional,
             "cash_yield_pnl": (
                 (cfg.cash_yield_bps_annual * 1e-4 / max(cfg.bars_per_year, 1))
-                * cfg.starting_capital * step_count
+                * cfg.starting_capital * bars_in_cash
                 if getattr(cfg, 'cash_yield_bps_annual', 0) > 0 else 0.0
             ),
             # Episode-scoped L4 stats
@@ -602,6 +619,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         "per_symbol_returns_gross": {
             sym: np.array(rets, dtype=np.float64) for sym, rets in per_symbol_returns_gross.items()
         },
+        "per_symbol_date_returns": per_symbol_date_returns,
         "spy_returns": np.array(all_spy_returns, dtype=np.float64),
     }
 
@@ -1799,11 +1817,28 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
                 print(rendered)
             except UnicodeEncodeError:
                 print(rendered.encode('ascii', errors='replace').decode('ascii'))
-            print(f"  {C.DIM}Column guide: ICIR=consistency of predictions (like a batting average for forecasts){C.RESET}")
-            print(f"  {C.DIM}IC_m=average prediction accuracy | IC_s=how much accuracy varies | "
-                  f"Win=correct calls{C.RESET}")
-            print(f"  {C.DIM}HitRt=% of time direction was right (>53% is good) | "
-                  f"Persist=how long signals last (bars){C.RESET}")
+            print(f"  {C.DIM}Column guide:{C.RESET}")
+            print(f"  {C.DIM}  - ICIR   : How reliably the model makes good predictions, day after day.{C.RESET}")
+            print(f"  {C.DIM}             Think of it like a weather forecaster's track record — not just{C.RESET}")
+            print(f"  {C.DIM}             \"are they right sometimes?\" but \"can you count on them daily?\"{C.RESET}")
+            print(f"  {C.DIM}             > 0.5 = dependable forecaster  |  < 0.2 = unreliable, skip it{C.RESET}")
+            print(f"  {C.DIM}  - IC_m   : The average quality of predictions (higher = better).{C.RESET}")
+            print(f"  {C.DIM}             Like a student's average test score across the whole semester.{C.RESET}")
+            print(f"  {C.DIM}             e.g. IC_m=0.05 means the model has a small but real skill at{C.RESET}")
+            print(f"  {C.DIM}             picking winners over losers — even 0.03 can be profitable{C.RESET}")
+            print(f"  {C.DIM}  - IC_s   : How wildly the prediction quality swings from day to day.{C.RESET}")
+            print(f"  {C.DIM}             Like comparing two archers — both average 8/10, but one scores{C.RESET}")
+            print(f"  {C.DIM}             7-9 every time (low IC_s, reliable) while the other scores{C.RESET}")
+            print(f"  {C.DIM}             3 one day and 10 the next (high IC_s, erratic). Lower = better{C.RESET}")
+            print(f"  {C.DIM}  - Win    : Count of days where the model correctly guessed the direction.{C.RESET}")
+            print(f"  {C.DIM}             e.g. Win=180 means out of ~252 trading days, it got the{C.RESET}")
+            print(f"  {C.DIM}             \"will it go up or down?\" question right on 180 of them{C.RESET}")
+            print(f"  {C.DIM}  - HitRt  : Win expressed as a percentage — the real scorecard.{C.RESET}")
+            print(f"  {C.DIM}             Like free-throw shooting: >53%% = you have an edge over the{C.RESET}")
+            print(f"  {C.DIM}             market, >58%% = strong skill, <50%% = you'd do better flipping a coin{C.RESET}")
+            print(f"  {C.DIM}  - Persist : How many bars into the future a signal stays useful.{C.RESET}")
+            print(f"  {C.DIM}             Like milk's expiry date — Persist=1 means the signal is stale{C.RESET}")
+            print(f"  {C.DIM}             by tomorrow; Persist=5 means it's still fresh 5 bars later{C.RESET}")
         else:
             pass  # Already printed in loop above
 
@@ -1851,6 +1886,9 @@ Examples:
                    help="Number of synthetic symbols (default: 20)")
     g.add_argument("--symbols", type=str, default="",
                    help="Comma-separated symbols (e.g. AAPL,MSFT,NVDA)")
+    g.add_argument("--sector", type=str, default="",
+                   help="Comma-separated sectors (e.g. technology,financials). "
+                        "Use --sector list to show available sectors.")
     g.add_argument("--n-symbols", type=int, default=50)
     g.add_argument("--data-dir", type=str, default="",
                    help="Load from a directory of CSV/Parquet files")
@@ -2038,8 +2076,44 @@ def _run_self_tests():
         sys.exit(1)
 
 
+def resolve_symbols(args):
+    """Resolve symbol list from --sector, --symbols, or DEFAULT_SYMBOLS."""
+    # --sector list: print available sectors and exit
+    if args.sector.strip().lower() == "list":
+        print("Available sectors:")
+        for name, syms in SECTOR_MAP.items():
+            print(f"  {name:25s} ({len(syms):2d} symbols)  {', '.join(syms[:6])}"
+                  + (f" ..." if len(syms) > 6 else ""))
+        print(f"\nTotal: {sum(len(s) for s in SECTOR_MAP.values())} symbols across "
+              f"{len(SECTOR_MAP)} sectors")
+        sys.exit(0)
+    # --sector X,Y: collect symbols from named sectors
+    if args.sector:
+        sector_syms = []
+        for s in args.sector.split(","):
+            key = s.strip().lower().replace(" ", "_")
+            if key not in SECTOR_MAP:
+                print(f"ERROR: Unknown sector '{s.strip()}'. Use --sector list to see options.")
+                sys.exit(1)
+            sector_syms.extend(SECTOR_MAP[key])
+        # If --symbols also given, intersect
+        if args.symbols:
+            explicit = {x.strip().upper() for x in args.symbols.split(",") if x.strip()}
+            sector_syms = [s for s in sector_syms if s in explicit]
+        return sector_syms
+    # --symbols only
+    if args.symbols:
+        return [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    # Default: first n_symbols from DEFAULT_SYMBOLS
+    return DEFAULT_SYMBOLS[:args.n_symbols]
+
+
 def main():
     args = parse_args()
+
+    # -- Handle --sector list early (before heavy init) --
+    if args.sector.strip().lower() == "list":
+        resolve_symbols(args)  # prints and exits
 
     # -- Fixed random seed for reproducible results --
     import random, shutil, glob as _glob
@@ -2216,8 +2290,7 @@ def main():
         data_source = "Yahoo Finance (survivorship-biased)"
         if not HAS_YF:
             tprint("--yahoo requires yfinance: pip install yfinance", "err"); return
-        syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-                if args.symbols else DEFAULT_SYMBOLS[:args.n_symbols])
+        syms = resolve_symbols(args)
         tprint(f"Data source: {data_source}", "warn")
         tprint("  Backtest results will be upward-biased. Use Norgate PIT data for valid results.", "warn")
         data = download_data(syms, cfg, use_cache=args.cache)
@@ -2233,8 +2306,7 @@ def main():
         norgate_dir = args.norgate_dir or NORGATE_DIR
         norgate_dbs = ([db.strip() for db in args.norgate_db.split(",") if db.strip()]
                        if args.norgate_db else None)
-        norgate_syms = ([s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-                        if args.symbols else DEFAULT_SYMBOLS[:args.n_symbols])
+        norgate_syms = resolve_symbols(args)
 
         if not Path(norgate_dir).exists():
             tprint(f"Norgate data not found at: {norgate_dir}", "err")
@@ -2364,6 +2436,7 @@ def main():
     # **********************************************************************
     base_results = None
 
+    training_hist = []  # populated by training loop (empty in eval-only mode)
     if args.eval_only:
         print_section("EVAL-ONLY MODE")
         tprint("Building untrained network for pipeline demonstration...", "info")
@@ -2373,6 +2446,7 @@ def main():
         system = AlphaTradeSystem(datasets, cfg)
         tprint("Starting self-play training loop...", "info")
         champion = system.train()
+        training_hist = getattr(system, 'hist', [])
         net = system.champ
 
         # -- Show base system's own evaluation (for comparison) --
@@ -2485,8 +2559,31 @@ def main():
         verbose=args.verbose,
         spy_returns_lookup=spy_returns_lookup,
     )
+    # Save SMA pipeline lifetime stats before no-SMA run
+    pip_sma_lt = dict(pipeline.execution_engine.lifetime_stats)
 
     print_results(pipeline_results)
+
+    # -- Pipeline v7.0 WITHOUT SMA overlay (A/B comparison) --
+    tprint("Re-evaluating without SMA overlay (for comparison)...", "info")
+    pipeline.use_sma = False
+    pipeline.execution_engine.reset_lifetime_stats()
+    nosma_results = evaluate_with_pipeline(
+        net=unwrap_net(net) if HAS_TORCH else net,
+        datasets=datasets,
+        pipeline=pipeline,
+        cfg=cfg,
+        acfg=acfg,
+        label="Pipeline v7.0 (no SMA)",
+        verbose=0,
+        spy_returns_lookup=spy_returns_lookup,
+    )
+    nosma_lt = dict(pipeline.execution_engine.lifetime_stats)
+    pipeline.use_sma = True  # Restore for diagnostics
+    # Restore SMA lifetime stats for diagnostics section
+    pipeline.execution_engine.reset_lifetime_stats()
+    pipeline.execution_engine._lifetime_trades = pip_sma_lt['n_trades']
+    pipeline.execution_engine._lifetime_suppressed = pip_sma_lt['n_suppressed']
 
     # FIX Ãƒâ€šÃ‚Â§5.5: Record holdout result in guard (audit trail)
     if holdout_guard is not None:
@@ -2614,14 +2711,19 @@ def main():
         pip_trade_pnl = pipeline_results['total_pnl'] - pip_cash_yield
 
         # Estimate base cash yield (same formula: cash_bps * capital * steps)
+        # Base v3.0 doesn't track cash_yield_pnl per symbol, so we estimate it
+        # from step counts (same test data = same step count per symbol).
+        _cash_bps = getattr(cfg, 'cash_yield_bps_annual', 0) * 1e-4
+        _cash_per_bar = (_cash_bps / max(cfg.bars_per_year, 1)) * cfg.starting_capital if _cash_bps > 0 else 0.0
         _base_total_steps = sum(
             s.get('step_count', 0) for s in _pip_per_sym.values()
         )  # Use pipeline step count (same test data length)
-        _cash_bps = getattr(cfg, 'cash_yield_bps_annual', 0) * 1e-4
-        base_cash_yield = (
-            (_cash_bps / max(cfg.bars_per_year, 1)) * cfg.starting_capital * _base_total_steps
-            if _cash_bps > 0 else 0.0
-        )
+        base_cash_yield = _cash_per_bar * _base_total_steps
+        # Per-symbol cash yield estimate for base (used in per-symbol rows)
+        _base_cash_per_sym = {
+            sym: _cash_per_bar * _pip_per_sym.get(sym, {}).get('step_count', 0)
+            for sym in _pip_per_sym
+        }
         base_trade_pnl = base_results.get('total_pnl', 0) - base_cash_yield
 
         # Pipeline trades from L4 stats
@@ -2653,77 +2755,153 @@ def main():
         base_win_rate = base_results.get('avg_wr', 0.0)  # This is already computed correctly in base system
         base_profit_factor = base_results.get('avg_pf', 0.0)
 
+        # No-SMA pipeline stats
+        _nosma_per_sym = nosma_results.get('per_sym', {})
+        nosma_cash_yield = sum(s.get('cash_yield_pnl', 0) for s in _nosma_per_sym.values())
+        nosma_trade_pnl = nosma_results['total_pnl'] - nosma_cash_yield
+        nosma_n_trades = nosma_lt.get('n_trades', 0)
+        nosma_n_suppressed = nosma_lt.get('n_suppressed', 0)
+        nosma_suppression_pct = nosma_lt.get('suppression_rate', 0) * 100
+
         print_section("COMPARISON: v3.0 vs v7.0")
         print(f"  {C.DIM}Side-by-side: raw AI decisions vs. the full system with risk controls.{C.RESET}")
         print(f"  {C.DIM}Like comparing a driver without seatbelts (v3.0) vs. with full safety gear (v7.0).{C.RESET}")
 
         if HAS_TABLE_FORMATTER:
+            _E = ""  # shorthand for empty trailing columns
             table = TableFormatter(title="BASE V3.0 VS PIPELINE V7.0")
             table.add_column('Metric', align='left')
             table.add_column('Base v3.0', align='right')
+            table.add_column('v7.0 (no SMA)', align='right')
             table.add_column('Pipeline v7.0', align='right')
+            table.add_column('# Trades', align='right')
+            table.add_column('$ Used', align='right')
+            table.add_column('CAGR', align='right')
 
             # Prepare colored strings
             base_pnl_c = C.GREEN if base_results.get('total_pnl', 0) > 0 else C.RED
+            nosma_pnl_c = C.GREEN if nosma_results['total_pnl'] > 0 else C.RED
             pip_pnl_c = C.GREEN if pipeline_results['total_pnl'] > 0 else C.RED
             base_trade_c = C.GREEN if base_trade_pnl > 0 else C.RED
+            nosma_trade_c = C.GREEN if nosma_trade_pnl > 0 else C.RED
             pip_trade_c = C.GREEN if pip_trade_pnl > 0 else C.RED
 
+            # Starting capital
+            table.add_row(['Starting Capital',
+                          f"${cfg.starting_capital:>13,.0f}",
+                          f"${cfg.starting_capital:>13,.0f}",
+                          f"${cfg.starting_capital:>13,.0f}", _E, _E, _E])
+
             # Add rows with section headers
-            table.add_row([f"{C.BOLD}--- P&L ---{C.RESET}", "", ""])
+            table.add_row([f"{C.BOLD}--- P&L ---{C.RESET}", _E, _E, _E, _E, _E, _E])
             table.add_row(['Total P&L',
                           f"{base_pnl_c}${base_results.get('total_pnl', 0):>+13,.2f}{C.RESET}",
-                          f"{pip_pnl_c}${pipeline_results['total_pnl']:>+13,.2f}{C.RESET}"])
+                          f"{nosma_pnl_c}${nosma_results['total_pnl']:>+13,.2f}{C.RESET}",
+                          f"{pip_pnl_c}${pipeline_results['total_pnl']:>+13,.2f}{C.RESET}", _E, _E, _E])
             table.add_row(['  Trade P&L',
                           f"{base_trade_c}${base_trade_pnl:>+13,.2f}{C.RESET}",
-                          f"{pip_trade_c}${pip_trade_pnl:>+13,.2f}{C.RESET}"])
+                          f"{nosma_trade_c}${nosma_trade_pnl:>+13,.2f}{C.RESET}",
+                          f"{pip_trade_c}${pip_trade_pnl:>+13,.2f}{C.RESET}", _E, _E, _E])
             table.add_row(['  Cash Yield',
                           f"{C.CYAN}${base_cash_yield:>+13,.2f}{C.RESET}",
-                          f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}"])
+                          f"{C.CYAN}${nosma_cash_yield:>+13,.2f}{C.RESET}",
+                          f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}", _E, _E, _E])
 
-            # Per-symbol Trade P&L (cash yield stripped out)
+            # Per-symbol Trade P&L (cash yield stripped out) + $ Used + CAGR
             _base_per_sym = base_results.get('per_sym', {})
             all_syms = sorted(set(list(_base_per_sym.keys()) + list(_pip_per_sym.keys())))
             if all_syms:
-                table.add_row([f"{C.BOLD}--- Trade P&L by Symbol ---{C.RESET}", "", ""])
+                table.add_row([f"{C.BOLD}--- Trade P&L by Symbol ---{C.RESET}", _E, _E, _E, _E, _E, _E])
                 for sym in all_syms:
                     b_total = _base_per_sym.get(sym, {}).get('pnl', 0)
-                    b_cash = _base_per_sym.get(sym, {}).get('cash_yield_pnl', 0)
+                    b_cash = _base_per_sym.get(sym, {}).get('cash_yield_pnl', 0) or _base_cash_per_sym.get(sym, 0)
                     b_trade = b_total - b_cash
+                    n_total = _nosma_per_sym.get(sym, {}).get('pnl', 0)
+                    n_cash = _nosma_per_sym.get(sym, {}).get('cash_yield_pnl', 0)
+                    n_trade = n_total - n_cash
                     p_total = _pip_per_sym.get(sym, {}).get('pnl', 0)
                     p_cash = _pip_per_sym.get(sym, {}).get('cash_yield_pnl', 0)
                     p_trade = p_total - p_cash
                     b_c = C.GREEN if b_trade > 0 else C.RED
+                    n_c = C.GREEN if n_trade > 0 else C.RED
                     p_c = C.GREEN if p_trade > 0 else C.RED
+                    sym_trades = _pip_per_sym.get(sym, {}).get('pipeline_trades', 0)
                     period = _sym_periods.get(sym, None)
                     period_str = f" ({period[0]} to {period[1]})" if period else ""
+                    # $ Used (peak notional) and CAGR
+                    _peak = _pip_per_sym.get(sym, {}).get('peak_notional', 0)
+                    _steps = _pip_per_sym.get(sym, {}).get('step_count', 0)
+                    if _peak > 0 and _steps > 0:
+                        _years = _steps / 252
+                        _sym_cagr = (1 + p_trade / _peak) ** (1 / max(_years, 0.01)) - 1
+                        _cagr_c = C.GREEN if _sym_cagr > 0 else C.RED
+                        cagr_str = f"{_cagr_c}{_sym_cagr:>+8.1%}{C.RESET}"
+                        used_str = f"${_peak:>10,.0f}"
+                    else:
+                        cagr_str = "N/A"
+                        used_str = "N/A"
                     table.add_row([f"  {sym}{period_str}",
                                   f"{b_c}${b_trade:>+13,.2f}{C.RESET}",
-                                  f"{p_c}${p_trade:>+13,.2f}{C.RESET}"])
+                                  f"{n_c}${n_trade:>+13,.2f}{C.RESET}",
+                                  f"{p_c}${p_trade:>+13,.2f}{C.RESET}",
+                                  f"{sym_trades:>8d}", used_str, cagr_str])
 
             if has_spy_bench:
                 spy_pnl_c = C.GREEN if spy_total_pnl > 0 else C.RED
                 _spy_hdr = f"--- SPY Benchmark ({_spy_period_str}) ---" if _spy_period_str else "--- SPY Benchmark ---"
-                table.add_row([f"{C.BOLD}{_spy_hdr}{C.RESET}", "", ""])
+                table.add_row([f"{C.BOLD}{_spy_hdr}{C.RESET}", _E, _E, _E, _E, _E, _E])
                 table.add_row(['  SPY Buy & Hold P&L',
                               f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}",
-                              f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}"])
-                table.add_row(['  SPY CAGR', spy_cagr_str, spy_cagr_str])
+                              f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}",
+                              f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}", _E, _E, _E])
+                table.add_row(['  SPY CAGR', spy_cagr_str, spy_cagr_str, spy_cagr_str, _E, _E, _E])
 
-            table.add_row([f"{C.BOLD}--- Trading ---{C.RESET}", "", ""])
-            table.add_row(['Trades Executed', f"{base_n_trades:>14d}", f"{pip_n_trades:>14d}"])
+            table.add_row([f"{C.BOLD}--- Trading ---{C.RESET}", _E, _E, _E, _E, _E, _E])
+            table.add_row(['Trades Executed',
+                          f"{base_n_trades:>14d}",
+                          f"{nosma_n_trades:>14d}",
+                          f"{pip_n_trades:>14d}",
+                          f"{pip_n_trades:>8d}", _E, _E])
 
             base_n_suppressed = 0
-            table.add_row(['Trades Suppressed', f"{base_n_suppressed:>14d}", f"{pip_n_suppressed:>14d}"])
-            table.add_row(['Suppression Rate', f"{0.0:>13.1f}%", f"{pip_suppression_pct:>13.1f}%"])
+            table.add_row(['Trades Suppressed',
+                          f"{base_n_suppressed:>14d}",
+                          f"{nosma_n_suppressed:>14d}",
+                          f"{pip_n_suppressed:>14d}", _E, _E, _E])
+            table.add_row(['Suppression Rate',
+                          f"{0.0:>13.1f}%",
+                          f"{nosma_suppression_pct:>13.1f}%",
+                          f"{pip_suppression_pct:>13.1f}%", _E, _E, _E])
 
             base_wr_str = f"{base_win_rate:>13.1f}%" if not np.isnan(base_win_rate) else "N/A (0 closed)"
             pip_wr_str = f"{pip_win_rate:>13.1f}%" if not np.isnan(pip_win_rate) else f"N/A ({pip_n_closed_trades} closed)"
-            table.add_row(['Win Rate', base_wr_str, pip_wr_str])
+            table.add_row(['Win Rate', base_wr_str, _E, pip_wr_str, _E, _E, _E])
 
             base_pf_str = f"{base_profit_factor:>14.2f}" if not np.isnan(base_profit_factor) else "N/A"
             pip_pf_str = f"{pip_profit_factor:>14.2f}" if not np.isnan(pip_profit_factor) else "N/A"
-            table.add_row(['Profit Factor', base_pf_str, pip_pf_str])
+            table.add_row(['Profit Factor', base_pf_str, _E, pip_pf_str, _E, _E, _E])
+
+            # --- Risk ---
+            table.add_row([f"{C.BOLD}--- Risk ---{C.RESET}", _E, _E, _E, _E, _E, _E])
+            table.add_row(['Sharpe',
+                          f"{base_results.get('avg_sh', 0):>+14.3f}",
+                          f"{nosma_results['avg_sh']:>+14.3f}",
+                          f"{pipeline_results['avg_sh']:>+14.3f}", _E, _E, _E])
+            table.add_row(['Max Drawdown',
+                          f"{base_results.get('dd_max', 0):>13.1f}%",
+                          f"{nosma_results['dd_max']:>13.1f}%",
+                          f"{pipeline_results['dd_max']:>13.1f}%", _E, _E, _E])
+            table.add_row(['Breadth',
+                          f"{base_results.get('breadth', 0):>13.0f}%",
+                          f"{nosma_results['breadth']:>13.0f}%",
+                          f"{pipeline_results['breadth']:>13.0f}%", _E, _E, _E])
+
+            # --- Score ---
+            table.add_row([f"{C.BOLD}--- Score ---{C.RESET}", _E, _E, _E, _E, _E, _E])
+            table.add_row([f"{C.BOLD}Score{C.RESET}",
+                          f"{C.BOLD}{base_results.get('score', 0):>+14.3f}{C.RESET}",
+                          f"{C.BOLD}{nosma_results['score']:>+14.3f}{C.RESET}",
+                          f"{C.BOLD}{pipeline_results['score']:>+14.3f}{C.RESET}", _E, _E, _E])
 
             rendered = "  " + table.render().replace("\n", "\n  ")
             try:
@@ -2731,45 +2909,75 @@ def main():
             except UnicodeEncodeError:
                 print(rendered.encode('ascii', errors='replace').decode('ascii'))
         else:
-            # Fallback to old format
-            print(f"  {'Metric':<22s}  {'Base v3.0':>14s}  {'Pipeline v7.0':>14s}")
-            print(f"  {'='*22}  {'='*14}  {'='*14}")
+            # Fallback to old format (5 columns)
+            W = 16  # column width
+            TW = 10  # trades column width
+            print(f"  {'Metric':<22s}  {'Base v3.0':>{W}s}  {'v7.0 (no SMA)':>{W}s}  {'Pipeline v7.0':>{W}s}  {'# Trades':>{TW}s}")
+            print(f"  {'='*22}  {'='*W}  {'='*W}  {'='*W}  {'='*TW}")
+
+            # Starting Capital
+            print(f"  {'Starting Capital':<22s}  "
+                  f"${cfg.starting_capital:>{W-1},.0f}  "
+                  f"${cfg.starting_capital:>{W-1},.0f}  "
+                  f"${cfg.starting_capital:>{W-1},.0f}")
 
             # --- P&L Breakdown ---
             print(f"  {C.BOLD}{'--- P&L ---':<22s}{C.RESET}")
             base_pnl_c = C.GREEN if base_results.get('total_pnl', 0) > 0 else C.RED
+            nosma_pnl_c = C.GREEN if nosma_results['total_pnl'] > 0 else C.RED
             pip_pnl_c = C.GREEN if pipeline_results['total_pnl'] > 0 else C.RED
             print(f"  {'Total P&L':<22s}  "
                   f"{base_pnl_c}${base_results.get('total_pnl', 0):>+13,.2f}{C.RESET}  "
+                  f"{nosma_pnl_c}${nosma_results['total_pnl']:>+13,.2f}{C.RESET}  "
                   f"{pip_pnl_c}${pipeline_results['total_pnl']:>+13,.2f}{C.RESET}")
             base_trade_c = C.GREEN if base_trade_pnl > 0 else C.RED
+            nosma_trade_c = C.GREEN if nosma_trade_pnl > 0 else C.RED
             pip_trade_c = C.GREEN if pip_trade_pnl > 0 else C.RED
             print(f"  {'  Trade P&L':<22s}  "
                   f"{base_trade_c}${base_trade_pnl:>+13,.2f}{C.RESET}  "
+                  f"{nosma_trade_c}${nosma_trade_pnl:>+13,.2f}{C.RESET}  "
                   f"{pip_trade_c}${pip_trade_pnl:>+13,.2f}{C.RESET}")
             print(f"  {'  Cash Yield':<22s}  "
                   f"{C.CYAN}${base_cash_yield:>+13,.2f}{C.RESET}  "
+                  f"{C.CYAN}${nosma_cash_yield:>+13,.2f}{C.RESET}  "
                   f"{C.CYAN}${pip_cash_yield:>+13,.2f}{C.RESET}")
 
-            # Per-symbol Trade P&L (cash yield stripped out)
+            # Per-symbol Trade P&L (cash yield stripped out) + $ Used + CAGR
             _base_per_sym_fb = base_results.get('per_sym', {})
             _all_syms_fb = sorted(set(list(_base_per_sym_fb.keys()) + list(_pip_per_sym.keys())))
             if _all_syms_fb:
                 print(f"  {C.BOLD}{'--- Trade P&L by Symbol ---':<22s}{C.RESET}")
                 for sym in _all_syms_fb:
                     b_total = _base_per_sym_fb.get(sym, {}).get('pnl', 0)
-                    b_cash = _base_per_sym_fb.get(sym, {}).get('cash_yield_pnl', 0)
+                    b_cash = _base_per_sym_fb.get(sym, {}).get('cash_yield_pnl', 0) or _base_cash_per_sym.get(sym, 0)
                     b_trade = b_total - b_cash
+                    n_total = _nosma_per_sym.get(sym, {}).get('pnl', 0)
+                    n_cash = _nosma_per_sym.get(sym, {}).get('cash_yield_pnl', 0)
+                    n_trade = n_total - n_cash
                     p_total = _pip_per_sym.get(sym, {}).get('pnl', 0)
                     p_cash = _pip_per_sym.get(sym, {}).get('cash_yield_pnl', 0)
                     p_trade = p_total - p_cash
                     b_c = C.GREEN if b_trade > 0 else C.RED
+                    n_c = C.GREEN if n_trade > 0 else C.RED
                     p_c = C.GREEN if p_trade > 0 else C.RED
+                    sym_trades = _pip_per_sym.get(sym, {}).get('pipeline_trades', 0)
                     period = _sym_periods.get(sym, None)
                     period_str = f" ({period[0]} to {period[1]})" if period else ""
+                    _peak_fb = _pip_per_sym.get(sym, {}).get('peak_notional', 0)
+                    _steps_fb = _pip_per_sym.get(sym, {}).get('step_count', 0)
+                    if _peak_fb > 0 and _steps_fb > 0:
+                        _yrs_fb = _steps_fb / 252
+                        _cagr_fb = (1 + p_trade / _peak_fb) ** (1 / max(_yrs_fb, 0.01)) - 1
+                        cagr_fb_str = f"{_cagr_fb:>+8.1%}"
+                        used_fb_str = f"${_peak_fb:>10,.0f}"
+                    else:
+                        cagr_fb_str = "     N/A"
+                        used_fb_str = "       N/A"
                     print(f"  {'  ' + sym + period_str:<22s}  "
                           f"{b_c}${b_trade:>+13,.2f}{C.RESET}  "
-                          f"{p_c}${p_trade:>+13,.2f}{C.RESET}")
+                          f"{n_c}${n_trade:>+13,.2f}{C.RESET}  "
+                          f"{p_c}${p_trade:>+13,.2f}{C.RESET}  "
+                          f"{sym_trades:>10d}  {used_fb_str}  {cagr_fb_str}")
 
             if has_spy_bench:
                 spy_pnl_c = C.GREEN if spy_total_pnl > 0 else C.RED
@@ -2777,38 +2985,59 @@ def main():
                 print(f"  {C.BOLD}{_spy_hdr_fb}{C.RESET}")
                 print(f"  {'  SPY Buy & Hold P&L':<22s}  "
                       f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}  "
+                      f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}  "
                       f"{spy_pnl_c}${spy_total_pnl:>+13,.2f}{C.RESET}")
                 print(f"  {'  SPY CAGR':<22s}  "
-                      f"{spy_cagr_str:>14s}  {spy_cagr_str:>14s}")
+                      f"{spy_cagr_str:>14s}  {spy_cagr_str:>14s}  {spy_cagr_str:>14s}")
 
             # --- Trading Activity ---
             print(f"  {C.BOLD}{'--- Trading ---':<22s}{C.RESET}")
             print(f"  {'Trades Executed':<22s}  "
                   f"{base_n_trades:>14d}  "
+                  f"{nosma_n_trades:>14d}  "
                   f"{pip_n_trades:>14d}")
 
-            # FIX: Base system doesn't track suppression (direct action model)
-            # Show "0" instead of "N/A" since it conceptually suppresses 0 trades
             base_n_suppressed = 0
             print(f"  {'Trades Suppressed':<22s}  "
                   f"{base_n_suppressed:>14d}  "
+                  f"{nosma_n_suppressed:>14d}  "
                   f"{pip_n_suppressed:>14d}")
             print(f"  {'Suppression Rate':<22s}  "
                   f"{0.0:>13.1f}%  "
+                  f"{nosma_suppression_pct:>13.1f}%  "
                   f"{pip_suppression_pct:>13.1f}%")
 
-            # FIX: Use properly computed win rate and profit factor
-            # Handle NaN case (no closed round-trip trades) with clear labeling
             base_wr_str = f"{base_win_rate:>13.1f}%" if not np.isnan(base_win_rate) else "      N/A (no closed trades)"
             pip_wr_str = f"{pip_win_rate:>13.1f}%" if not np.isnan(pip_win_rate) else f"      N/A ({pip_n_closed_trades} closed)"
 
-            print(f"  {'Win Rate':<22s}  {base_wr_str}  {pip_wr_str}")
+            print(f"  {'Win Rate':<22s}  {base_wr_str}  {'':>14s}  {pip_wr_str}")
 
-            # Enhanced Profit Factor format: handle NaN case
             base_pf_str = f"{base_profit_factor:>14.2f}" if not np.isnan(base_profit_factor) else "           N/A"
             pip_pf_str = f"{pip_profit_factor:>14.2f}" if not np.isnan(pip_profit_factor) else "           N/A"
 
-            print(f"  {'Profit Factor':<22s}  {base_pf_str}  {pip_pf_str}")
+            print(f"  {'Profit Factor':<22s}  {base_pf_str}  {'':>14s}  {pip_pf_str}")
+
+            # --- Risk ---
+            print(f"  {C.BOLD}{'--- Risk ---':<22s}{C.RESET}")
+            print(f"  {'Sharpe':<22s}  "
+                  f"{base_results.get('avg_sh', 0):>+14.3f}  "
+                  f"{nosma_results['avg_sh']:>+14.3f}  "
+                  f"{pipeline_results['avg_sh']:>+14.3f}")
+            print(f"  {'Max Drawdown':<22s}  "
+                  f"{base_results.get('dd_max', 0):>13.1f}%  "
+                  f"{nosma_results['dd_max']:>13.1f}%  "
+                  f"{pipeline_results['dd_max']:>13.1f}%")
+            print(f"  {'Breadth':<22s}  "
+                  f"{base_results.get('breadth', 0):>13.0f}%  "
+                  f"{nosma_results['breadth']:>13.0f}%  "
+                  f"{pipeline_results['breadth']:>13.0f}%")
+
+            # --- Score ---
+            print(f"  {'='*22}  {'='*14}  {'='*14}  {'='*14}")
+            print(f"  {C.BOLD}{'Score':<22s}  "
+                  f"{base_results.get('score', 0):>+14.3f}  "
+                  f"{nosma_results['score']:>+14.3f}  "
+                  f"{pipeline_results['score']:>+14.3f}{C.RESET}")
 
         # Add explanatory note if pipeline has 0 closed trades but positive Trade P&L
         # Also show detailed trade entry breakdown
@@ -2844,23 +3073,83 @@ def main():
                               f"Pos: {entry['position_before']:>+6.0f} -> {entry['position_after']:>+6.0f}  "
                               f"P&L: ${entry.get('realized_pnl', 0):>+8.2f}")
 
-        # --- Risk ---
-        print(f"  {C.BOLD}{'--- Risk ---':<22s}{C.RESET}")
-        print(f"  {'Sharpe':<22s}  "
-              f"{base_results.get('avg_sh', 0):>+14.3f}  "
-              f"{pipeline_results['avg_sh']:>+14.3f}")
-        print(f"  {'Max Drawdown':<22s}  "
-              f"{base_results.get('dd_max', 0):>13.1f}%  "
-              f"{pipeline_results['dd_max']:>13.1f}%")
-        print(f"  {'Breadth':<22s}  "
-              f"{base_results.get('breadth', 0):>13.0f}%  "
-              f"{pipeline_results['breadth']:>13.0f}%")
+    # **********************************************************************
+    # STEP 7.5: Terminal charts
+    # **********************************************************************
+    print_section("CHARTS")
+    tprint("Visual summaries — quick-glance performance charts.", "info")
 
-        # --- Score ---
-        print(f"  {'='*22}  {'='*14}  {'='*14}")
-        print(f"  {C.BOLD}{'Score':<22s}  "
-              f"{base_results.get('score', 0):>+14.3f}  "
-              f"{pipeline_results['score']:>+14.3f}{C.RESET}")
+    # (a) Per-symbol Trade P&L horizontal bars (green/red)
+    _chart_per_sym = pipeline_results.get('per_sym', {})
+    _chart_syms = sorted(_chart_per_sym.keys())
+    if _chart_syms:
+        _sym_pnls = []
+        for sym in _chart_syms:
+            s = _chart_per_sym[sym]
+            trade_pnl = s.get('pnl', 0) - s.get('cash_yield_pnl', 0)
+            _sym_pnls.append((sym, trade_pnl))
+        hbar_chart(_sym_pnls, title="Per-Symbol Trade P&L (Pipeline v7.0)")
+
+    # (b) Sector performance horizontal bars (green/red)
+    if _chart_per_sym:
+        _sector_pnls = []
+        for sector, tickers in SECTOR_MAP.items():
+            total = sum(
+                _chart_per_sym.get(t, {}).get('pnl', 0) - _chart_per_sym.get(t, {}).get('cash_yield_pnl', 0)
+                for t in tickers if t in _chart_per_sym
+            )
+            if total != 0:
+                _sector_pnls.append((sector.replace("_", " ").title(), total))
+        if _sector_pnls:
+            _sector_pnls.sort(key=lambda x: x[1], reverse=True)
+            hbar_chart(_sector_pnls, title="Sector Performance (Pipeline v7.0)")
+
+    # (c) Portfolio equity curve vs SPY — date-aligned returns
+    # FIX: Previously used concatenated per-symbol returns (4 syms × N bars =
+    # 4N compounding periods), inflating the equity curve. Now we merge by date
+    # and average across active symbols so both strategy and SPY use the same
+    # time axis with identical compounding periods.
+    _date_rets = pipeline_results.get("per_symbol_date_returns", {})
+    if _date_rets:
+        from collections import defaultdict
+        _by_date = defaultdict(list)
+        for _, _pairs in _date_rets.items():
+            for _dt, _ret in _pairs:
+                _by_date[_dt].append(_ret)
+        _dates_sorted = sorted(_by_date.keys())
+        _portfolio_rets = np.array([np.mean(_by_date[_dt]) for _dt in _dates_sorted])
+
+        if len(_portfolio_rets) > 2:
+            _equity = cfg.starting_capital * np.cumprod(1 + _portfolio_rets)
+            # SPY equity for the exact same dates
+            _spy_eq = None
+            if has_spy_bench and spy_returns_lookup:
+                _spy_u = np.array([spy_returns_lookup.get(_dt, 0.0) for _dt in _dates_sorted],
+                                  dtype=np.float64)
+                if len(_spy_u) > 2:
+                    _spy_eq = cfg.starting_capital * np.cumprod(1 + _spy_u)
+
+            if _spy_eq is not None:
+                dual_line_chart(_equity, _spy_eq, width=70, height=14,
+                               title="Portfolio Equity vs SPY Buy & Hold",
+                               label1="Pipeline v7.0", label2="SPY")
+            else:
+                line_chart(_equity, width=70, height=14,
+                          title="Portfolio Equity Curve (Pipeline v7.0)")
+
+    # (d) Training loss chart (only when training was run)
+    if training_hist:
+        _vl_values = []
+        for h in training_hist:
+            if isinstance(h, dict):
+                vl = h.get("vl", 0)
+                if vl == 0:
+                    um = h.get("update_metrics", {})
+                    vl = um.get("vl", 0) if isinstance(um, dict) else 0
+                _vl_values.append(float(vl))
+        if any(v != 0 for v in _vl_values):
+            line_chart(_vl_values, width=70, height=10,
+                      title="Value Loss vs Iteration", fmt="f")
 
     # **********************************************************************
     # STEP 8: Pipeline diagnostics
