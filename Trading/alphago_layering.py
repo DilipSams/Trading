@@ -2681,7 +2681,7 @@ def main():
         # where no trading occurs, inflating SPY compounding vs the chart.
         _date_rets_for_spy = pipeline_results.get("per_symbol_date_returns", {})
         _test_dates = set()
-        for _sym, _pairs in _date_rets_for_spy.items():
+        for _pairs in _date_rets_for_spy.values():
             for _dt, _ret in _pairs:
                 _test_dates.add(_dt)
         _test_dates_sorted = sorted(_test_dates)
@@ -2690,10 +2690,8 @@ def main():
         if _spy_unique:
             _spy_unique_arr = np.array(_spy_unique, dtype=np.float64)
             spy_cum = float(np.prod(1 + _spy_unique_arr) - 1)
-            # SPY P&L on total capital (N × starting_capital) for fair
-            # comparison with strategy Total P&L (sum across all symbols)
-            _n_syms_spy = len(datasets)
-            spy_total_pnl = spy_cum * cfg.starting_capital * _n_syms_spy
+            # SPY P&L on $10k (same allocation as one symbol)
+            spy_total_pnl = spy_cum * cfg.starting_capital
             n_spy = len(_spy_unique_arr)
             spy_cagr = float(np.prod(1 + _spy_unique_arr) ** (252 / max(n_spy, 1)) - 1)
             spy_cagr_str = f"{spy_cagr:+.2%}"
@@ -3130,63 +3128,39 @@ def main():
             _sector_pnls.sort(key=lambda x: x[1], reverse=True)
             hbar_chart(_sector_pnls, title="Sector Performance (Pipeline v7.0)")
 
-    # (c) Portfolio equity curve vs SPY — per-symbol equity summation
-    # Each symbol runs independently from starting_capital. The total portfolio
-    # is N * starting_capital. We build per-symbol equity curves by date, sum
-    # them, and compare against SPY buy-and-hold on the same total capital.
-    # This ensures: chart ending_value - chart starting_value == table Total P&L.
+    # (c) Cumulative % return chart — equal-weight portfolio vs SPY
+    # Each symbol gets $10k. We average per-symbol daily returns by date
+    # (equal-weight portfolio), then cumprod to get cumulative % return.
+    # SPY: cumprod of its daily returns over the same dates.
+    # Both start at 0% — directly comparable regardless of dollar amounts.
     _date_rets = pipeline_results.get("per_symbol_date_returns", {})
     if _date_rets:
-        _n_syms = len(_date_rets)
-        _total_capital = cfg.starting_capital * _n_syms
-
-        # Build per-symbol equity indexed by date
-        # Each symbol: equity[date] = starting_capital * cumprod(1 + returns up to date)
-        _sym_equity_by_date = {}  # {sym: {date: equity_value}}
-        for _sym, _pairs in _date_rets.items():
-            _eq = cfg.starting_capital
-            _sym_eq = {}
+        from collections import defaultdict
+        _by_date = defaultdict(list)
+        for _pairs in _date_rets.values():
             for _dt, _ret in _pairs:
-                _eq *= (1 + _ret)
-                _sym_eq[_dt] = _eq
-            _sym_equity_by_date[_sym] = _sym_eq
-
-        # Collect all unique dates across all symbols
-        _all_dates = set()
-        for _sym_eq in _sym_equity_by_date.values():
-            _all_dates.update(_sym_eq.keys())
-        _dates_sorted = sorted(_all_dates)
+                _by_date[_dt].append(_ret)
+        _dates_sorted = sorted(_by_date.keys())
 
         if len(_dates_sorted) > 2:
-            # For each date, sum equity across symbols. If a symbol hasn't
-            # started yet or already ended, its equity is starting_capital (idle cash).
-            _total_eq = []
-            # Track last known equity per symbol (starts at starting_capital)
-            _last_eq = {s: cfg.starting_capital for s in _sym_equity_by_date}
-            for _dt in _dates_sorted:
-                for _sym, _sym_eq in _sym_equity_by_date.items():
-                    if _dt in _sym_eq:
-                        _last_eq[_sym] = _sym_eq[_dt]
-                _total_eq.append(sum(_last_eq.values()))
-            _equity = np.array(_total_eq)
+            # Equal-weight portfolio return per date (average across active symbols)
+            _port_rets = np.array([np.mean(_by_date[_dt]) for _dt in _dates_sorted])
+            _port_cum_pct = (np.cumprod(1 + _port_rets) - 1) * 100  # cumulative %
 
-            # SPY: buy-and-hold with the same total capital over the same dates
-            _spy_eq = None
+            # SPY cumulative % over the same dates
+            _spy_cum_pct = None
             if has_spy_bench and spy_returns_lookup:
-                _spy_cum = _total_capital
-                _spy_vals = []
-                for _dt in _dates_sorted:
-                    _spy_cum *= (1 + spy_returns_lookup.get(_dt, 0.0))
-                    _spy_vals.append(_spy_cum)
-                _spy_eq = np.array(_spy_vals)
+                _spy_rets = np.array([spy_returns_lookup.get(_dt, 0.0) for _dt in _dates_sorted])
+                _spy_cum_pct = (np.cumprod(1 + _spy_rets) - 1) * 100
 
-            if _spy_eq is not None:
-                dual_line_chart(_equity, _spy_eq, width=70, height=14,
-                               title=f"Portfolio Equity vs SPY Buy & Hold (${_total_capital/1e3:.0f}k base)",
-                               label1="Pipeline v7.0", label2="SPY")
+            if _spy_cum_pct is not None:
+                dual_line_chart(_port_cum_pct, _spy_cum_pct, width=70, height=14,
+                               title="Cumulative Return: Portfolio vs SPY (equal $10k base)",
+                               label1="Pipeline v7.0", label2="SPY", fmt="%")
             else:
-                line_chart(_equity, width=70, height=14,
-                          title=f"Portfolio Equity Curve (${_total_capital/1e3:.0f}k base)")
+                line_chart(_port_cum_pct, width=70, height=14,
+                          title="Cumulative Return: Portfolio ($10k/symbol)",
+                          fmt="%")
 
     # (d) Training loss chart (only when training was run)
     if training_hist:
