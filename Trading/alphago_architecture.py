@@ -613,7 +613,7 @@ class StockSelector:
 
         selected = []
         sector_counts = {}
-        max_per_sector = max(1, int(self.cfg.top_n * self.cfg.sector_max_pct))
+        max_per_sector = max(2, int(self.cfg.top_n * self.cfg.sector_max_pct))
 
         # Build reverse lookup: symbol -> sector
         sym_to_sector = {}
@@ -624,7 +624,9 @@ class StockSelector:
         for sym, score, components in rankings:
             if len(selected) >= self.cfg.top_n:
                 break
-            sector = sym_to_sector.get(sym, "other")
+            # Strip timeframe suffix (e.g. "MU_1d" -> "MU") for sector lookup
+            bare_sym = sym.split('_')[0] if '_' in sym else sym
+            sector = sym_to_sector.get(bare_sym, "other")
             if sector_counts.get(sector, 0) >= max_per_sector:
                 continue  # Sector full, skip
             selected.append(sym)
