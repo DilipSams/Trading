@@ -3153,14 +3153,32 @@ def main():
                 _spy_rets = np.array([spy_returns_lookup.get(_dt, 0.0) for _dt in _dates_sorted])
                 _spy_cum_pct = (np.cumprod(1 + _spy_rets) - 1) * 100
 
+            # Compute summary values for annotation
+            _n_syms_chart = len(_date_rets)
+            _invested = cfg.starting_capital * _n_syms_chart
+            _port_final_pct = float(_port_cum_pct[-1])
+            _port_return_dollar = _invested * _port_final_pct / 100
+
             if _spy_cum_pct is not None:
                 dual_line_chart(_port_cum_pct, _spy_cum_pct, width=70, height=14,
                                title="Cumulative Return: Portfolio vs SPY (equal $10k base)",
                                label1="Pipeline v7.0", label2="SPY", fmt="%")
+                _spy_final_pct = float(_spy_cum_pct[-1])
+                _spy_return_dollar = cfg.starting_capital * _spy_final_pct / 100
+                # Summary: % return (Return $ / Invested $)
+                _p_c = C.GREEN if _port_final_pct > 0 else C.RED
+                _s_c = C.GREEN if _spy_final_pct > 0 else C.RED
+                print(f"    Pipeline v7.0: {_p_c}{_port_final_pct:+.1f}%{C.RESET}"
+                      f" (${_port_return_dollar:+,.0f} / ${_invested:,.0f})"
+                      f"    SPY: {_s_c}{_spy_final_pct:+.1f}%{C.RESET}"
+                      f" (${_spy_return_dollar:+,.0f} / ${cfg.starting_capital:,.0f})")
             else:
                 line_chart(_port_cum_pct, width=70, height=14,
                           title="Cumulative Return: Portfolio ($10k/symbol)",
                           fmt="%")
+                _p_c = C.GREEN if _port_final_pct > 0 else C.RED
+                print(f"    Portfolio: {_p_c}{_port_final_pct:+.1f}%{C.RESET}"
+                      f" (${_port_return_dollar:+,.0f} / ${_invested:,.0f})")
 
     # (d) Training loss chart (only when training was run)
     if training_hist:
