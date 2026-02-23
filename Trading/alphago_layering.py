@@ -260,9 +260,9 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         sim_cfg.use_action_masking = False
         sim_cfg.use_trailing_stops = False       # L4 owns risk — env stops interfere
         sim_cfg.use_asymmetric_stops = False     # L4 owns risk — env stops interfere
-        # Match env action space to Pipeline's 7-level discretization
-        sim_cfg.action_targets = (-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0)
-        sim_cfg.n_actions = 7                    # Must match action_targets length
+        # Match env action space to Pipeline's 9-level discretization (Iter 9: added 1.25, 1.5)
+        sim_cfg.action_targets = (-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.25, 1.5)
+        sim_cfg.n_actions = 9                    # Must match action_targets length
         env = TradingEnv(d.features_test, d.prices_test, sim_cfg, d.symbol, ev=True)
         # FIX Ãƒâ€šÃ‚Â§4.4: Flag env as pipeline eval mode ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â prevents get_risk_target() future access
         env._pipeline_eval_mode = True
@@ -297,6 +297,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         sym_date_returns = []        # [(date_str, net_return), ...] for equity curve
         bars_in_cash = 0             # bars where not in a position (for cash yield)
         peak_notional = 0.0          # max abs(shares * price) for $ Used
+        _notional_sum = 0.0          # sum of notional on bars where in position
 
         while not done:
             bar_idx = env.cs
@@ -427,6 +428,8 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
                 peak_notional = _notional
             if abs(env.exposure) < 0.01:
                 bars_in_cash += 1
+            else:
+                _notional_sum += _notional   # accumulate while in position
 
             # -- SPY benchmark return for this bar's date --
             spy_ret_this_bar = 0.0
@@ -487,6 +490,9 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         all_bar_returns_net.extend(sym_bar_returns_net)
         all_spy_returns.extend(sym_spy_returns)
 
+        _bars_in_pos = step_count - bars_in_cash
+        avg_notional = _notional_sum / max(_bars_in_pos, 1)
+
         per_sym[d.symbol] = {
             "pnl": info["net_pnl"],
             "trades": info["total_trades"],
@@ -499,6 +505,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
             "step_count": step_count,
             "bars_in_cash": bars_in_cash,
             "peak_notional": peak_notional,
+            "avg_notional": avg_notional,
             "cash_yield_pnl": (
                 (cfg.cash_yield_bps_annual * 1e-4 / max(cfg.bars_per_year, 1))
                 * cfg.starting_capital * bars_in_cash
@@ -2122,6 +2129,8 @@ Examples:
                    choices=["conv_attn", "transformer"])
     g.add_argument("--eval-only", action="store_true",
                    help="Skip training, evaluate untrained network through pipeline")
+    g.add_argument("--realized-sizing", action="store_true",
+                   help="Size positions on starting_capital + realized PnL only (not MTM portfolio value)")
 
     # Performance
     g = p.add_argument_group("Performance")
@@ -2152,6 +2161,8 @@ Examples:
                    help="Strategy version: v7=current, v8=stock selection engine")
     g.add_argument("--top-n", type=int, default=15,
                    help="v8.0: number of stocks to select (default: 15)")
+    g.add_argument("--kill-loss", type=float, default=None,
+                   help="Kill switch max portfolio loss fraction (default: ArchitectureConfig default=0.30)")
     g.add_argument("--skip-ablation", action="store_true",
                    help="v8.0: skip ablation study")
 
@@ -2387,6 +2398,7 @@ def main():
         use_compile=not args.no_compile,
         use_dsr=not args.no_dsr,
         no_subproc=args.no_subproc,
+        use_realized_capital_sizing=getattr(args, 'realized_sizing', False),
         backbone_type=args.backbone,
         timeframes=tfs,
         download_period="max",
@@ -2396,12 +2408,16 @@ def main():
     # **********************************************************************
     # STEP 2: Configure institutional architecture
     # **********************************************************************
+    _kill_loss_kw = {}
+    if getattr(args, 'kill_loss', None) is not None:
+        _kill_loss_kw['kill_max_loss_pct'] = args.kill_loss
     acfg = ArchitectureConfig(
         target_annual_vol=args.target_vol,
         max_leverage=args.max_leverage,
         kelly_fraction=args.kelly_fraction,
         no_trade_threshold_pct=args.no_trade_threshold,
         backtest_mode=True,  # Enable backtest mode: allow cross-regime testing, disable drift kill
+        **_kill_loss_kw,
     )
 
     # -- v7.0 WS6B: Deterministic reproducibility --
@@ -2886,28 +2902,29 @@ def main():
                    f"${cap['capacity_at_sharpe_05']/1e6:.0f}M", "info")
 
     # **********************************************************************
-    # V8.0: STOCK SELECTION ENGINE (gated behind --version v8)
+    # V8.0: STOCK SELECTION ENGINE (always runs; verbose output gated on --version v8)
     # **********************************************************************
     v8_results = None
+    v8_lt = {}
+
     if args.version == "v8":
         print_section("V8.0 STOCK SELECTION ENGINE")
-
-        # Step 1: Failure post-mortem
+        # Failure post-mortem (verbose, v8 mode only)
         tprint("Analyzing why v3.0 and v7.0 (no SMA) underperform...", "info")
         run_postmortem(base_results, nosma_results, pipeline_results, datasets)
 
-        # Step 2: Stock selection
-        sel_cfg = SelectionConfig(top_n=args.top_n)
-        selector = StockSelector(sel_cfg, SECTOR_MAP)
-        selected_datasets = selector.select(datasets, spy_returns_lookup)
+    # Stock selection — always run so v8 column appears in comparison table
+    sel_cfg = SelectionConfig(top_n=args.top_n)
+    selector = StockSelector(sel_cfg, SECTOR_MAP)
+    selected_datasets = selector.select(datasets, spy_returns_lookup)
 
+    if args.version == "v8":
         tprint(f"Selected {len(selected_datasets)} stocks from "
                f"{len(datasets)} universe:", "ok")
         if selector.selection_log:
             _log = selector.selection_log[-1]
             for _sel_sym in _log['selected']:
                 _sel_score = _log['scores'].get(_sel_sym, 0)
-                # Find component details
                 _comp_str = ""
                 for _s, _sc, _comp in _log['rankings']:
                     if _s == _sel_sym:
@@ -2917,40 +2934,44 @@ def main():
                                      f"vol={_comp['vol_20']:.0%}")
                         break
                 tprint(f"  {_sel_sym:<6s}: score={_sel_score:+.4f}  {_comp_str}", "info")
-
-            # Show sector allocation
             _sec_alloc = _log.get('sector_allocation', {})
             if _sec_alloc:
                 tprint(f"  Sector allocation: {dict(_sec_alloc)}", "info")
 
-        # Step 3: Build v8.0 rank map for position sizing
-        _v8_rank = {}
-        for _rank_idx, _sel_sym in enumerate(_log['selected'] if selector.selection_log else []):
-            _v8_rank[_sel_sym] = _rank_idx
+    # Build rank map
+    _v8_rank = {}
+    _v8_sel_log = selector.selection_log[-1] if selector.selection_log else None
+    for _rank_idx, _sel_sym in enumerate(_v8_sel_log['selected'] if _v8_sel_log else []):
+        _v8_rank[_sel_sym] = _rank_idx
 
-        # Step 4: Evaluate v8.0 with rank-based sizing
-        pipeline.use_sma = True
-        pipeline.use_v8_sizing = True
-        pipeline._v8_rank = _v8_rank
-        pipeline.execution_engine.reset_lifetime_stats()
+    # Evaluate v8.0 with rank-based sizing.
+    # --version v8: use selector-filtered datasets (top-N from full universe).
+    # comparison mode: use same datasets as v7 so all symbols appear; only sizing differs.
+    _v8_eval_datasets = selected_datasets if args.version == "v8" else datasets
+    pipeline.use_sma = True
+    pipeline.use_v8_sizing = True
+    pipeline._v8_rank = _v8_rank
+    pipeline.execution_engine.reset_lifetime_stats()
 
-        v8_results = evaluate_with_pipeline(
-            net=unwrap_net(net) if HAS_TORCH else net,
-            datasets=selected_datasets,
-            pipeline=pipeline, cfg=cfg, acfg=acfg,
-            label="Pipeline v8.0", verbose=args.verbose,
-            spy_returns_lookup=spy_returns_lookup,
-        )
-        v8_lt = dict(pipeline.execution_engine.lifetime_stats)
+    v8_results = evaluate_with_pipeline(
+        net=unwrap_net(net) if HAS_TORCH else net,
+        datasets=_v8_eval_datasets,
+        pipeline=pipeline, cfg=cfg, acfg=acfg,
+        label="Pipeline v8.0",
+        verbose=args.verbose if args.version == "v8" else 0,
+        spy_returns_lookup=spy_returns_lookup,
+    )
+    v8_lt = dict(pipeline.execution_engine.lifetime_stats)
 
+    if args.version == "v8":
         print_results(v8_results)
 
-        # Restore pipeline to v7.0 mode
-        pipeline.use_v8_sizing = False
-        pipeline._v8_rank = {}
-        pipeline.execution_engine.reset_lifetime_stats()
-        pipeline.execution_engine._lifetime_trades = pip_sma_lt['n_trades']
-        pipeline.execution_engine._lifetime_suppressed = pip_sma_lt['n_suppressed']
+    # Restore pipeline to v7.0 mode
+    pipeline.use_v8_sizing = False
+    pipeline._v8_rank = {}
+    pipeline.execution_engine.reset_lifetime_stats()
+    pipeline.execution_engine._lifetime_trades = pip_sma_lt['n_trades']
+    pipeline.execution_engine._lifetime_suppressed = pip_sma_lt['n_suppressed']
 
     # -- Compute SPY buy-and-hold P&L for comparison table --
     # NOTE: spy_rets_arr is concatenated across symbols (duplicated dates) — correct
@@ -3090,7 +3111,7 @@ def main():
             v8_n_trades = v8_lt.get('n_trades', 0)
             v8_n_suppressed = v8_lt.get('n_suppressed', 0)
             v8_suppression_pct = v8_lt.get('suppression_rate', 0) * 100
-            _v8_n_syms = len(_v8_per_sym) if _v8_per_sym else args.top_n
+            _v8_n_syms = len(_v8_per_sym) if _v8_per_sym else len(selected_datasets)
             _v8_total_cap = cfg.starting_capital * _v8_n_syms
 
             # v8.0 Win Rate and Profit Factor
@@ -3443,7 +3464,15 @@ def main():
                     if _dt in _sym_eq:
                         _last_eq[_sym] = _sym_eq[_dt]
                 _total_eq.append(sum(_last_eq.values()))
-            _port_cum_pct = np.array([(v - _total_capital) / _total_capital * 100
+            # Total $ Used (peak notional per symbol, summed) — computed first
+            # because it is the denominator for BOTH the chart y-axis and the label.
+            _chart_per_sym = pipeline_results.get('per_sym', {})
+            _total_used = sum(s.get('avg_notional', 0) for s in _chart_per_sym.values())
+            if _total_used <= 0:
+                _total_used = _total_capital  # fallback
+
+            # Portfolio curve: PnL / $ Used → chart endpoint == label %
+            _port_cum_pct = np.array([(v - _total_capital) / _total_used * 100
                                       for v in _total_eq])
 
             # SPY cumulative % — start from FULL test period (bar 0) for fair benchmark.
@@ -3458,8 +3487,10 @@ def main():
                         for ts in d.timestamps_test:
                             _full_test_dates.add(str(ts)[:10])
                 _full_spy_dates = sorted(_full_test_dates)
+                # SPY benchmark: $10k (starting_capital), NOT total across symbols
+                _spy_base = cfg.starting_capital
                 # Pre-compound SPY through lookback period (before chart starts)
-                _spy_eq = _total_capital
+                _spy_eq = _spy_base
                 for _dt in _full_spy_dates:
                     if _dt < _dates_sorted[0]:
                         _spy_eq *= (1 + spy_returns_lookup.get(_dt, 0.0))
@@ -3468,21 +3499,14 @@ def main():
                 for _dt in _dates_sorted:
                     _spy_eq *= (1 + spy_returns_lookup.get(_dt, 0.0))
                     _spy_vals.append(_spy_eq)
-                _spy_cum_pct = np.array([(v - _total_capital) / _total_capital * 100
+                _spy_cum_pct = np.array([(v - _spy_base) / _spy_base * 100
                                          for v in _spy_vals])
 
-            # Summary values
+            # Summary values — _port_final_pct IS the return on $ Used (matches label)
             _port_final_pct = float(_port_cum_pct[-1])
-            _port_pnl = _total_capital * _port_final_pct / 100
+            _port_pnl = _total_used * _port_final_pct / 100   # actual dollar PnL
             _p_sign = "+" if _port_pnl >= 0 else "-"
             _p_c = C.GREEN if _port_final_pct > 0 else C.RED
-
-            # Compute total $ Used (sum of peak notional across symbols)
-            _chart_per_sym = pipeline_results.get('per_sym', {})
-            _total_used = sum(s.get('peak_notional', 0) for s in _chart_per_sym.values())
-            if _total_used <= 0:
-                _total_used = _total_capital  # fallback
-            _port_pnl_on_used = (_port_pnl / _total_used) * 100 if _total_used > 0 else 0.0
 
             if _spy_cum_pct is not None:
                 dual_line_chart(_port_cum_pct, _spy_cum_pct, width=70, height=14,
@@ -3490,18 +3514,18 @@ def main():
                                label1=_chart_ver, label2="SPY", fmt="%",
                                dates=_dates_sorted)
                 _spy_final_pct = float(_spy_cum_pct[-1])
-                _spy_pnl = _total_capital * _spy_final_pct / 100
+                _spy_pnl = _spy_base * _spy_final_pct / 100
                 _s_sign = "+" if _spy_pnl >= 0 else "-"
                 _s_c = C.GREEN if _spy_final_pct > 0 else C.RED
-                print(f"    {_chart_ver}: {_p_c}{_port_pnl_on_used:+.1f}%{C.RESET}"
+                print(f"    {_chart_ver}: {_p_c}{_port_final_pct:+.1f}%{C.RESET}"
                       f" ({_p_sign}${abs(_port_pnl):,.0f} / ${_total_used:,.0f} used)"
                       f"    SPY: {_s_c}{_spy_final_pct:+.1f}%{C.RESET}"
-                      f" ({_s_sign}${abs(_spy_pnl):,.0f} / ${_total_capital:,.0f})")
+                      f" ({_s_sign}${abs(_spy_pnl):,.0f} / ${_spy_base:,.0f})")
             else:
                 line_chart(_port_cum_pct, width=70, height=14,
                           title=f"Cumulative Return: Portfolio ({_n_syms} syms × ${cfg.starting_capital/1e3:.0f}k)",
                           fmt="%", dates=_dates_sorted)
-                print(f"    {_chart_ver}: {_p_c}{_port_pnl_on_used:+.1f}%{C.RESET}"
+                print(f"    {_chart_ver}: {_p_c}{_port_final_pct:+.1f}%{C.RESET}"
                       f" ({_p_sign}${abs(_port_pnl):,.0f} / ${_total_used:,.0f} used)")
 
     # (d) Training loss chart (only when training was run)

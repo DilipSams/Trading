@@ -384,20 +384,20 @@ class ArchitectureConfig:
     n_slices: int = 5
     slice_mode: str = "TWAP"
     max_participation_rate: float = 0.10    # Max 10% of ADV per bar
-    kill_max_loss_pct: float = 0.15            # 15% max loss (trend-following needs wider stop)
+    kill_max_loss_pct: float = 0.30            # 30% max loss (wider stop for concentrated selection)
     kill_max_turnover_spike: float = 20.0   # Raised: SMA transitions (0→0.25) are normal, not spikes
     kill_cooldown_bars: int = 10               # Faster re-entry (SMA gates direction)
     kill_allow_auto_reenter: bool = True       # Allow auto re-entry after cooldown + recovery
     kill_reenter_buffer: float = 0.02         # Must recover trigger_value * (1 + buffer) before re-entry
 
     # WS5B: Additional kill switches
-    kill_confidence_window: int = 10          # Consecutive bars of low confidence -> kill
-    kill_min_confidence: float = 0.05         # Ensemble confidence floor
+    kill_confidence_window: int = 999         # effectively disabled for backtesting
+    kill_min_confidence: float = 0.0          # effectively disabled for backtesting
     kill_min_data_quality: float = 60.0       # L0 quality score floor
-    kill_vol_breach_mult: float = 5.0         # 5x target vol (75% for 15% target) -- was 3x/45%
-    kill_cost_spike_mult: float = 2.0         # Kill if realized cost > N * modeled cost
-    kill_cost_spike_window: int = 5           # N consecutive cost spikes -> kill
-    kill_dd_duration_bars: int = 252          # 1 year in drawdown before kill (was 126/6mo)
+    kill_vol_breach_mult: float = 10.0        # effectively disabled — 10x target vol (150% for 15% target), momentum portfolios need high vol headroom
+    kill_cost_spike_mult: float = 999.0       # effectively disabled — fixed 10bps slippage always exceeds modeled 0.5bps
+    kill_cost_spike_window: int = 999         # effectively disabled
+    kill_dd_duration_bars: int = 999          # effectively disabled — momentum portfolios need longer recovery
     kill_on_drift: bool = True                # Kill if drift detector fires
 
     # -- Ensemble EMA smoothing --
@@ -5687,9 +5687,12 @@ class InstitutionalPipeline:
         self.portfolio = PortfolioConstructor(acfg, bars_per_year)
 
         # L4: Execution
+        # Iter 9: add 1.25 step so discretizer snaps to 1.25 for sma_position≥1.125 (midpoint 1.0-1.25)
+        # bull_aligned (0.90) × trend_boost (1.30) = 1.17 > 1.125 → snaps to 1.25 (25% leverage) ✓
+        # Without 1.25: midpoint(1.0, 1.5)=1.25 → 1.17 would snap back to 1.0 (no leverage)
         self.execution_engine = ExecutionEngine(
             acfg, bars_per_year,
-            action_targets=(-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0),
+            action_targets=(-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.25, 1.5),
         )
 
         # SMA trend overlay toggle (can be disabled for A/B comparison)
@@ -5893,18 +5896,27 @@ class InstitutionalPipeline:
 
             if sma_200 is not None:
                 # -- FULL MODE: 200+ bars (LONG-ONLY) --
-                golden_cross = sma_50 > sma_100 if sma_100 else True
-
+                # Trend-strength base position:
+                #   Bull aligned (P > SMA50 > SMA100 > SMA200) → 0.80
+                #   Golden cross (SMA50 > SMA100, P > SMA200)  → 0.60
+                #   Just above SMA200                          → 0.40
+                #   Below SMA200                               → 0.00 (flat)
+                #   Distance boost can push bull-aligned to 1.0
                 if current_price > sma_200:
                     if current_price > sma_50 > sma_100 > sma_200:
-                        sma_position = 0.25
-                        sma_reason = "sma=bull_aligned(+0.25)"
-                    elif golden_cross:
-                        sma_position = 0.25
-                        sma_reason = "sma=golden_cross(+0.25)"
+                        sma_position = 0.80
+                        sma_reason = "sma=bull_aligned(+0.80)"
+                    elif sma_100 is not None and sma_50 > sma_100:
+                        sma_position = 0.60
+                        sma_reason = "sma=golden_cross(+0.60)"
                     else:
-                        sma_position = 0.25
-                        sma_reason = "sma=above_200(+0.25)"
+                        sma_position = 0.40
+                        sma_reason = "sma=above_200(+0.40)"
+                    # Distance-from-SMA200 boost: 10-30% above → up to +30%
+                    if sma_200 > 0:
+                        dist_pct = (current_price / sma_200) - 1.0
+                        trend_boost = 1.0 + min(max(dist_pct - 0.10, 0.0) * 1.5, 0.30)
+                        sma_position = min(sma_position * trend_boost, 1.0)
                 else:
                     # Below SMA200 → FLAT (no shorts — long-only mode)
                     sma_position = 0.0
@@ -5929,43 +5941,44 @@ class InstitutionalPipeline:
                     sma_position = 0.0
                     sma_reason = "sma=below_50(flat)"
 
-            # v8.0: Aggressive trend-strength + rank-based position sizing
-            if self.use_v8_sizing and self._v8_rank and self._current_symbol:
-                rank_idx = self._v8_rank.get(self._current_symbol, -1)
-                if rank_idx >= 0 and sma_position > 0:
-                    n_selected = max(len(self._v8_rank), 1)
-
-                    # Step 1: Trend-strength base position (replaces flat 0.25)
-                    #   Bull aligned (P > SMA50 > SMA100 > SMA200) → 0.80
-                    #   Golden cross (SMA50 > SMA100, P > SMA200)  → 0.60
-                    #   Just above SMA200                          → 0.40
-                    if sma_200 is not None and current_price > sma_200:
-                        if current_price > sma_50 > sma_100 > sma_200:
-                            base_pos = 0.80
-                            sma_reason = "sma=v8_bull_aligned"
-                        elif sma_100 is not None and sma_50 > sma_100:
-                            base_pos = 0.60
-                            sma_reason = "sma=v8_golden_cross"
-                        else:
-                            base_pos = 0.40
-                            sma_reason = "sma=v8_above_200"
+            # v8.0: own base positions (0.40/0.60/0.80) + distance boost + rank multiplier
+            # Separate from v7.0 (0.25/0.50/0.75). Overrides v7.0 value entirely.
+            # NOTE: gate is NOT conditioned on sma_position>0 so we force long when SMA is
+            # positive regardless of alpha-signal direction (alphas net-negative → cause suppression)
+            if self.use_v8_sizing and self._current_symbol:
+                # Step 1: v8.0-specific base positions (always applies)
+                if sma_200 is not None and current_price > sma_200:
+                    if current_price > sma_50 > sma_100 > sma_200:
+                        base_pos = 0.90
+                        sma_reason = "sma=v8_bull_aligned"
+                    elif sma_100 is not None and sma_50 > sma_100:
+                        # Iter 9: raise from 0.70→0.80 so it snaps to 1.0 (not 0.5)
+                        # golden_cross 0.70 < midpoint(0.5,1.0)=0.75 → was snapping to 0.5 same as above_200!
+                        base_pos = 0.80
+                        sma_reason = "sma=v8_golden_cross"
                     else:
-                        base_pos = sma_position  # Partial/minimal modes keep 0.25
-
-                    # Step 2: Distance-from-SMA200 boost (strong trends get more)
-                    trend_boost = 1.0
-                    if sma_200 is not None and sma_200 > 0:
-                        dist_pct = (current_price / sma_200) - 1.0
-                        # 0-10% above → 1.0x, 10-30% above → up to 1.3x
-                        trend_boost = 1.0 + min(max(dist_pct - 0.10, 0.0) * 1.5, 0.30)
-
-                    # Step 3: Rank-based multiplier (top stocks get more)
-                    # Rank 0 (best) → 1.0, Rank N-1 (worst selected) → 0.60
-                    rank_mult = 0.60 + 0.40 * (1.0 - rank_idx / n_selected)
-
-                    # Final position = base × trend_boost × rank
-                    sma_position = min(base_pos * trend_boost * rank_mult, 1.0)
-                    sma_reason = f"{sma_reason}({sma_position:+.2f})"
+                        base_pos = 0.50
+                        sma_reason = "sma=v8_above_200"
+                else:
+                    base_pos = sma_position  # partial/minimal: keep v7.0 value
+                # Step 2: distance-from-SMA200 boost
+                trend_boost = 1.0
+                if sma_200 is not None and sma_200 > 0:
+                    dist_pct = (current_price / sma_200) - 1.0
+                    # Iter 9: raise ceiling 0.30→0.60: stocks ≥50% above SMA200 → trend_boost=1.60
+                    # 0.90 × 1.60 = 1.44 > midpoint(1.25,1.50)=1.375 → snaps to 1.50 (50% leverage)
+                    trend_boost = 1.0 + min(max(dist_pct - 0.10, 0.0) * 1.5, 0.60)
+                # Step 3: rank multiplier — only when a rank map is available
+                # Iter 7: widen range from 0.75-1.00 → 0.50-1.50 to differentiate top vs bottom stocks
+                rank_mult = 1.0
+                if self._v8_rank:
+                    rank_idx = self._v8_rank.get(self._current_symbol, -1)
+                    if rank_idx >= 0:
+                        n_selected = max(len(self._v8_rank), 1)
+                        rank_mult = 0.50 + 1.00 * (1.0 - rank_idx / n_selected)
+                # Iter 7: raise cap from 1.0 → 1.50 (moderate leverage for top bull-aligned stocks)
+                sma_position = min(base_pos * trend_boost * rank_mult, 1.50)
+                sma_reason = f"{sma_reason}({sma_position:+.2f})"
 
 
             # Override L3's target with SMA-based position

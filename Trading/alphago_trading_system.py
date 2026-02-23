@@ -40,7 +40,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import numpy as np
 import pandas as pd
@@ -265,13 +265,17 @@ def _year_axis(ds_dates, n, label_width, indent=4):
     for i in range(1, len(years)):
         if years[i] != years[i - 1]:
             markers.append((i, years[i]))
-    # Build label line — place year strings at marker positions
+    # Build label line — skip labels that would overlap or extend past chart edge
     axis = [" "] * n
+    last_end = -2  # position after last placed label
     for col, yr in markers:
+        if col < last_end + 1:      # need at least 1 space gap
+            continue
+        if col + len(yr) > n:       # would be truncated at chart edge
+            continue
         for j, ch in enumerate(yr):
-            pos = col + j
-            if 0 <= pos < n:
-                axis[pos] = ch
+            axis[col + j] = ch
+        last_end = col + len(yr)
     pad = " " * indent
     return f"{pad}{' ' * label_width}  {''.join(axis)}"
 
@@ -602,6 +606,8 @@ class Config:
     validate_delay: bool = True            # Test with next-open execution in validation
     placebo_feature_shuffle: bool = True   # Run placebo test (shuffled features)
     placebo_fail_pnl_threshold: float = 0.0  # Placebo should not profit
+    # --- Capital sizing mode ---
+    use_realized_capital_sizing: bool = False  # Size on starting_capital + realized PnL only (not MTM)
     # --- Engineering ---
     deterministic_eval: bool = True        # Use argmax (not sampling) in evaluation
     # --- VWAP/TWAP order slicing (#5) ---
@@ -1579,6 +1585,7 @@ class TradingEnv(gym.Env):
     def _reset_state(self):
         self.cs = self.w                           # Current step (bar index)
         self.cash = self.cfg.starting_capital      # Cash balance
+        self._realized_capital = self.cfg.starting_capital  # Capital base for sizing (realized mode)
         self.shares = 0.0                          # Signed shares (+ long, - short)
         self.exposure = 0.0                        # Current exposure fraction [-1, +1]
         self.entry_vwap = 0.0                      # Volume-weighted avg entry price
@@ -1885,7 +1892,11 @@ class TradingEnv(gym.Env):
         """
         mid = self._get_mid_price()
         ref = self._exec_price_ref()  # May be next-open if configured
-        port_value = self._portfolio_value()
+        if getattr(self.cfg, 'use_realized_capital_sizing', False):
+            # Size on starting_capital + cumulative realized PnL only — unrealized moves don't affect sizing
+            port_value = self._realized_capital
+        else:
+            port_value = self._portfolio_value()
         max_notional = port_value * self.cfg.max_position_pct * self.cfg.max_leverage
 
         # Desired signed notional
@@ -1962,6 +1973,9 @@ class TradingEnv(gym.Env):
                 self._log_trade(mid, realized_pnl, was_long, close_shares)
                 self.shares = 0.0
                 self.entry_vwap = 0.0
+                # Update realized capital base: cash when flat = starting_capital + all realized PnL net of costs
+                if getattr(self.cfg, 'use_realized_capital_sizing', False):
+                    self._realized_capital = self.cash
                 # Reset asymmetric stop stats when closing position
                 if self.asymmetric_stop_manager is not None:
                     self._reset_position_stats()
@@ -3624,50 +3638,128 @@ def _assign_symbol_pools(datasets, cfg):
         else: d.split_group = "train"
     return datasets
 
-def prepare_datasets(data,cfg):
-    ds=[];st=time.time();tot=len(data);skipped_reasons={}
-    valid_tfs={"1m","2m","5m","15m","30m","60m","1h","90m","1d","5d","1wk","1mo"}
-    for i,(sym,df) in enumerate(data.items()):
-        try:
-            di=compute_indicators(df);f=build_feature_matrix(di)
-            # Include Volume if available, else synthesize a dummy column
-            if "Volume" in di.columns:
-                p=di[["Open","High","Low","Close","Volume"]].values.astype(np.float32)
-            else:
-                ohlc = di[["Open","High","Low","Close"]].values.astype(np.float32)
-                dummy_vol = np.full((len(ohlc), 1), 1e6, dtype=np.float32)
-                p = np.hstack([ohlc, dummy_vol])
-            ts=np.array(di.index.astype(str))
-            parts=sym.rsplit("_",1); tf="1d"
-            if len(parts)==2 and parts[1] in valid_tfs: tf=parts[1]
-            n=len(f)
-            splits = _split_indices(n, cfg)
-            if splits is None:
-                skipped_reasons[sym] = f"too short ({n} bars, need ~{3*(cfg.window_size+50)}+embargo)"
-                continue
-            (tr0,tr1),(va0,va1),(te0,te1) = splits
-            ds.append(SymbolDataset(
-                sym,
-                f[tr0:tr1], f[va0:va1], f[te0:te1],
-                p[tr0:tr1], p[va0:va1], p[te0:te1],
-                tr1-tr0, va1-va0, te1-te0,
-                ts[tr0:tr1], ts[va0:va1], ts[te0:te1],
-                tf, split_group="train"
-            ))
-        except Exception as ex:
-            skipped_reasons[sym] = f"error: {ex.__class__.__name__}: {str(ex)[:80]}"
-        if (i+1)%20==0 or i+1==tot: progress_bar(i+1,tot,"Features",start_time=st)
+_PREPARE_VALID_TFS = {"1m","2m","5m","15m","30m","60m","1h","90m","1d","5d","1wk","1mo"}
+
+def _process_one_symbol(args):
+    """
+    Top-level worker for parallel feature engineering.
+    Must be module-level (not nested) so it is picklable by ProcessPoolExecutor.
+
+    Returns: (sym, SymbolDataset | None, error_str | None)
+    Data integrity guarantee: all processing is identical to the sequential path —
+    compute_indicators → build_feature_matrix → _split_indices → SymbolDataset.
+    No shared mutable state; each worker operates on its own copy of the DataFrame.
+    """
+    sym, df, cfg = args
+    try:
+        di = compute_indicators(df)
+        f  = build_feature_matrix(di)
+        # Volume: use real column or synthesize dummy (same as sequential path)
+        if "Volume" in di.columns:
+            p = di[["Open","High","Low","Close","Volume"]].values.astype(np.float32)
+        else:
+            ohlc      = di[["Open","High","Low","Close"]].values.astype(np.float32)
+            dummy_vol = np.full((len(ohlc), 1), 1e6, dtype=np.float32)
+            p         = np.hstack([ohlc, dummy_vol])
+        ts    = np.array(di.index.astype(str))
+        parts = sym.rsplit("_", 1)
+        tf    = parts[1] if len(parts) == 2 and parts[1] in _PREPARE_VALID_TFS else "1d"
+        n     = len(f)
+        splits = _split_indices(n, cfg)
+        if splits is None:
+            return sym, None, f"too short ({n} bars, need ~{3*(cfg.window_size+50)}+embargo)"
+        (tr0, tr1), (va0, va1), (te0, te1) = splits
+        dataset = SymbolDataset(
+            sym,
+            f[tr0:tr1], f[va0:va1], f[te0:te1],
+            p[tr0:tr1], p[va0:va1], p[te0:te1],
+            tr1-tr0, va1-va0, te1-te0,
+            ts[tr0:tr1], ts[va0:va1], ts[te0:te1],
+            tf, split_group="train"
+        )
+        return sym, dataset, None
+    except Exception as ex:
+        return sym, None, f"error: {ex.__class__.__name__}: {str(ex)[:80]}"
+
+
+def prepare_datasets(data, cfg):
+    """
+    Build SymbolDataset objects from raw price data.
+
+    Parallelism: uses ProcessPoolExecutor when symbol count > 4 to run
+    compute_indicators + build_feature_matrix across CPU cores.  Falls back
+    to sequential for small batches where process-spawn overhead dominates.
+
+    Data integrity:
+    - Each worker receives its own copy of the DataFrame (no shared state).
+    - Results are sorted by symbol name before _assign_symbol_pools so the
+      seeded RNG produces the same train/val/holdout split regardless of the
+      order futures complete.
+    - Exceptions in workers are caught and reported as skipped symbols, not
+      silently dropped.
+    """
+    st  = time.time()
+    tot = len(data)
+    skipped_reasons: dict = {}
+
+    # Threshold: ProcessPoolExecutor has ~0.5-1s spawn overhead on Windows.
+    # Not worth it for tiny symbol counts.
+    n_workers = min(getattr(cfg, 'n_workers', 4), tot, os.cpu_count() or 1)
+    use_parallel = (tot > 4) and (n_workers > 1)
+
+    args_list = [(sym, df, cfg) for sym, df in data.items()]
+    raw_results: list = []   # [(sym, dataset_or_None, error_or_None)]
+
+    if use_parallel:
+        tprint(f"Feature engineering: {tot} symbols × {n_workers} workers (parallel)", "info")
+        completed = 0
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(_process_one_symbol, args): args[0]
+                       for args in args_list}
+            for future in as_completed(futures):
+                completed += 1
+                try:
+                    raw_results.append(future.result())
+                except Exception as ex:
+                    # Worker process itself crashed (OOM, segfault, etc.)
+                    sym = futures[future]
+                    raw_results.append((sym, None,
+                        f"worker crash: {ex.__class__.__name__}: {str(ex)[:80]}"))
+                if completed % 20 == 0 or completed == tot:
+                    progress_bar(completed, tot, "Features", start_time=st)
+    else:
+        tprint(f"Feature engineering: {tot} symbols (sequential)", "info")
+        for i, args in enumerate(args_list):
+            raw_results.append(_process_one_symbol(args))
+            if (i + 1) % 20 == 0 or i + 1 == tot:
+                progress_bar(i + 1, tot, "Features", start_time=st)
+
+    # Sort by symbol name so _assign_symbol_pools is deterministic regardless
+    # of the order futures completed.
+    raw_results.sort(key=lambda x: x[0])
+
+    ds: list = []
+    for sym, dataset, error in raw_results:
+        if error:
+            skipped_reasons[sym] = error
+        elif dataset is not None:
+            ds.append(dataset)
+
     # Diagnostic: show why datasets were skipped
-    if skipped_reasons and len(ds) == 0:
-        tprint(f"All {len(skipped_reasons)} symbols skipped:", "warn")
+    if skipped_reasons:
+        if len(ds) == 0:
+            tprint(f"All {len(skipped_reasons)} symbols skipped:", "warn")
         for sym, reason in list(skipped_reasons.items())[:5]:
             tprint(f"  {sym}: {reason}", "warn")
+
     ds = _assign_symbol_pools(ds, cfg)
-    n_tr = sum(1 for d in ds if d.split_group=="train")
-    n_va = sum(1 for d in ds if d.split_group=="val")
-    n_ho = sum(1 for d in ds if d.split_group=="holdout")
-    tprint(f"{len(ds)} datasets | pools: train={n_tr} val={n_va} holdout={n_ho}","ok")
-    tprint(f"  bars: train={sum(d.n_train for d in ds):,} val={sum(d.n_val for d in ds):,} test={sum(d.n_test for d in ds):,}","info")
+    n_tr = sum(1 for d in ds if d.split_group == "train")
+    n_va = sum(1 for d in ds if d.split_group == "val")
+    n_ho = sum(1 for d in ds if d.split_group == "holdout")
+    tprint(f"{len(ds)} datasets | pools: train={n_tr} val={n_va} holdout={n_ho}", "ok")
+    tprint(f"  bars: train={sum(d.n_train for d in ds):,} "
+           f"val={sum(d.n_val for d in ds):,} "
+           f"test={sum(d.n_test for d in ds):,}", "info")
     return ds
 
 class AlphaTradeSystem:
