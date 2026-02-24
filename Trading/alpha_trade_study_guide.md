@@ -1,10 +1,10 @@
-# ALPHA-TRADE v7.0 — Complete Beginner's Study Guide
+# ALPHA-TRADE v8.0 — Complete Beginner's Study Guide
 
 ### An Institutional-Grade Quantitative Trading System
 
 **From Absolute Zero to Understanding Every Moving Part**
 
-*Last Updated: February 19, 2026 — Includes RL observation fix, horizon optimization, Tier 1-3 alpha improvements, 3 dead alpha resurrections, ICIR/HitRate/Persistence quality metrics, no-trade threshold optimization, auto-flip mechanism, **asymmetric stop losses (8 bugs fixed), zero-trades bug fix (6 bugs fixed), crowding detection, professional table formatting, RL engine NaN fixes (4 bugs), CV parallelization (10x speedup), RL zero-trades policy collapse (5 bugs), training budget increase, local optima detection (3 improvements), wave-batched MCTS (GPU optimization), KS/ADWIN drift detection (4-detector majority vote), horizon blender fix (dead code revived), neural net stability (LayerNorm + orthogonal init), and adaptive block bootstrap***
+*Last Updated: February 24, 2026 — Includes RL observation fix, horizon optimization, Tier 1-3 alpha improvements, 3 dead alpha resurrections, ICIR/HitRate/Persistence quality metrics, no-trade threshold optimization, auto-flip mechanism, **asymmetric stop losses (8 bugs fixed), zero-trades bug fix (6 bugs fixed), crowding detection, professional table formatting, RL engine NaN fixes (4 bugs), CV parallelization (10x speedup), RL zero-trades policy collapse (5 bugs), training budget increase, local optima detection (3 improvements), wave-batched MCTS (GPU optimization), KS/ADWIN drift detection (4-detector majority vote), horizon blender fix (dead code revived), neural net stability (LayerNorm + orthogonal init), adaptive block bootstrap, and **v8.0 Stock Selection Engine (Tier 2 Adaptive N + Tier 3 Sector Momentum Gate, no sector cap — ride momentum freely)*****
 
 *If you've never written a trading algorithm, never heard of "alpha," and aren't sure what a neural network does — this guide is for you. We start from scratch and build up, one concept at a time.*
 
@@ -15,9 +15,10 @@
 This guide is organized from simple to complex. Each section builds on the last.
 
 - **Sections 1–3**: The "what" and "why" — no code, no math, just plain English
-- **Sections 4–9**: The five layers of the system — explained with analogies first, then details
+- **Sections 4–9**: The six layers of the system — explained with analogies first, then details (Section 4 includes the new v8.0 Stock Selection Engine)
 - **Sections 10–13**: The deep technical stuff — math, algorithms, training
 - **Section 14+**: Metrics, validation, glossary, configuration reference
+- **Section 21**: What's new in v8.0 — the Stock Selection Engine explained from first principles
 
 If something doesn't make sense, skip ahead — it's often explained more fully in a later section. Then come back.
 
@@ -27,7 +28,7 @@ If something doesn't make sense, skip ahead — it's often explained more fully 
 
 1. [Before We Begin: What You Need to Know](#1-before-we-begin-what-you-need-to-know)
 2. [The Big Picture: What Does This System Do?](#2-the-big-picture-what-does-this-system-do)
-3. [The Factory Analogy: How the 5 Layers Work Together](#3-the-factory-analogy-how-the-5-layers-work-together)
+3. [The Factory Analogy: How the 6 Layers Work Together](#3-the-factory-analogy-how-the-6-layers-work-together)
 4. [The Architecture Diagram](#4-the-architecture-diagram)
 5. [L0 — Data Infrastructure: The Foundation](#5-l0--data-infrastructure-the-foundation)
 6. [L1 — Alpha Factory: Making Predictions](#6-l1--alpha-factory-making-predictions)
@@ -45,6 +46,7 @@ If something doesn't make sense, skip ahead — it's often explained more fully 
 18. [What's New in v7.0? (February 2026 Update)](#18-whats-new-in-v70-february-2026-update)
 19. [RL Engine Deep Fix (February 18, 2026)](#19-rl-engine-deep-fix-february-18-2026)
 20. [GPU, Drift Detection, and Horizon Blender Upgrades (February 19, 2026)](#20-gpu-drift-detection-and-horizon-blender-upgrades-february-19-2026)
+21. [What's New in v8.0? — Stock Selection Engine (February 24, 2026)](#21-whats-new-in-v80--stock-selection-engine-february-24-2026)
 
 ---
 
@@ -111,23 +113,23 @@ This system looks at market data, generates multiple independent opinions about 
 
 ### 2.2 The System Versions
 
-This system has evolved through three major generations:
+This system has evolved through four major generations:
 
-| | v3.0 | v6.0 | v7.0 (Current - Feb 17, 2026) |
-|---|---|---|---|
-| **File** | `alphago_trading_system.py` | `alphago_architecture.py` | `alphago_architecture.py` + `alphago_stop_loss.py` + enhancements |
-| **Design** | Monolithic RL agent | Five-layer architecture | Enhanced five-layer with asymmetric stops |
-| **Alpha Count** | 1 (RL only) | 6 traditional + 1 RL | **12 alphas** (10 core + 2 advanced, all alive) |
-| **Features** | 45-dim observation | 45-dim features | **49-dim features** (Tier 1 improvements) |
-| **Horizon** | 5-bar | Mixed (5-21 bars) | **15-bar standardized** (IC-optimized) |
-| **RL Training** | 50k-100k steps | 100k steps | **800k steps** (8 iterations x 100k) |
-| **RL Observation** | Direct from env | **BUG: not passed in validation** | ✅ **FIXED: properly windowed** |
-| **Risk Management** | Basic drawdown control | Kill switches | **Asymmetric stops** (1.5% loss, 5% trail, ATR-adjusted) |
-| **Validation** | Basic sharpe test | Walk-forward CV | **Multi-horizon IC + ICIR + HitRate + Persistence** |
-| **Monitoring** | Basic PnL tracking | Basic kill switches | **Crowding detection** (>70% agreement → -30% size) |
-| **Key Fixes** | - | Trend signal inverted | ✅ **8 critical bugs fixed** (stops production-ready) |
+| | v3.0 | v6.0 | v7.0 (Feb 17, 2026) | v8.0 (Current - Feb 24, 2026) |
+|---|---|---|---|---|
+| **File** | `alphago_trading_system.py` | `alphago_architecture.py` | `alphago_architecture.py` + `alphago_stop_loss.py` + enhancements | Same files + `StockSelector` class in `alphago_architecture.py` |
+| **Design** | Monolithic RL agent | Five-layer architecture | Enhanced five-layer with asymmetric stops | **Six-layer**: stock selection pre-filter + five-layer pipeline |
+| **Alpha Count** | 1 (RL only) | 6 traditional + 1 RL | **12 alphas** (10 core + 2 advanced, all alive) | Same 12 alphas — but now only applied to pre-selected quality stocks |
+| **Universe** | 1 stock | Any stock list | Any stock list | **206-stock universe** → pre-filtered to top performers |
+| **Stock Selection** | N/A | N/A | N/A | **Tier 2: Adaptive N** (quality threshold) + **Tier 3: Sector Momentum Gate** |
+| **Sector Cap** | N/A | N/A | N/A | **None** — ride momentum freely; if tech is best, take all tech |
+| **Features** | 45-dim observation | 45-dim features | **49-dim features** (Tier 1 improvements) | Same 49-dim features |
+| **Horizon** | 5-bar | Mixed (5-21 bars) | **15-bar standardized** (IC-optimized) | Same 15-bar standardized |
+| **RL Training** | 50k-100k steps | 100k steps | **800k steps** (8 iterations x 100k) | Same 800k steps |
+| **Risk Management** | Basic drawdown control | Kill switches | **Asymmetric stops** (1.5% loss, 5% trail, ATR-adjusted) | Same asymmetric stops |
+| **Key Fixes** | - | Trend signal inverted | ✅ **8 critical bugs fixed** | ✅ **12+ selection engine bugs fixed** (threshold math, sector boost, dead code removal) |
 
-**v7.0 wraps v6.0, which wraps v3.0.** The RL engine from v3.0 becomes just one of **twelve** analysts in the v7.0 system. This is the key architectural insight — no single model, no matter how good, should directly control your money.
+**v8.0 wraps v7.0, which wraps v6.0, which wraps v3.0.** The biggest new idea in v8.0: *the factory now has a sourcing department*. Before any alpha signal is generated, a dedicated selection engine picks the best stocks from a 206-stock universe. Think of it as "only bring the best ingredients into the kitchen — don't cook with everything in the warehouse."
 
 #### What Do These Improvements Actually Mean? (For Complete Beginners)
 
@@ -206,6 +208,23 @@ Let's break down what changed from v6.0 to v7.0 in plain English:
 
 The result is a system that's safer (better risk management), smarter (10 working alphas), and more reliable (comprehensive validation).
 
+#### What Did v8.0 Add? (The Stock Selection Engine)
+
+v8.0 adds a **smart stock picker** that runs *before* the entire L0→L4 pipeline. Think of it this way:
+
+> **v7.0 analogy**: A brilliant chef who can cook anything — but is given random ingredients from a 206-item warehouse, including half-rotten produce, out-of-season vegetables, and ingredients that just don't work together.
+
+> **v8.0 analogy**: The same brilliant chef, but now a smart purchasing team first goes to the market and brings back *only* the freshest, highest-quality ingredients that are currently in season. The chef works better because the inputs are better.
+
+The v8.0 stock selection engine works like this:
+
+1. **Score every stock** in a 206-stock universe using a composite momentum score (50% momentum, 30% relative strength vs SPY, 15% trend alignment, 5% low volatility)
+2. **Tier 2 — Adaptive N**: Don't fix the number at 15. Instead, take all stocks that score within 50% of the top score. In a hot market where 25 stocks are strong, take 25. In a weak bear market where only 4 stocks are worth trading, take just 4. Let quality decide the quantity.
+3. **Tier 3 — Sector Momentum Gate**: Boost the scores of stocks from high-momentum sectors. If tech is on fire and beating everything else, tech stocks get a score bonus. This means hot sectors naturally float to the top without any hard quota — if tech is the best game in town, the portfolio can be all tech.
+4. **No Sector Cap**: The old design capped any one sector at 50% of the portfolio. That's gone. The market decides. If momentum is concentrated in one place, we ride it.
+
+**v8.0 Bottom Line**: The pipeline is smarter *before it even starts* — working only with the best stocks available rather than trying to find gems in a pile of rocks.
+
 ---
 
 ### 2.3 The #1 Rule: Signals ≠ Positions
@@ -221,17 +240,32 @@ The signal says *what*. The risk manager decides *how much*. They are always sep
 
 ---
 
-## 3. The Factory Analogy: How the 5 Layers Work Together
+## 3. The Factory Analogy: How the 6 Layers Work Together
 
 Imagine you're running a chocolate factory. You wouldn't have one person doing everything — buying cocoa beans, testing quality, mixing ingredients, managing the recipe, packaging, and shipping. You'd have departments. This trading system works the same way.
 
-### The Five Departments
+### The Six Departments (v8.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     THE TRADING FACTORY                             │
+│                     THE TRADING FACTORY (v8.0)                      │
 │                                                                     │
-│  🏭 L0 - THE WAREHOUSE (Data Infrastructure)                       │
+│  🛒 S0 - THE SOURCING TEAM (v8.0 Stock Selection Engine)            │
+│     "Which cocoa farms are worth buying from TODAY?"                │
+│     • Scores 206 stocks across 4 dimensions:                        │
+│       - Momentum (50%): Is the stock trending up over the year?     │
+│       - Relative Strength (30%): Is it outperforming the market?   │
+│       - Trend Alignment (15%): Is it above its 50 and 200-day SMA? │
+│       - Low Volatility (5%): Is it steady rather than chaotic?     │
+│     • Tier 3 Sector Boost: Hot sectors get a score bonus —         │
+│       if tech is crushing everything, tech stocks score higher      │
+│     • Tier 2 Adaptive N: Takes ALL stocks above quality threshold   │
+│       (could be 4 in a bear market, 25 in a bull run)              │
+│     • No sector cap — if 15 tech stocks qualify, take all 15       │
+│     • Outputs: A short-list of the best stocks to analyze           │
+│                           │                                          │
+│                           ▼                                          │
+│  🏭 L0 - THE WAREHOUSE (Data Infrastructure)                        │
 │     "Did we get good cocoa beans today?"                            │
 │     • Receives raw market data (prices, volumes)                    │
 │     • Checks quality: Are there missing values? Stale prices?       │
@@ -308,16 +342,64 @@ Think about what happens if you DON'T separate them:
 
 ## 4. The Architecture Diagram
 
-Below is the complete data flow diagram showing how one "bar" (one time period — could be one day, one hour, etc.) of data flows through all five layers. Follow the arrows from top to bottom.
+Below is the complete data flow diagram showing how one "bar" (one time period — could be one day, one hour, etc.) of data flows through all six layers. Follow the arrows from top to bottom.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                        ALPHA-TRADE SYSTEM ARCHITECTURE                      ║
+║                      ALPHA-TRADE v8.0 SYSTEM ARCHITECTURE                   ║
 ║                     Complete Data Flow: One Bar Through the Pipeline         ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
  ┌──────────────────────────────────────────────────────────────────────────┐
- │  RAW MARKET DATA                                                         │
+ │  206-STOCK UNIVERSE (e.g., S&P 500 large caps, diversified sectors)      │
+ │  Full OHLCV history for every stock — downloaded daily                   │
+ └────────────────────────────────────┬─────────────────────────────────────┘
+                                      │
+                                      ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  ╔════════════════════════════════════════════════════════════════════╗   │
+ │  ║  S0: STOCK SELECTION ENGINE (v8.0 — NEW LAYER)                   ║   │
+ │  ║  File: alphago_architecture.py — StockSelector class             ║   │
+ │  ╚════════════════════════════════════════════════════════════════════╝   │
+ │                                                                          │
+ │  TIER 3: SECTOR MOMENTUM (runs first — boosts scores before ranking)     │
+ │  ┌──────────────────────────────────────────────────────────────────┐    │
+ │  │  For each sector: compute 6-month mean return of all members     │    │
+ │  │  Best sector gets a +w_sector_momentum (e.g. +0.10) score boost │    │
+ │  │  Other sectors get a proportional boost (0.0 to 1.0 × weight)   │    │
+ │  │  Negative-momentum sectors: no boost (but no penalty either)    │    │
+ │  └──────────────────────────────────────────────────────────────────┘    │
+ │                        │                                                 │
+ │                        ▼                                                 │
+ │  COMPOSITE SCORE (per stock):                                            │
+ │  ┌──────────────────────────────────────────────────────────────────┐    │
+ │  │  score = 0.50 × 12m_momentum  (price today / price 1yr ago - 1) │    │
+ │  │        + 0.30 × relative_strength_vs_SPY                        │    │
+ │  │        + 0.15 × SMA_alignment  (above 50d SMA and 200d SMA?)   │    │
+ │  │        + 0.05 × inv_vol  (lower volatility = higher score)      │    │
+ │  │        + sector_momentum_boost  (Tier 3, 0.0 to 0.10)          │    │
+ │  │                                                                  │    │
+ │  │  Quality filters: min 63 bars, uptrend required (SMA aligned),   │    │
+ │  │  exclude top 5% most volatile stocks                             │    │
+ │  └──────────────────────────────────────────────────────────────────┘    │
+ │                        │                                                 │
+ │                        ▼                                                 │
+ │  TIER 2: ADAPTIVE N (how many stocks to take)                           │
+ │  ┌──────────────────────────────────────────────────────────────────┐    │
+ │  │  threshold = top_score − abs(top_score) × (1 − min_score_pct)   │    │
+ │  │  n_passing = count stocks where score ≥ threshold               │    │
+ │  │  effective_N = n_passing  (no floor, no ceiling, no sector cap)  │    │
+ │  │                                                                  │    │
+ │  │  Bull market: 25 stocks qualify → take 25                        │    │
+ │  │  Bear market: 4 stocks qualify → take 4 (don't dilute quality!) │    │
+ │  └──────────────────────────────────────────────────────────────────┘    │
+ │                                                                          │
+ │  OUTPUT: Short-list of N high-quality stocks (typically 8–25)           │
+ └────────────────────────────────────┬─────────────────────────────────────┘
+                                      │
+                                      ▼
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │  RAW MARKET DATA (for selected stocks only)                              │
  │  OHLCV Bar: Open=$150, High=$153, Low=$149, Close=$152, Volume=50M      │
  └────────────────────────────────────┬─────────────────────────────────────┘
                                       │
@@ -2886,7 +2968,7 @@ Best champion evaluated on all holdout datasets. Per-symbol results printed: PnL
 | File | Size | Layer(s) | Purpose |
 |------|------|----------|---------|
 | `alphago_trading_system.py` | ~4,700 lines | Core v3.0 | The "engine room." Contains: RL environment, PPO trainer, self-play loop, feature engineering, synthetic data generation, neural network architecture (with LayerNorm + orthogonal init). |
-| `alphago_architecture.py` | ~6,100 lines | L1-L4 | The v7.0 institutional wrapper. Contains: AlphaSignal interface, **12 alpha families** (10 core + 2 advanced), Ridge meta-learner, HorizonBlender (sqrt(h) weighting), PortfolioConstructor (risk/optimizer), DriftDetector (4-detector majority vote), ExecutionEngine, kill switches, reconciliation, alerting. |
+| `alphago_architecture.py` | ~6,400 lines | S0 + L1-L4 | The v8.0 institutional wrapper. Contains: **NEW: `SelectionConfig` + `StockSelector`** (composite scoring, Tier 2 adaptive N, Tier 3 sector momentum gate); AlphaSignal interface, **12 alpha families** (10 core + 2 advanced), Ridge meta-learner, HorizonBlender (sqrt(h) weighting), PortfolioConstructor (risk/optimizer), DriftDetector (4-detector majority vote), ExecutionEngine, kill switches, reconciliation, alerting. |
 | `alphago_enhancements.py` | ~2,500 lines | Various | Enhanced configuration, additional risk management, monitoring dashboards, extension hooks. |
 | `alphago_cost_model.py` | ~153 lines | L3, L4 | Single source of truth for transaction costs: half-spread + sqrt-impact + fees. Used by both L3 (optimization) and L4 (execution). |
 | `alphago_stop_loss.py` | ~350 lines | L4 | **NEW in v7.0:** Asymmetric stop loss manager. Implements tight loss stops (1.5%), wide trail stops (5%), ATR-based volatility scaling, time-based tightening. Production-ready after 8 critical bug fixes. |
@@ -2964,6 +3046,23 @@ Best champion evaluated on all holdout datasets. Per-symbol results printed: PnL
 | **Wave Batching** | Grouping K MCTS rollouts into a single "wave" and evaluating them all in one GPU call. Reduces GPU calls from 256 to ~17 while maintaining search quality through virtual loss diversity. See Section 10.5 and Section 20.1. |
 | **Walk-Forward CV** | Cross-validation that respects time order: always train on past, test on future. Never lets future data contaminate training. |
 | **Yang-Zhang Volatility** | A volatility estimator that uses OHLC bars (not just close-to-close). 14× more statistically efficient than standard deviation of returns. Combines overnight gaps, intraday range (Rogers-Satchell), and close-to-close variance. Used in v7.0 for improved volatility measurement. |
+
+**v8.0 New Terms:**
+
+| Term | Definition |
+|------|------------|
+| **Adaptive N (Tier 2)** | v8.0 feature: instead of selecting a fixed number of stocks (e.g., always 15), the system takes all stocks that score within a quality threshold of the best scorer. In a bull market this might be 25; in a bear market it might be 4. Quality determines quantity, not an arbitrary count. |
+| **Composite Score** | v8.0 stock ranking score = 50% × momentum + 30% × relative_strength + 15% × SMA_alignment + 5% × inv_vol + sector_momentum_boost. Higher = stronger, more trending stock. Used to rank all 206 stocks before selection. |
+| **Momentum (12-month)** | Annualized price return from 12 months ago to 22 trading days ago (skipping the most recent month to avoid short-term reversal effects). The primary factor in the v8.0 composite score (50% weight). |
+| **Relative Strength vs SPY** | How much a stock has outperformed (or underperformed) SPY over the same momentum window. A stock rising 20% while SPY rises 10% has positive relative strength of +10%. The second-largest factor in the composite score (30% weight). |
+| **Sector Cap (Removed in v8.0)** | Pre-v8.0, no sector could represent more than 50% of selected stocks. Removed in v8.0 — if tech has the best 15 stocks, the portfolio can be all tech. Momentum concentration is allowed; risk limits are handled by L3. |
+| **Sector Momentum Gate (Tier 3)** | v8.0 feature: boost composite scores for stocks in high-momentum sectors. The hottest sector gets a full +w_sector_momentum boost (e.g., +0.10). Other sectors get a proportional fraction. Negative-momentum sectors get 0 boost. Natural result: hot sectors float to the top without hard quotas. |
+| **SelectionConfig** | v8.0 dataclass holding all parameters for the stock selection engine: top_n, adaptive_n, min_score_pct, sector_momentum_gate, w_sector_momentum, and the four composite score weights. |
+| **SMA Alignment** | Whether a stock is above its 50-day and 200-day simple moving averages. 0 points = below both (downtrend), 1 point = above 50d only, 2 points = above 200d only, 3 points = above both (strong uptrend). Only stocks above both SMAs pass the uptrend filter (sma_alignment_required=True). |
+| **StockSelector** | v8.0 class in alphago_architecture.py that implements the pre-pipeline stock selection. Has three methods: `_compute_sector_momentum()` (Tier 3), `rank_universe()` (composite scoring), and `select()` (adaptive N and filtering). |
+| **Tier 2 (Adaptive N)** | The adaptive stock count feature: include all stocks within a quality threshold drop of the top scorer. Threshold formula: top_score − abs(top_score) × (1 − min_score_pct). This works correctly for both positive and negative scores, unlike the old top_score × pct formula. |
+| **Tier 3 (Sector Momentum Gate)** | The sector-level momentum boost feature: compute 6-month sector returns, normalize so the best sector = 1.0, add w_sector_momentum × relative_sector_momentum to each stock's composite score. Hot sectors naturally produce higher-scoring stocks without slot counting. |
+| **Universe** | The full pool of stocks available for selection. In v8.0 this is 206 stocks (e.g., S&P 500 large caps across all sectors). The StockSelector narrows this to the best N stocks before the L0→L4 pipeline runs. |
 
 ---
 
@@ -3092,7 +3191,79 @@ Price rises to $110 (+10%):
 
 **Validation:** All parameters validated in `TradingEnv.__init__()` to prevent invalid configurations (see Bug Fix #11 in Section 18)
 
-### 17.4 Reproducibility Configuration
+### 17.4 v8.0 SelectionConfig (alphago_architecture.py — NEW)
+
+This is the configuration for the pre-pipeline stock selection engine added in v8.0.
+
+**Core Selection:**
+| Parameter | Default | What It Controls |
+|-----------|---------|-----------------|
+| `top_n` | 15 | Fixed number of stocks to select when `adaptive_n=False` (ignored when adaptive_n=True) |
+| `adaptive_n` | False | Enable Tier 2: variable N — takes all stocks scoring within `min_score_pct` drop of the top scorer |
+| `min_score_pct` | 0.50 | Tier 2 threshold: stock must score ≥ top_score − abs(top_score) × (1 − min_score_pct). Clipped to [0.0, 1.0]. |
+| `momentum_lookback` | 252 | Bars for 12-month momentum calculation (1 year of daily data) |
+| `momentum_skip` | 21 | Skip last 21 bars of momentum window (avoids short-term reversal effect in the signal) |
+| `min_bars` | 63 | Minimum bars required to consider a stock (3 months = fast-track for newer listings) |
+| `sma_alignment_required` | True | Stock must be above both 50-bar and 200-bar SMA to qualify (uptrend filter) |
+| `volatility_cap_percentile` | 95.0 | Exclude the top 5% most volatile stocks from the universe |
+
+**Sector Momentum Gate (Tier 3):**
+| Parameter | Default | What It Controls |
+|-----------|---------|-----------------|
+| `sector_momentum_gate` | False | Enable Tier 3: boost composite scores for stocks in high-momentum sectors |
+| `sector_momentum_lookback` | 126 | Bars for sector momentum calculation (6 months of daily data) |
+| `w_sector_momentum` | 0.10 | Maximum additive score boost from sector momentum (stocks in top sector get +0.10) |
+
+**Composite Score Weights:**
+| Parameter | Default | What It Controls |
+|-----------|---------|-----------------|
+| `w_momentum` | 0.50 | Weight for 12-month price momentum in composite score |
+| `w_trend` | 0.15 | Weight for SMA alignment (trend filter) in composite score |
+| `w_rs` | 0.30 | Weight for relative strength vs SPY in composite score |
+| `w_invvol` | 0.05 | Weight for inverse volatility (calmer stocks score higher) |
+
+**CLI Arguments (alphago_layering.py):**
+| CLI Flag | Maps To | Description |
+|----------|---------|-------------|
+| `--top-n 15` | `top_n` | Fixed stock count (used only when --adaptive-n is OFF) |
+| `--adaptive-n` | `adaptive_n=True` | Enable Tier 2 variable stock count |
+| `--min-score-pct 0.50` | `min_score_pct` | Quality threshold (fraction of top score drop allowed) |
+| `--sector-momentum-gate` | `sector_momentum_gate=True` | Enable Tier 3 sector score boost |
+| `--sector-momentum-weight 0.10` | `w_sector_momentum` | Magnitude of sector boost |
+
+**Common Invocation Patterns:**
+```bash
+# Baseline (fixed 15 stocks, no sector boost):
+python alphago_layering.py --version v8 --skip-ablation
+
+# Tier 2 only (let quality decide the count):
+python alphago_layering.py --version v8 --adaptive-n --min-score-pct 0.50 --skip-ablation
+
+# Tier 3 only (sector momentum boost):
+python alphago_layering.py --version v8 --sector-momentum-gate --sector-momentum-weight 0.10 --skip-ablation
+
+# Full v8.0 (Tier 2 + Tier 3 combined):
+python alphago_layering.py --version v8 --adaptive-n --sector-momentum-gate --skip-ablation
+```
+
+**The Threshold Math (Why It Works for Positive AND Negative Scores):**
+```
+threshold = top_score − abs(top_score) × (1 − pct)
+
+Example A — Bull market (top_score = +0.40, pct = 0.50):
+  threshold = 0.40 − 0.40 × 0.50 = 0.40 − 0.20 = +0.20
+  → Takes all stocks scoring ≥ +0.20 (top half of the positive range)
+
+Example B — Bear market (top_score = −0.10, pct = 0.50):
+  threshold = −0.10 − 0.10 × 0.50 = −0.10 − 0.05 = −0.15
+  → Takes all stocks scoring ≥ −0.15 (still picks the least-bad options!)
+
+Key property: threshold ≤ top_score in ALL cases → always ≥ 1 stock selected.
+Old broken formula (top_score × pct): In bear market → −0.10 × 0.50 = −0.05 > −0.10
+  → threshold ABOVE top_score → ZERO stocks pass! Fixed in v8.0.
+```
+
+### 17.5 Reproducibility Configuration
 
 | Feature | How It Works |
 |---------|-------------|
@@ -3103,7 +3274,7 @@ Price rises to $110 (+10%):
 
 **Same data + same config = same output, always.** This is non-negotiable. Every random operation is seeded, and the exact configuration is hashed and recorded.
 
-### 17.5 Configuration Precedence (CRITICAL)
+### 17.6 Configuration Precedence (CRITICAL)
 
 **⚠️ Warning:** The system has THREE levels of configuration, and they override each other in a specific order:
 
@@ -4631,6 +4802,187 @@ trend_strength = |sum of last 20 returns| / sum of |each return|
 | Neural Net Stability | L4 (RL Engine) | Stable early training, no gradient explosions | Pre-measured ingredients for the mixer |
 | Adaptive Block Bootstrap | L4 (RL Engine) | Trend-preserving simulations | Matching wind conditions to reality |
 | Leveraged ETFs | L0 (Data) | 12 new tradeable instruments | More tools in the toolbox |
+
+---
+
+---
+
+## 21. What's New in v8.0? — Stock Selection Engine (February 24, 2026)
+
+v8.0 adds a brand-new layer to the pipeline: a **stock selection engine** that runs *before* any alpha signal is generated. This is the biggest architectural change since v6.0 introduced the five-layer pipeline.
+
+### 21.1 The Problem v8.0 Solves
+
+**Analogy:** Imagine you have a world-class restaurant kitchen (the L0→L4 pipeline). The kitchen can cook anything brilliantly. But every morning, someone delivers a random mix of 206 ingredients: some fresh and perfect, some stale, some totally out of season.
+
+The kitchen is wasting effort cooking with low-quality ingredients. Worse, the brilliant dishes the kitchen *could* make with the best ingredients are diluted by average ones.
+
+**v8.0 solution:** Add a smart purchasing team (the `StockSelector`) that goes to market every morning and brings back *only* the top-quality, in-season ingredients. The kitchen now has the same talent but works with better inputs — and the meals get better.
+
+In concrete terms:
+- **Before v8.0**: The pipeline ran on whatever stocks were in the list. A mediocre stock and a strong stock got equal treatment.
+- **After v8.0**: Only the strongest, most momentum-driven stocks make it past the pre-filter. The pipeline's alpha signals are spent exclusively on the best opportunities.
+
+---
+
+### 21.2 The Composite Score: How Stocks Are Ranked
+
+Every stock in the 206-stock universe gets a **composite score** based on four ingredients:
+
+| Ingredient | Weight | What It Measures | Analogy |
+|---|---|---|---|
+| **12-Month Momentum** | 50% | Price today vs price 1 year ago (skip last 21 days to avoid short-term reversal) | "Has this horse been winning races all year?" |
+| **Relative Strength vs SPY** | 30% | Is the stock gaining more than the S&P 500? | "Is this horse faster than the pack, not just fast in general?" |
+| **SMA Alignment** | 15% | Is it above its 50-day AND 200-day moving average? (0, 1, 2, or 3 points) | "Is the horse running uphill or downhill right now?" |
+| **Inverse Volatility** | 5% | Calmer stocks score higher (95th percentile cap for wild swings) | "Is this horse steady, or does it throw the jockey randomly?" |
+
+```
+composite_score = 0.50 × momentum
+               + 0.30 × relative_strength_vs_SPY
+               + 0.15 × (SMA_score / 3.0)
+               + 0.05 × (inv_vol / 100.0)
+               + sector_momentum_boost     ← Tier 3 (if enabled)
+```
+
+**Quality filters applied before scoring:**
+- Stock must have at least 63 bars of data (3 months minimum)
+- Stock must be in an uptrend (above 50-day and 200-day SMA)
+- Stock must not be in the top 5% most volatile (these are excluded entirely)
+
+---
+
+### 21.3 Tier 2: Adaptive N — Let Quality Decide the Quantity
+
+**The old way (pre-v8.0):** Always pick exactly 15 stocks. Fixed, rigid. Whether the market is booming or crashing, whether 30 stocks are screaming higher or only 3 are, you always pick exactly 15.
+
+**The problem with a fixed 15:**
+- *Bull market*: 25 stocks might genuinely qualify. You're leaving 10 great opportunities on the table.
+- *Bear market*: Only 4 stocks are worth touching. You force 11 mediocre picks to fill the quota, diluting quality.
+
+**Tier 2 fix:** Instead of a fixed count, set a **quality threshold**. Include every stock that scores within X% of the best score. The count adapts naturally:
+
+```
+threshold = top_score − abs(top_score) × (1 − min_score_pct)
+
+Examples with min_score_pct = 0.50:
+
+BULL MARKET (top_score = +0.40):
+  threshold = 0.40 − 0.40 × 0.50 = +0.20
+  → Include all stocks with score ≥ +0.20
+  → If 22 stocks pass: take 22 (no artificial cap!)
+
+BEAR MARKET (top_score = −0.10):
+  threshold = −0.10 − 0.10 × 0.50 = −0.15
+  → Include all stocks with score ≥ −0.15
+  → If 4 stocks pass: take only 4 (don't dilute quality!)
+```
+
+**Analogy:** Imagine you're a talent scout. Instead of saying "I must sign exactly 15 players," you say "I'll sign anyone within 50% of our best prospect's talent rating." In a great draft year, you sign 22 players. In a bad draft year, you sign 4. The quality stays constant; the count flexes.
+
+**Why the threshold formula matters:** The old formula `top_score × min_score_pct` breaks completely in bear markets. When `top_score = −0.10` and `pct = 0.50`, it gives `-0.10 × 0.50 = -0.05`, which is *above* the top score. Zero stocks pass. The system falls back to picking 15 random stocks — the worst possible outcome.
+
+The new formula `top_score − abs(top_score) × (1 − pct)` *always* puts the threshold at or below the top score, mathematically guaranteeing at least 1 stock is always selected.
+
+**No floor, no ceiling, no fallback.** If 4 stocks qualify in a bear market, take 4. Trust the math.
+
+---
+
+### 21.4 Tier 3: Sector Momentum Gate — Let Hot Sectors Dominate
+
+**The idea:** Markets often have "hot themes." In 2023, AI/tech was on fire. In 2022, energy was the one bright spot. Rather than treating all sectors equally, boost the scores of stocks from whatever sector is showing the strongest momentum right now.
+
+**How it works (step by step):**
+
+1. Compute the 6-month return for every stock in the universe
+2. Group stocks by sector (Tech, Energy, Healthcare, etc.)
+3. Average the 6-month returns for each sector → sector momentum score
+4. Normalize: the hottest sector gets a +10% score boost (the full `w_sector_momentum`). Other sectors get a proportional fraction. Negative-momentum sectors get 0 boost (no penalty — the market might turn, so we don't punish).
+
+```
+For each stock:
+  sector_return = mean 6m return of all stocks in same sector
+  max_sector_return = highest sector return in the universe
+  relative_boost = max(0, sector_return / max_sector_return)  ← always 0.0–1.0
+  score += w_sector_momentum × relative_boost                ← e.g. +0.10 for top sector
+```
+
+**Example:** If Tech averages +18% over 6 months and Energy averages +6%:
+- A tech stock gets a full +0.10 boost to its composite score
+- An energy stock gets +0.10 × (6/18) = +0.033 boost
+- A sector with -5% momentum gets 0 boost
+
+**Analogy:** Imagine you're picking horses for a race. All horses have their own individual fitness score. But you also know which stable (sector) has been training hardest and winning the most races lately. Horses from that stable get a bonus to their fitness score — because it's not just the horse, it's also the training environment and the current conditions. If tech horses are winning everything right now, they get extra credit.
+
+**Why additive boost (not slot allocation)?** An earlier design considered giving hot sectors more "slots" (e.g., "Tech can have 8 of the 15 spots"). But this creates discontinuities and is complex to reason about. An additive score boost is simpler: hot sectors naturally float their stocks to the top of the ranking, and the adaptive N picks however many make the cut. No arbitrary slot counting needed.
+
+---
+
+### 21.5 No Sector Cap — Ride the Momentum
+
+**Pre-v8.0 design:** A hard `sector_max_pct = 0.50` cap. No single sector could represent more than 50% of the selected stocks. If tech was the top-7 stocks by score, the 8th pick would be forced to come from another sector.
+
+**The problem:** This cap *fights against momentum*. If tech is genuinely the best opportunity in the market, you're artificially limited to half-tech and forced to allocate to weaker sectors.
+
+**v8.0 change:** The sector cap is gone. The selection is purely score-driven. If tech occupies all 25 slots in an adaptive-N run, so be it. We ride momentum wherever it leads.
+
+**Analogy:** Imagine you can bet on horses, and one stable has the 10 fastest horses on the track today. An artificial rule saying "you can only bet on 5 horses from any one stable" forces you to bet on slower horses from other stables. v8.0 says: drop the rule. Bet on the 10 fastest horses. If they all happen to be from the same stable, that's the signal the market is giving you.
+
+**Risk management note:** The L3 portfolio construction layer still applies Kelly sizing, volatility targeting, and drawdown controls. Sector concentration at the *selection* level doesn't mean the portfolio will over-leverage into one sector — L3 will naturally reduce position sizes for correlated names. The selection engine focuses on *opportunity quality*, not *risk limits* — that's L3's job.
+
+---
+
+### 21.6 Bug Fixes in the v8.0 Selection Engine
+
+Building the selection engine involved finding and fixing 12+ bugs. The most important ones:
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| **Wrong threshold math** | In bear markets (negative top_score), threshold ended up *above* top score → zero stocks passed | Changed from `top × pct` to `top − abs(top) × (1-pct)` |
+| **Fixed N fallback in bear market** | When zero stocks passed, code fell back to `top_n=15` — picking mediocre stocks anyway | Removed fallback; new formula guarantees ≥1 stock always |
+| **Artificial floor (min_n=8)** | Code always selected at least 8 stocks even when only 2 qualified | Removed `max(min_n, n_passing)` — trust the threshold |
+| **Hard top_n ceiling** | `min(n_passing, top_n)` capped adaptive N at 15 even in bull markets | Removed `min(..., top_n)` — let n_passing be the ceiling |
+| **Sector cap still enforcing** | `sector_max_pct=0.50` check in `select()` was still blocking momentum concentration | Removed sector cap check entirely from `select()` |
+| **max() computed inside loop** | `max(sector_momentum.values())` called for every stock → O(N×S) | Pre-computed as `_sec_max_mom` before the loop → O(S) |
+| **Dead `min_n` field** | `SelectionConfig.min_n` defined but never read after floor removal | Removed field and `--min-n` CLI arg entirely |
+| **NaN from empty sector** | `np.mean([])` returns NaN for a sector with no qualifying stocks | Added `if rets` guard in dict comprehension |
+| **Invalid min_score_pct** | Values > 1.0 push threshold above top score → 0 stocks pass | Added `pct = max(0.0, min(1.0, self.cfg.min_score_pct))` clipping |
+| **Adaptive N log only showed when N ≠ 15** | If adaptive N happened to pick 15, the log showed nothing | Changed to always log when `--adaptive-n` flag is active |
+| **Unused variables in `select()`** | `for sym, score, components in rankings` — `score` and `components` unused | Changed to `for sym, _, _ in rankings` |
+
+---
+
+### 21.7 Reading the Selection Logs
+
+When you run with `--adaptive-n` or `--sector-momentum-gate`, the output includes new diagnostic lines:
+
+```
+[Selection] Selected 18 stocks from universe of 206
+  Score range: +0.412 → +0.218 (threshold: +0.206)
+  Sector allocation: Technology=8, Healthcare=4, Industrials=3, Energy=2, Other=1
+  Adaptive N: 18 stocks passed threshold (min_score_pct=50% of top score)
+  Sector momentum (top 3): Technology=+18.2%, Healthcare=+9.1%, Industrials=+6.4%
+```
+
+**How to read it:**
+- **Score range**: The top stock scored +0.412. The threshold is 50% of the way from 0 to +0.412, which is +0.206. The lowest selected stock scored +0.218, just above threshold.
+- **Sector allocation**: 8 out of 18 picks are Technology. No artificial cap stopped this — Tech simply had the highest scores.
+- **Adaptive N**: 18 stocks scored above the threshold (not forced to 15 or 25).
+- **Sector momentum (top 3)**: Tech has been up 18.2% over the last 6 months — this is why tech stocks got the biggest sector boost.
+
+---
+
+### 21.8 Summary of v8.0 Changes
+
+| Change | Layer | Impact | Analogy |
+|--------|-------|--------|---------|
+| Stock Selection Engine (StockSelector) | New S0 layer | Focuses pipeline on only the best 8-25 stocks | Smart purchasing team for the kitchen |
+| Composite Score (4 factors) | S0 | Momentum-weighted ranking of 206 stocks | Fitness test for every horse before race selection |
+| Tier 2: Adaptive N | S0 | Variable stock count driven by quality threshold | "Take all A-players, not exactly 15 people" |
+| Tier 3: Sector Momentum Gate | S0 | Score boost for stocks in high-momentum sectors | Bonus points for horses from the winning stable |
+| No Sector Cap | S0 | Pure momentum concentration allowed | Bet on the fastest horses regardless of stable |
+| Threshold formula fix | S0 | Works correctly for positive AND negative scores | Fixed the GPS that was giving backwards directions |
+| Bear market handling | S0 | No fallback to fixed N — picks 4 if only 4 qualify | Trust the quality gate even in hard markets |
+| 12+ selection engine bugs fixed | S0 | Production-ready with defensive programming | Bullet-proofing the new department |
 
 ---
 
