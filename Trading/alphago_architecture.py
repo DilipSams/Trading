@@ -472,13 +472,17 @@ class ArchitectureConfig:
 @dataclass
 class SelectionConfig:
     """Configuration for v8.0 stock selection engine."""
-    top_n: int = 15                          # Number of stocks to hold
+    top_n: int = 15                          # Stocks to select when adaptive_n=False
+    adaptive_n: bool = False                 # Tier 2: variable N — let quality threshold decide
+    min_score_pct: float = 0.50             # Tier 2: select stocks scoring >= top_score - abs(top_score)*(1-pct)
     momentum_lookback: int = 252             # 12-month momentum window
     momentum_skip: int = 21                  # Skip last month (reversal effect)
     min_bars: int = 63                       # P3: Fast-track new listings — 63 bars (3 months) min
     sma_alignment_required: bool = True      # Only select stocks in uptrend
-    sector_max_pct: float = 0.50             # Max 50% in any single sector
     volatility_cap_percentile: float = 95.0  # Exclude top 5% most volatile
+    sector_momentum_gate: bool = False       # Tier 3: boost scores for stocks in high-momentum sectors
+    sector_momentum_lookback: int = 126      # Tier 3: 6-month lookback for sector momentum
+    w_sector_momentum: float = 0.10         # Tier 3: max additive boost to composite score
     # Weight allocation for composite score
     w_momentum: float = 0.50
     w_trend: float = 0.15
@@ -498,8 +502,34 @@ class StockSelector:
         self.cfg = sel_cfg
         self.sector_map = sector_map
         self.selection_log = []
+        # Build reverse lookup once: symbol -> sector
+        self.sym_to_sector = {s: sec for sec, syms in sector_map.items() for s in syms}
 
-    def rank_universe(self, datasets, spy_returns_lookup=None):
+    def _compute_sector_momentum(self, datasets):
+        """
+        Tier 3: Compute sector-level momentum as mean 6-month return of member stocks.
+
+        Uses the test (OOS holdout) close prices. Returns a dict mapping
+        sector_name -> mean_6m_return for all sectors with sufficient data.
+        """
+        lookback = self.cfg.sector_momentum_lookback  # default 126 bars ≈ 6 months
+        sector_returns = {}
+        for d in datasets:
+            if not hasattr(d, 'prices_test') or d.prices_test is None:
+                continue
+            closes = d.prices_test[:, 3]
+            if len(closes) < lookback:
+                continue
+            start_price = closes[-lookback]
+            if start_price <= 0:           # guard: skip corrupted price data
+                continue
+            ret = (closes[-1] / start_price) - 1.0
+            bare_sym = d.symbol.split('_')[0] if '_' in d.symbol else d.symbol
+            sector = self.sym_to_sector.get(bare_sym, 'other')
+            sector_returns.setdefault(sector, []).append(ret)
+        return {s: float(np.mean(rets)) for s, rets in sector_returns.items() if rets}
+
+    def rank_universe(self, datasets, spy_returns_lookup=None, sector_momentum=None):
         """
         Rank all symbols by composite score.
 
@@ -585,6 +615,9 @@ class StockSelector:
         else:
             vol_cap = 999.0
 
+        # Pre-compute sector max for Tier 3 boost (avoids recomputing inside loop)
+        _sec_max_mom = max(sector_momentum.values()) if sector_momentum else 0.0
+
         for d, momentum, sma_score, rs_vs_spy, vol_20 in symbol_data:
             if vol_20 > vol_cap:
                 continue  # Too volatile, skip
@@ -599,6 +632,17 @@ class StockSelector:
                 + self.cfg.w_invvol * (inv_vol / 100.0)  # Normalize inv_vol
             )
 
+            # --- Tier 3: Sector Momentum Boost ---
+            # Stocks in the hottest sector get +w_sector_momentum; proportional for others.
+            # Negative-momentum sectors get 0 boost (no penalty — still rankable on own merit).
+            # Note: _sec_max_mom is pre-computed before this loop (see below).
+            if _sec_max_mom > 0 and sector_momentum:
+                bare_sym = d.symbol.split('_')[0] if '_' in d.symbol else d.symbol
+                sec = self.sym_to_sector.get(bare_sym, 'other')
+                sec_mom = sector_momentum.get(sec, 0.0)
+                relative_boost = max(0.0, sec_mom / _sec_max_mom)  # 0.0–1.0
+                score += self.cfg.w_sector_momentum * relative_boost
+
             rankings.append((d.symbol, score, {
                 'momentum': momentum,
                 'sma_score': sma_score,
@@ -611,40 +655,65 @@ class StockSelector:
         return rankings
 
     def select(self, datasets, spy_returns_lookup=None):
-        """Select top-N stocks with sector diversification constraints."""
-        rankings = self.rank_universe(datasets, spy_returns_lookup)
+        """
+        Select stocks: Tier 3 sector boost → rank → Tier 2 adaptive N → no sector cap.
 
+        Flow:
+          1. Tier 3 (if enabled): compute sector momentum, pass to rank_universe() as boost
+          2. rank_universe(): score and sort all stocks (with optional sector boost)
+          3. Tier 2 (if enabled): compute effective ceiling from score threshold
+          4. Greedy selection: pick top stocks up to effective_ceiling, no sector cap
+        """
+        # Tier 3: compute sector momentum before ranking so it can boost scores
+        sector_momentum = None
+        if self.cfg.sector_momentum_gate:
+            sector_momentum = self._compute_sector_momentum(datasets)
+
+        rankings = self.rank_universe(datasets, spy_returns_lookup, sector_momentum)
+
+        # Tier 2: compute effective ceiling based on score threshold.
+        # When adaptive_n=True: select exactly the stocks that pass — no floor, no cap, no fallback.
+        #   4 qualify in a weak market → take 4. 22 qualify in a bull run → take 22.
+        #
+        # Threshold formula: top_score - abs(top_score) * (1 - min_score_pct)
+        #   This works correctly for both positive AND negative top_score:
+        #     positive: top=+0.40, pct=0.50 → threshold=+0.20  (top 50% of a good universe)
+        #     negative: top=-0.10, pct=0.50 → threshold=-0.15  (top 50% of a bad universe)
+        #   Crucially: threshold is always <= top_score, so n_passing >= 1 guaranteed.
+        #
+        # When adaptive_n=False: select exactly top_n stocks (original behavior).
+        if self.cfg.adaptive_n and rankings:
+            top_score = rankings[0][1]
+            pct = max(0.0, min(1.0, self.cfg.min_score_pct))  # clip to [0,1]: >1 would push threshold above top
+            threshold = top_score - abs(top_score) * (1.0 - pct)
+            n_passing = sum(1 for _, s, _ in rankings if s >= threshold)
+            effective_ceiling = n_passing  # pure quality gate — no floor, no cap
+        else:
+            effective_ceiling = self.cfg.top_n
+
+        # Greedy selection — no sector cap, ride momentum
         selected = []
         sector_counts = {}
-        max_per_sector = max(2, int(self.cfg.top_n * self.cfg.sector_max_pct))
-
-        # Build reverse lookup: symbol -> sector
-        sym_to_sector = {}
-        for sector, symbols in self.sector_map.items():
-            for s in symbols:
-                sym_to_sector[s] = sector
-
-        for sym, score, components in rankings:
-            if len(selected) >= self.cfg.top_n:
+        for sym, _, _ in rankings:
+            if len(selected) >= effective_ceiling:
                 break
-            # Strip timeframe suffix (e.g. "MU_1d" -> "MU") for sector lookup
-            bare_sym = sym.split('_')[0] if '_' in sym else sym
-            sector = sym_to_sector.get(bare_sym, "other")
-            if sector_counts.get(sector, 0) >= max_per_sector:
-                continue  # Sector full, skip
             selected.append(sym)
+            bare_sym = sym.split('_')[0] if '_' in sym else sym
+            sector = self.sym_to_sector.get(bare_sym, 'other')
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
         # Filter datasets to only selected symbols
         sym_set = set(selected)
         filtered = [d for d in datasets if d.symbol in sym_set]
 
-        # Log selection
+        # Log selection with Tier 2/3 diagnostics
         self.selection_log.append({
             'selected': selected,
             'rankings': [(s, sc, comp) for s, sc, comp in rankings],
             'scores': {s: sc for s, sc, _ in rankings},
             'sector_allocation': dict(sector_counts),
+            'effective_n': effective_ceiling,
+            'sector_momentum': sector_momentum or {},
         })
 
         return filtered

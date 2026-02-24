@@ -2160,7 +2160,19 @@ Examples:
                    choices=["v7", "v8"],
                    help="Strategy version: v7=current, v8=stock selection engine")
     g.add_argument("--top-n", type=int, default=15,
-                   help="v8.0: number of stocks to select (default: 15)")
+                   help="v8.0: stocks to select when --adaptive-n is OFF (default: 15). "
+                        "With --adaptive-n, ignored — N expands to all stocks that pass the threshold.")
+    g.add_argument("--adaptive-n", action="store_true",
+                   help="v8.0 Tier 2: variable N — select all stocks within min-score-pct drop of the top score. "
+                        "4 qualify in a weak market → take 4; 25 qualify in a bull run → take 25.")
+    g.add_argument("--min-score-pct", type=float, default=0.50,
+                   help="v8.0 Tier 2: quality threshold as fraction of top score drop allowed (default: 0.50). "
+                        "0.50 means select stocks within 50%% of the top score's absolute magnitude. "
+                        "Must be in [0.0, 1.0].")
+    g.add_argument("--sector-momentum-gate", action="store_true",
+                   help="v8.0 Tier 3: boost composite scores for stocks in high-momentum sectors")
+    g.add_argument("--sector-momentum-weight", type=float, default=0.10,
+                   help="v8.0 Tier 3: max additive boost to composite score from sector momentum (default: 0.10)")
     g.add_argument("--kill-loss", type=float, default=None,
                    help="Kill switch max portfolio loss fraction (default: ArchitectureConfig default=0.30)")
     g.add_argument("--skip-ablation", action="store_true",
@@ -2914,7 +2926,13 @@ def main():
         run_postmortem(base_results, nosma_results, pipeline_results, datasets)
 
     # Stock selection — always run so v8 column appears in comparison table
-    sel_cfg = SelectionConfig(top_n=args.top_n)
+    sel_cfg = SelectionConfig(
+        top_n=args.top_n,
+        adaptive_n=args.adaptive_n,
+        min_score_pct=args.min_score_pct,
+        sector_momentum_gate=args.sector_momentum_gate,
+        w_sector_momentum=args.sector_momentum_weight,
+    )
     selector = StockSelector(sel_cfg, SECTOR_MAP)
     selected_datasets = selector.select(datasets, spy_returns_lookup)
 
@@ -2937,6 +2955,17 @@ def main():
             _sec_alloc = _log.get('sector_allocation', {})
             if _sec_alloc:
                 tprint(f"  Sector allocation: {dict(_sec_alloc)}", "info")
+            # Tier 2: always log when adaptive_n is on so the user can see N in action
+            _eff_n = _log.get('effective_n', args.top_n)
+            if args.adaptive_n:
+                tprint(f"  Adaptive N: {_eff_n} stocks passed threshold "
+                       f"(min_score_pct={args.min_score_pct:.0%} of top score)", "info")
+            # Tier 3: log top-3 sector momentum scores
+            _sec_mom = _log.get('sector_momentum', {})
+            if _sec_mom:
+                _top3 = sorted(_sec_mom.items(), key=lambda x: -x[1])[:3]
+                tprint(f"  Sector momentum (top 3): " +
+                       ", ".join(f"{s}={m:+.1%}" for s, m in _top3), "info")
 
     # Build rank map
     _v8_rank = {}
