@@ -421,6 +421,95 @@ class CalendarAlpha(BaseAlpha):
 
 
 # ============================================================================
+# 6. BREAKOUT ALPHA — P2 (52-week high with volume confirmation)
+# ============================================================================
+
+class BreakoutAlpha(BaseAlpha):
+    """
+    52-week high breakout alpha with volume confirmation.
+
+    Economic hypothesis: Stocks making new 52-week highs are in persistent
+    uptrends driven by fundamental catalysts (AI boom, spin-off repricing, etc.).
+    These moves are NOT mean-reverting in the short term.
+
+    Signal:
+      +signal when price breaks above N-bar high + volume > 1.5x avg + positive 5d momentum
+      0.0     when price is not at a new high
+    Adapts lookback to available data (200-252 bars).
+
+    Expected use-case: Captures NVDA-type breakouts early and holds through
+    parabolic moves. Complements TrendAlpha (EMA21/60) by triggering earlier.
+    """
+
+    def __init__(self, acfg: ArchitectureConfig):
+        super().__init__(name="breakout_52wk", horizon=15)
+        self.max_lookback = 200    # Use 200 instead of 252 to include more stocks
+        self.vol_window = 20       # Volume comparison window
+        self._warmup_bars = 50     # Minimum: need at least 50 bars
+
+    def generate(self, closes: np.ndarray, volumes: np.ndarray = None,
+                 features: np.ndarray = None, bar_idx: int = 0,
+                 **kwargs) -> AlphaSignal:
+        self._bar_count = bar_idx
+        n = len(closes)
+
+        if n < self._warmup_bars:
+            return AlphaSignal(alpha_name=self.name, horizon=self.horizon,
+                               timestamp=bar_idx)
+
+        current_price = float(closes[-1])
+
+        # Adaptive lookback: use available history up to max_lookback
+        lookback = min(self.max_lookback, n - 1)
+
+        # N-bar high (exclude current bar to avoid lookahead bias)
+        hist_high = float(np.max(closes[-(lookback + 1):-1]))
+        is_new_high = current_price > hist_high
+        breakout_pct = (current_price / max(hist_high, 1e-10)) - 1.0
+
+        # 5-day momentum (direction check)
+        momentum_5d = float((closes[-1] / closes[-6]) - 1.0) if n >= 6 else 0.0
+
+        # Volume confirmation: current volume vs 20-day avg
+        vol_confirm = 0.5  # Neutral default when no volume data
+        if volumes is not None and len(volumes) >= self.vol_window + 1:
+            avg_vol = float(np.mean(volumes[-(self.vol_window + 1):-1]))
+            current_vol = float(volumes[-1])
+            if avg_vol > 0:
+                # Ratio capped at 3x; normalize to 0-1
+                vol_confirm = min(current_vol / avg_vol, 3.0) / 3.0
+
+        if is_new_high and momentum_5d > 0:
+            # Signal strength scales with how far above the high
+            raw_strength = min(breakout_pct * 3.0, 1.0)   # 33%+ breakout → full signal
+            mu = 0.12 * raw_strength * (0.4 + 0.6 * vol_confirm)
+            confidence = 0.4 + 0.4 * raw_strength + 0.2 * vol_confirm
+        else:
+            mu = 0.0
+            confidence = 0.0
+
+        # Sigma from recent realized vol
+        if n >= 21:
+            log_rets = np.diff(np.log(np.maximum(closes[-21:], 1e-12)))
+            sigma = float(np.std(log_rets)) * np.sqrt(252)
+            sigma = max(0.10, min(0.60, sigma))
+        else:
+            sigma = 0.20
+
+        return AlphaSignal(
+            mu=mu, sigma=sigma, confidence=confidence,
+            horizon=self.horizon, alpha_name=self.name,
+            timestamp=bar_idx,
+            metadata={
+                'is_new_high': is_new_high,
+                'breakout_pct': breakout_pct,
+                'vol_confirm': vol_confirm,
+                'lookback_used': lookback,
+            },
+        )
+
+
+# ============================================================================
 # FACTORY FUNCTION
 # ============================================================================
 

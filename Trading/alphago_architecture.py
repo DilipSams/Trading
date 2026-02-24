@@ -317,6 +317,9 @@ class ArchitectureConfig:
     reversal_formation: int = 5              # Formation period (5-bar losers)
     reversal_horizon: int = 5                # Reversal period (expect bounce in 5 bars)
 
+    # P4: Bull-regime RL gate
+    bull_regime_gate: bool = True            # Clamp RL mu to >= 0 when all SMAs aligned bullish
+
     # Tier 3: Risk-managed momentum
     trend_risk_managed: bool = True          # Scale trend signal by inverse volatility
     trend_vol_target: float = 0.15           # Target annual volatility for scaling
@@ -472,7 +475,7 @@ class SelectionConfig:
     top_n: int = 15                          # Number of stocks to hold
     momentum_lookback: int = 252             # 12-month momentum window
     momentum_skip: int = 21                  # Skip last month (reversal effect)
-    min_bars: int = 126                      # Need 126+ bars (6 months) for ranking
+    min_bars: int = 63                       # P3: Fast-track new listings — 63 bars (3 months) min
     sma_alignment_required: bool = True      # Only select stocks in uptrend
     sector_max_pct: float = 0.50             # Max 50% in any single sector
     volatility_cap_percentile: float = 95.0  # Exclude top 5% most volatile
@@ -1117,6 +1120,15 @@ class RLAlphaAdapter(BaseAlpha):
         # mu: Expected direction weighted by policy probabilities
         mu_raw = float(np.dot(probs, self.ACTION_RETURN_MAP))
         mu = mu_raw * self.acfg.rl_logit_to_mu_scale
+
+        # P4: Bull-regime gate — prevent RL from shorting fully bull-aligned stocks
+        # When P > SMA50 > SMA100 > SMA200, the RL's HALF_SHORT bias is counter-productive
+        if closes is not None and len(closes) >= 200 and self.acfg.bull_regime_gate:
+            sma50_rl = float(np.mean(closes[-50:]))
+            sma100_rl = float(np.mean(closes[-100:]))
+            sma200_rl = float(np.mean(closes[-200:]))
+            if float(closes[-1]) > sma50_rl > sma100_rl > sma200_rl:
+                mu = max(0.0, mu)  # Floor to 0: no short signal in full bull regime
 
         # sigma: From risk head (forward vol estimate) or entropy-based
         if self.acfg.rl_risk_head_to_sigma and risk_est > 0:
@@ -5702,6 +5714,14 @@ class InstitutionalPipeline:
         self.use_v8_sizing = False
         self._v8_rank = {}        # symbol -> rank_index (0 = best)
         self._current_symbol = None  # Set per-symbol in eval loop
+        # Fix B: Sticky-max — consecutive bars above SMA200 per symbol
+        # Floors position: 21+ bars → ≥1.0x;  63+ bars → ≥1.25x
+        self._bull_hold_count: dict = {}  # symbol -> int
+        # Fix C: Anti-churn — minimum holding period between position changes
+        # Prevents the whipsaw pattern that destroys value in cyclical/defensive stocks
+        # Energy/Healthcare/Staples trade 15-29 times in 3.5 yrs → mostly losers
+        self._last_trade_bar: dict = {}   # symbol -> bar_idx of last position change
+        self._last_pos: dict = {}         # symbol -> last committed position
 
         # Diagnostics
         self._step_count = 0
@@ -5952,9 +5972,10 @@ class InstitutionalPipeline:
                         base_pos = 0.90
                         sma_reason = "sma=v8_bull_aligned"
                     elif sma_100 is not None and sma_50 > sma_100:
-                        # Iter 9: raise from 0.70→0.80 so it snaps to 1.0 (not 0.5)
-                        # golden_cross 0.70 < midpoint(0.5,1.0)=0.75 → was snapping to 0.5 same as above_200!
-                        base_pos = 0.80
+                        # Fix A: raise from 0.80→0.92 so golden_cross snaps to 1.5 (not 1.25) for top-ranked stocks
+                        # 0.92 × rank_mult(1.5) = 1.38 ≥ midpoint(1.25,1.5)=1.375 → snaps to 1.5 ✓
+                        # Old 0.80 × 1.5 = 1.20 < 1.375 → was stuck at 1.25 (NVDA: 67 bars, -$28k vs always-1.5)
+                        base_pos = 0.92
                         sma_reason = "sma=v8_golden_cross"
                     else:
                         base_pos = 0.50
@@ -5963,10 +5984,10 @@ class InstitutionalPipeline:
                     base_pos = sma_position  # partial/minimal: keep v7.0 value
                 # Step 2: distance-from-SMA200 boost
                 trend_boost = 1.0
+                dist_pct = 0.0  # P1: track for dynamic cap
                 if sma_200 is not None and sma_200 > 0:
                     dist_pct = (current_price / sma_200) - 1.0
                     # Iter 9: raise ceiling 0.30→0.60: stocks ≥50% above SMA200 → trend_boost=1.60
-                    # 0.90 × 1.60 = 1.44 > midpoint(1.25,1.50)=1.375 → snaps to 1.50 (50% leverage)
                     trend_boost = 1.0 + min(max(dist_pct - 0.10, 0.0) * 1.5, 0.60)
                 # Step 3: rank multiplier — only when a rank map is available
                 # Iter 7: widen range from 0.75-1.00 → 0.50-1.50 to differentiate top vs bottom stocks
@@ -5976,10 +5997,60 @@ class InstitutionalPipeline:
                     if rank_idx >= 0:
                         n_selected = max(len(self._v8_rank), 1)
                         rank_mult = 0.50 + 1.00 * (1.0 - rank_idx / n_selected)
-                # Iter 7: raise cap from 1.0 → 1.50 (moderate leverage for top bull-aligned stocks)
-                sma_position = min(base_pos * trend_boost * rank_mult, 1.50)
+                # P1: Dynamic cap — grows from 1.50 to 3.00 for mega-momentum stocks
+                # 50%+ above SMA200 → still 1.50; 200%+ above → cap reaches 3.00
+                dynamic_cap = 1.50 + min(max(dist_pct - 0.50, 0.0) * 1.0, 1.50)
+                sma_position = min(base_pos * trend_boost * rank_mult, dynamic_cap)
+                # P5: Parabolic tier — extra multiplier for sustained 3-month momentum
+                # Trigger: fully bull-aligned + 3-month return > 20% + top-half rank
+                if (sma_200 is not None and current_price > sma_50 > sma_100 > sma_200
+                        and len(_sma_closes) >= 64 and rank_mult >= 1.0):
+                    m3_return = float(_sma_closes[-1] / _sma_closes[-64]) - 1.0
+                    if m3_return > 0.20:
+                        para_mult = 1.0 + min((m3_return - 0.20) * 1.5, 0.50)
+                        sma_position = min(sma_position * para_mult, dynamic_cap)
+                        sma_reason = sma_reason + f"(para×{para_mult:.2f})"
+                # Fix B: Sticky-max position lock
+                # Track consecutive bars above SMA200; floor position for sustained uptrends
+                # Prevents position from collapsing on SMA50/100 noise during major bull runs
+                _sym = self._current_symbol
+                if sma_200 is not None and current_price > sma_200:
+                    self._bull_hold_count[_sym] = self._bull_hold_count.get(_sym, 0) + 1
+                else:
+                    self._bull_hold_count[_sym] = 0  # reset on SMA200 breach
+                _hold = self._bull_hold_count.get(_sym, 0)
+                if _hold >= 63:
+                    # 3+ months above SMA200 → floor at 1.25x (major bull market)
+                    if sma_position < 1.25:
+                        sma_position = 1.25
+                        sma_reason = sma_reason + f"(sticky≥1.25,{_hold}d)"
+                elif _hold >= 21:
+                    # 1+ month above SMA200 → floor at 1.0x (confirmed trend)
+                    if sma_position < 1.0:
+                        sma_position = 1.0
+                        sma_reason = sma_reason + f"(sticky≥1.0,{_hold}d)"
                 sma_reason = f"{sma_reason}({sma_position:+.2f})"
 
+
+            # Fix C: Anti-churn minimum holding period
+            # Problem: energy/healthcare/staples whipsaw 15-29 times → avg loser
+            # Solution: freeze position for 21 bars after any significant change (≥0.25x)
+            # Diagnostic: corr(trades, pnl) = -0.049; 16+ trade bucket → 41% negative rate
+            _MIN_HOLD = 21  # bars (~1 month) between position changes
+            _sym_c = self._current_symbol
+            if _sym_c and self.use_v8_sizing:
+                _last_bar = self._last_trade_bar.get(_sym_c, -999)
+                _last_p = self._last_pos.get(_sym_c, 0.0)
+                _bars_since_trade = bar_idx - _last_bar
+                _pos_change = abs(sma_position - _last_p)
+                if _pos_change >= 0.25 and _bars_since_trade < _MIN_HOLD:
+                    # Still within cooldown — freeze at last committed position
+                    sma_position = _last_p
+                    sma_reason = sma_reason + f"(churn_lock,{_bars_since_trade}d)"
+                elif _pos_change >= 0.25:
+                    # Significant change allowed — record the trade bar
+                    self._last_trade_bar[_sym_c] = bar_idx
+                    self._last_pos[_sym_c] = sma_position
 
             # Override L3's target with SMA-based position
             order.target_exposure = sma_position
@@ -6308,10 +6379,11 @@ def build_default_pipeline(acfg: ArchitectureConfig = None,
     # NEW ALPHAS: Tested on MSFT, IC validated
     # Import from alphago_new_alphas.py (with signal inversions applied)
     try:
-        from alphago_new_alphas import VolTermStructureAlpha, VolumePriceDivergenceAlpha
+        from alphago_new_alphas import VolTermStructureAlpha, VolumePriceDivergenceAlpha, BreakoutAlpha
         pipeline.register_alpha(VolTermStructureAlpha(acfg))  # IC +0.0326 (inverted)
         pipeline.register_alpha(VolumePriceDivergenceAlpha(acfg))  # IC +0.0033 (inverted)
-        print("[INFO] Loaded VolTermStructureAlpha and VolumePriceDivergenceAlpha")
+        pipeline.register_alpha(BreakoutAlpha(acfg))  # P2: 52-week high breakout w/ volume confirmation
+        print("[INFO] Loaded VolTermStructureAlpha, VolumePriceDivergenceAlpha, and BreakoutAlpha")
     except ImportError as e:
         print(f"[WARNING] Could not load new alphas from alphago_new_alphas.py: {e}")
     except Exception as e:
