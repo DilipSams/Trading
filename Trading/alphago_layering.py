@@ -3723,18 +3723,54 @@ def main():
         hbar_chart(_sym_pnls, title=f"Per-Symbol Trade P&L ({_chart_ver})")
 
     # (b) Sector performance horizontal bars (green/red)
+    # BUG FIX: Norgate symbols have _1d suffix (e.g. "AAPL_1d") but SECTOR_MAP uses
+    # plain symbols ("AAPL"). Build a reverse lookup so both formats match.
     if _chart_per_sym:
+        _bare_to_key = {}
+        for _k in _chart_per_sym:
+            _bare = _k.split('_')[0] if '_' in _k else _k
+            _bare_to_key[_bare] = _k
+
         _sector_pnls = []
+        _sector_table_rows = []   # for the text table below the chart
         for sector, tickers in SECTOR_MAP.items():
-            total = sum(
-                _chart_per_sym.get(t, {}).get('pnl', 0) - _chart_per_sym.get(t, {}).get('cash_yield_pnl', 0)
-                for t in tickers if t in _chart_per_sym
-            )
-            if total != 0:
-                _sector_pnls.append((sector.replace("_", " ").title(), total))
+            _sec_stocks = 0
+            _sec_winners = 0
+            _sec_total_pnl = 0.0
+            for t in tickers:
+                _key = _bare_to_key.get(t, t)
+                if _key not in _chart_per_sym:
+                    continue
+                _sd = _chart_per_sym[_key]
+                _trade_pnl = _sd.get('pnl', 0) - _sd.get('cash_yield_pnl', 0)
+                _sec_total_pnl += _trade_pnl
+                _sec_stocks += 1
+                if _trade_pnl > 0:
+                    _sec_winners += 1
+            if _sec_stocks > 0:
+                _sector_table_rows.append((
+                    sector.replace("_", " ").title(),
+                    _sec_total_pnl,
+                    _sec_stocks,
+                    _sec_winners,
+                ))
+            if _sec_total_pnl != 0:
+                _sector_pnls.append((sector.replace("_", " ").title(), _sec_total_pnl))
+
         if _sector_pnls:
             _sector_pnls.sort(key=lambda x: x[1], reverse=True)
             hbar_chart(_sector_pnls, title=f"Sector Performance ({_chart_ver})")
+
+        # Also print a concise text table so it's visible even in CI / log files
+        if _sector_table_rows:
+            _sector_table_rows.sort(key=lambda x: x[1], reverse=True)
+            print(f"\n    {'Sector':<26s} {'P&L':>12s}  {'Stocks':>6s}  {'Win%':>6s}")
+            print(f"    {'─'*26}  {'─'*12}  {'─'*6}  {'─'*6}")
+            for _sname, _spnl, _sn, _sw in _sector_table_rows:
+                _pnl_c = C.GREEN if _spnl >= 0 else C.RED
+                _wr_str = f"{_sw / _sn:.0%}" if _sn > 0 else " N/A"
+                print(f"    {_sname:<26s}  {_pnl_c}${_spnl:>+11,.0f}{C.RESET}  {_sn:>6d}  {_wr_str:>6s}")
+            print(f"    {'─'*26}  {'─'*12}  {'─'*6}  {'─'*6}")
 
     # (c) Cumulative % return chart — per-symbol equity summation
     # Build per-symbol equity curves, sum them, convert to cumulative %.
