@@ -4996,6 +4996,103 @@ SECTOR_MAP = {
     "telecom":       ["T","VZ","TMUS","CMCSA"],
 }
 
+# v9.0: Mid-Cap "Rising Stars" universe — stocks in the $500M–$10B range.
+# These are candidates for the mid-cap → large-cap graduation that drives multibagger returns.
+# Organized by sector to mirror SECTOR_MAP. Review quarterly as market caps shift.
+#
+# Market cap tiers (for reference):
+#   Mega:  >$200B   (AAPL, NVDA, MSFT)
+#   Large: $10B–200B (S&P 500)  ← DEFAULT_SYMBOLS universe
+#   Mid:   $2B–10B  (S&P MidCap 400) ← THIS LIST (multibagger sweet spot)
+#   Small: $300M–2B (Russell 2000)
+#   Micro: $50M–300M
+#
+# Proxy filter (no market cap in Norgate): use --min-dollar-volume 20000000 ($20M/day)
+# to ensure institutional-grade liquidity before selection.
+#
+# Note: Some names may have graduated to large-cap. StockSelector's composite score
+# naturally filters weak names — this list only defines the eligible universe.
+MID_CAP_SYMBOLS = [
+    # --- Technology mid-caps ---
+    "DUOL",   # Duolingo AI edtech
+    "MNDY",   # Monday.com work OS
+    "GTLB",   # GitLab DevSecOps
+    "BILL",   # Bill.com SMB finance
+    "ZI",     # ZoomInfo B2B data
+    "SEMR",   # Semrush digital marketing
+    "TOST",   # Toast restaurant tech
+    "SMAR",   # Smartsheet work management
+    "TASK",   # TaskUs BPO/AI services
+    "AEHR",   # Aehr Test Systems semiconductor testing
+    "PLAB",   # Photronics photomasks
+    "SKYT",   # SkyWater Technology (quantum/AI chips)
+    "CLFD",   # Clearfield fiber optics
+    "SMTC",   # Semtech IoT semiconductors
+    "AMBA",   # Ambarella AI vision chips
+    "ACLS",   # Axcelis Technologies ion implant equipment
+    "FORM",   # FormFactor semiconductor test
+    "RIOT",   # Riot Platforms Bitcoin mining/data center
+    "IREN",   # Iris Energy AI data center + Bitcoin
+
+    # --- Industrials / Infrastructure mid-caps ---
+    "KNF",    # Knife River aggregates (recent spin-off)
+    "PLPC",   # Preformed Line Products grid infrastructure
+    "DY",     # Dycom Industries utility contractor
+    "NVT",    # nVent Electric enclosures
+    "CSWI",   # CSW Industrials HVAC/plumbing products
+    "AWI",    # Armstrong World Industries ceilings
+    "GMS",    # GMS building products
+    "IBP",    # Installed Building Products insulation
+    "IESC",   # IEC Electronics specialty manufacturing
+    "ROAD",   # Construction Partners paving/road-building
+    "KTOS",   # Kratos Defense autonomous systems
+
+    # --- Energy / Cleantech mid-caps ---
+    "ARRY",   # Array Technologies utility-scale solar trackers
+    "SHLS",   # Shoals Technologies solar balance-of-system
+    "ENVX",   # Enovix next-gen silicon batteries
+    "BE",     # Bloom Energy solid-oxide fuel cells
+    "RUN",    # Sunrun residential solar
+    "CWEN",   # Clearway Energy wind/solar yieldco
+    "GPRE",   # Green Plains ethanol/clean fuel
+    "FLNC",   # Fluence Energy grid storage
+
+    # --- Healthcare mid-caps ---
+    "RXRX",   # Recursion Pharmaceuticals AI drug discovery
+    "CERT",   # Certara biosimulation / drug modeling
+    "HIMS",   # Hims & Hers telehealth / compounding pharmacy
+    "EXAS",   # Exact Sciences multi-cancer screening
+    "INSP",   # Inspire Medical neurostimulation for sleep apnea
+    "IRTC",   # iRhythm cardiac patch monitoring
+    "TMDX",   # TransMedics organ transport system
+    "NVCR",   # Novocure tumor treatment fields
+    "ACAD",   # ACADIA Pharmaceuticals CNS disorders
+    "PRAX",   # Praxis Precision neurology
+
+    # --- Financials mid-caps ---
+    "CWAN",   # Clearwater Analytics investment management SaaS
+    "RELY",   # Remitly global digital payments
+    "AFRM",   # Affirm BNPL (buy-now-pay-later)
+    "UPST",   # Upstart AI lending platform
+    "HOOD",   # Robinhood Markets retail brokerage
+    "SAIC",   # SAIC government IT services
+
+    # --- Consumer / Retail mid-caps ---
+    "CELH",   # Celsius Holdings functional energy drinks
+    "CAVA",   # CAVA Mediterranean fast casual
+    "BROS",   # Dutch Bros coffee drive-through
+    "WING",   # Wingstop fast casual franchising
+    "CHWY",   # Chewy pet e-commerce / telehealth
+    "DNUT",   # Krispy Kreme donut brands
+    "ONON",   # On Holding running performance
+
+    # --- Materials / Commodities mid-caps ---
+    "MP",     # MP Materials rare earth mining/processing
+    "MTRN",   # Materion specialty performance alloys
+    "CMC",    # Commercial Metals steel mini-mills
+    "RYI",    # Ryerson Tull metals distribution
+]
+
 YF_INTRADAY_MAX_PERIOD={"1m":"7d","2m":"60d","5m":"60d","15m":"60d","30m":"60d",
     "60m":"730d","1h":"730d","90m":"60d","1d":"max","5d":"max","1wk":"max","1mo":"max"}
 

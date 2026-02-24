@@ -74,6 +74,7 @@ try:
         print_box, print_divider, print_gpu_info, tprint, C, progress_bar,
         build_feature_matrix, compute_indicators,  # For RL observation construction
         hbar_chart, line_chart, dual_line_chart,  # Terminal charts
+        SymbolDataset,  # v9.0: used for constructing sector ETF datasets for RRG
     )
     HAS_BASE = True
 except ImportError as e:
@@ -2173,6 +2174,29 @@ Examples:
                    help="v8.0 Tier 3: boost composite scores for stocks in high-momentum sectors")
     g.add_argument("--sector-momentum-weight", type=float, default=0.10,
                    help="v8.0 Tier 3: max additive boost to composite score from sector momentum (default: 0.10)")
+    # v9.0: New scoring factors
+    g.add_argument("--volume-acc-weight", type=float, default=0.0,
+                   help="v9.0 Tier 4: weight for volume accumulation factor in composite score (default: 0, off). "
+                        "Measures fraction of volume on up-days (institutional accumulation signal).")
+    g.add_argument("--high52w-weight", type=float, default=0.0,
+                   help="v9.0 Tier 5: weight for 52-week high proximity in composite score (default: 0, off). "
+                        "Stocks near 52wk high = confirmed breakout territory.")
+    g.add_argument("--rrg-rotation", action="store_true",
+                   help="v9.0: use Relative Rotation Graph (RRG) quadrant scores for Tier 3 sector boost. "
+                        "Detects sector rotation from price-only data using sector ETFs vs SPY.")
+    g.add_argument("--rrg-fast", type=int, default=50,
+                   help="v9.0 RRG: fast EMA period in bars (default: 50 = ~10 trading weeks)")
+    g.add_argument("--rrg-slow", type=int, default=200,
+                   help="v9.0 RRG: slow EMA period in bars (default: 200 = ~40 trading weeks)")
+    g.add_argument("--sector-breadth-gate", action="store_true",
+                   help="v9.0: require >50%% of sector stocks above 50d SMA before allowing Tier 3 boost. "
+                        "Prevents narrow moves (1-2 large-caps dragging sector score).")
+    g.add_argument("--include-midcap", action="store_true",
+                   help="v9.0: include mid-cap 'Rising Stars' universe alongside large-cap 200-stock core. "
+                        "Adds ~70 mid-cap stocks ($2B-$10B); same selector filters out weak names.")
+    g.add_argument("--min-dollar-volume", type=float, default=0.0,
+                   help="v9.0: minimum average daily dollar volume in $ (e.g. 20000000 for $20M, default: off). "
+                        "Proxy for mid-cap liquidity gate — ensures institutional participation.")
     g.add_argument("--kill-loss", type=float, default=None,
                    help="Kill switch max portfolio loss fraction (default: ArchitectureConfig default=0.30)")
     g.add_argument("--skip-ablation", action="store_true",
@@ -2345,7 +2369,20 @@ def resolve_symbols(args):
         return [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     # Default: for v8.0, load full diversified universe; otherwise first n_symbols
     if getattr(args, 'version', 'v7') == 'v8':
-        return DEFAULT_SYMBOLS[:206]  # All 206 stocks across 11 sectors
+        base = DEFAULT_SYMBOLS[:206]  # All 206 stocks across 11 sectors
+        # v9.0: --include-midcap expands universe with Rising Stars (~70 additional symbols)
+        if getattr(args, 'include_midcap', False):
+            try:
+                from alphago_trading_system import MID_CAP_SYMBOLS
+                # De-duplicate: add only mid-cap symbols not already in the large-cap universe
+                base_set = set(base)
+                extra = [s for s in MID_CAP_SYMBOLS if s not in base_set]
+                tprint(f"  [Mid-Cap] Adding {len(extra)} Rising Stars to universe "
+                       f"(total: {len(base) + len(extra)} stocks)", "info")
+                return base + extra
+            except ImportError:
+                tprint("  [Mid-Cap] MID_CAP_SYMBOLS not found in alphago_trading_system.py", "warn")
+        return base
     return DEFAULT_SYMBOLS[:args.n_symbols]
 
 
@@ -2603,6 +2640,104 @@ def main():
             tprint(f"SPY data not found at {spy_path}, using cash benchmark", "warn")
     except Exception as e:
         tprint(f"Failed to load SPY benchmark: {e}, using cash benchmark", "warn")
+
+    # -- v9.0: Load sector ETFs for RRG + SPY dataset for RRG normalization --
+    _SECTOR_ETF_MAP = {
+        'technology': 'XLK', 'financials': 'XLF', 'healthcare': 'XLV',
+        'industrials': 'XLI', 'energy': 'XLE', 'consumer_discretionary': 'XLY',
+        'consumer_staples': 'XLP', 'materials': 'XLB', 'utilities': 'XLU',
+        'real_estate': 'XLRE', 'telecom': 'XLC',
+    }
+    sector_etf_datasets = {}
+    spy_dataset_for_rrg = None
+
+    if getattr(args, 'rrg_rotation', False):
+        _etf_dir = Path(NORGATE_DIR) / "US_Equities"
+        for _sector_name, _etf_sym in _SECTOR_ETF_MAP.items():
+            _etf_path = _etf_dir / f"{_etf_sym}.parquet"
+            if not _etf_path.exists():
+                tprint(f"  [RRG] {_etf_sym} not found in Norgate, skipping {_sector_name}", "warn")
+                continue
+            try:
+                _etf_df = pd.read_parquet(_etf_path)
+                # Normalize column names
+                _col_map = {}
+                for _c in _etf_df.columns:
+                    _cl = _c.lower().strip()
+                    if _cl == 'close' and 'unadj' not in _cl:
+                        _col_map[_c] = 'Close'
+                    elif _cl == 'high':
+                        _col_map[_c] = 'High'
+                    elif _cl == 'open':
+                        _col_map[_c] = 'Open'
+                    elif _cl == 'low':
+                        _col_map[_c] = 'Low'
+                    elif _cl == 'volume':
+                        _col_map[_c] = 'Volume'
+                _etf_df = _etf_df.rename(columns=_col_map)
+                if 'Close' not in _etf_df.columns:
+                    continue
+                _ec = _etf_df['Close'].values.astype(np.float32)
+                _eh = _etf_df['High'].values.astype(np.float32) if 'High' in _etf_df else _ec.copy()
+                _eo = _etf_df['Open'].values.astype(np.float32) if 'Open' in _etf_df else _ec.copy()
+                _el = _etf_df['Low'].values.astype(np.float32) if 'Low' in _etf_df else _ec.copy()
+                _ev = _etf_df['Volume'].values.astype(np.float32) if 'Volume' in _etf_df else np.zeros(len(_ec), dtype=np.float32)
+                _n = len(_ec)
+                _prices = np.column_stack([_eo, _eh, _el, _ec, _ev])
+                _ds = SymbolDataset(
+                    symbol=_etf_sym,
+                    features_train=np.zeros((0, 49), dtype=np.float32),
+                    features_val=np.zeros((0, 49), dtype=np.float32),
+                    features_test=np.zeros((0, 49), dtype=np.float32),
+                    prices_train=np.zeros((0, 5), dtype=np.float32),
+                    prices_val=np.zeros((0, 5), dtype=np.float32),
+                    prices_test=_prices,
+                    n_train=0, n_val=0, n_test=_n,
+                )
+                sector_etf_datasets[_sector_name] = _ds
+            except Exception as _e:
+                tprint(f"  [RRG] Failed to load {_etf_sym}: {_e}", "warn")
+        tprint(f"  [RRG] Loaded {len(sector_etf_datasets)}/11 sector ETFs", "info")
+
+        # SPY dataset for RRG (full OHLCV, not just returns dict)
+        _spy_path2 = Path(NORGATE_DIR) / "US_Equities" / "SPY.parquet"
+        if _spy_path2.exists():
+            try:
+                _spy_df2 = pd.read_parquet(_spy_path2)
+                _scol_map = {}
+                for _c in _spy_df2.columns:
+                    _cl = _c.lower().strip()
+                    if _cl == 'close' and 'unadj' not in _cl:
+                        _scol_map[_c] = 'Close'
+                    elif _cl == 'high':
+                        _scol_map[_c] = 'High'
+                    elif _cl == 'open':
+                        _scol_map[_c] = 'Open'
+                    elif _cl == 'low':
+                        _scol_map[_c] = 'Low'
+                    elif _cl == 'volume':
+                        _scol_map[_c] = 'Volume'
+                _spy_df2 = _spy_df2.rename(columns=_scol_map)
+                if 'Close' in _spy_df2.columns:
+                    _sc = _spy_df2['Close'].values.astype(np.float32)
+                    _sh = _spy_df2['High'].values.astype(np.float32) if 'High' in _spy_df2 else _sc.copy()
+                    _so = _spy_df2['Open'].values.astype(np.float32) if 'Open' in _spy_df2 else _sc.copy()
+                    _sl = _spy_df2['Low'].values.astype(np.float32) if 'Low' in _spy_df2 else _sc.copy()
+                    _sv = _spy_df2['Volume'].values.astype(np.float32) if 'Volume' in _spy_df2 else np.zeros(len(_sc), dtype=np.float32)
+                    _sn = len(_sc)
+                    spy_dataset_for_rrg = SymbolDataset(
+                        symbol='SPY',
+                        features_train=np.zeros((0, 49), dtype=np.float32),
+                        features_val=np.zeros((0, 49), dtype=np.float32),
+                        features_test=np.zeros((0, 49), dtype=np.float32),
+                        prices_train=np.zeros((0, 5), dtype=np.float32),
+                        prices_val=np.zeros((0, 5), dtype=np.float32),
+                        prices_test=np.column_stack([_so, _sh, _sl, _sc, _sv]),
+                        n_train=0, n_val=0, n_test=_sn,
+                    )
+                    tprint("  [RRG] SPY dataset loaded for RRG normalization", "ok")
+            except Exception as _e:
+                tprint(f"  [RRG] Failed to load SPY for RRG: {_e}", "warn")
 
     # -- L0 DATA QUALITY CHECKS --
     quality_results = []
@@ -2932,9 +3067,22 @@ def main():
         min_score_pct=args.min_score_pct,
         sector_momentum_gate=args.sector_momentum_gate,
         w_sector_momentum=args.sector_momentum_weight,
+        # v9.0 new fields:
+        w_volume_acc=getattr(args, 'volume_acc_weight', 0.0),
+        w_high52w=getattr(args, 'high52w_weight', 0.0),
+        use_rrg_rotation=getattr(args, 'rrg_rotation', False),
+        rrg_fast_period=getattr(args, 'rrg_fast', 50),
+        rrg_slow_period=getattr(args, 'rrg_slow', 200),
+        sector_breadth_gate=getattr(args, 'sector_breadth_gate', False),
+        min_dollar_volume=getattr(args, 'min_dollar_volume', 0.0),
     )
     selector = StockSelector(sel_cfg, SECTOR_MAP)
-    selected_datasets = selector.select(datasets, spy_returns_lookup)
+    selected_datasets = selector.select(
+        datasets,
+        spy_returns_lookup,
+        sector_etf_datasets=sector_etf_datasets if getattr(args, 'rrg_rotation', False) else None,
+        spy_dataset=spy_dataset_for_rrg if getattr(args, 'rrg_rotation', False) else None,
+    )
 
     if args.version == "v8":
         tprint(f"Selected {len(selected_datasets)} stocks from "
@@ -2946,10 +3094,15 @@ def main():
                 _comp_str = ""
                 for _s, _sc, _comp in _log['rankings']:
                     if _s == _sel_sym:
+                        _vol_acc_str = (f" vacc={_comp['vol_acc']:.0%}"
+                                        if 'vol_acc' in _comp and sel_cfg.w_volume_acc > 0 else "")
+                        _h52w_str = (f" h52w={_comp['high52w_proximity']:.0%}"
+                                     if 'high52w_proximity' in _comp and sel_cfg.w_high52w > 0 else "")
                         _comp_str = (f"mom={_comp['momentum']:+.1%} "
                                      f"sma={_comp['sma_score']}/3 "
                                      f"rs={_comp['rs_vs_spy']:+.1%} "
-                                     f"vol={_comp['vol_20']:.0%}")
+                                     f"vol={_comp['vol_20']:.0%}"
+                                     f"{_vol_acc_str}{_h52w_str}")
                         break
                 tprint(f"  {_sel_sym:<6s}: score={_sel_score:+.4f}  {_comp_str}", "info")
             _sec_alloc = _log.get('sector_allocation', {})
@@ -2960,12 +3113,56 @@ def main():
             if args.adaptive_n:
                 tprint(f"  Adaptive N: {_eff_n} stocks passed threshold "
                        f"(min_score_pct={args.min_score_pct:.0%} of top score)", "info")
-            # Tier 3: log top-3 sector momentum scores
+            # Tier 3: log top-3 sector momentum scores (v8 stock-avg mode)
             _sec_mom = _log.get('sector_momentum', {})
-            if _sec_mom:
+            if _sec_mom and not getattr(args, 'rrg_rotation', False):
                 _top3 = sorted(_sec_mom.items(), key=lambda x: -x[1])[:3]
                 tprint(f"  Sector momentum (top 3): " +
                        ", ".join(f"{s}={m:+.1%}" for s, m in _top3), "info")
+
+            # v9.0: RRG quadrant diagnostics
+            _rrg_meta = _log.get('rrg_metadata', {})
+            if _rrg_meta:
+                _qmap = {'leading': '[G]', 'improving': '[B]', 'weakening': '[Y]', 'lagging': '[R]'}
+                _quadrant_rows = sorted(_rrg_meta.items(), key=lambda x: -x[1]['score'])
+                tprint("  RRG Sector Quadrants:", "info")
+                for _sec, _data in _quadrant_rows:
+                    _icon = _qmap.get(_data['quadrant'], '[?]')
+                    tprint(f"    {_icon} {_sec:<24} {_data['quadrant']:<10} "
+                           f"RS_ratio={_data['rs_ratio']:+.1f}  RS_mom={_data['rs_momentum']:+.1f}",
+                           "info")
+
+            # v9.0: Multi-TF RS diagnostics
+            _mtf = _log.get('multitf_metadata', {})
+            if _mtf:
+                tprint("  Sector Multi-TF RS vs SPY (1m / 3m / 6m / 12m):", "info")
+                _mtf_sorted = sorted(_mtf.items(),
+                                     key=lambda x: -x[1].get('rs_score_norm', 0))
+                for _sec, _v in _mtf_sorted[:6]:
+                    _accel_flag = "(accel)" if _v.get('rs_accel', 0) > 0 else ""
+                    tprint(f"    {_sec:<24} "
+                           f"{_v['rs_1m']:+.1%} / {_v['rs_3m']:+.1%} / "
+                           f"{_v['rs_6m']:+.1%} / {_v['rs_12m']:+.1%}  "
+                           f"accel={_v['rs_accel']:+.1%} {_accel_flag}",
+                           "info")
+
+            # v9.0: Sector breadth diagnostics
+            _breadth = _log.get('sector_breadth', {})
+            if _breadth:
+                _top_breadth = sorted(_breadth.items(), key=lambda x: -x[1])[:5]
+                tprint("  Sector breadth (% stocks > 50d SMA): " +
+                       ", ".join(f"{s}={b:.0%}" for s, b in _top_breadth), "info")
+
+            # v9.0: Rising Stars (mid-cap names selected)
+            try:
+                from alphago_trading_system import MID_CAP_SYMBOLS as _MCS
+                _midcap_set = set(_MCS)
+                _rising = [_s for _s in _log['selected']
+                           if (_s.split('_')[0] if '_' in _s else _s) in _midcap_set]
+                if _rising:
+                    tprint(f"  Rising Stars selected: {', '.join(_rising)}", "info")
+            except ImportError:
+                pass
 
     # Build rank map
     _v8_rank = {}

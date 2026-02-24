@@ -489,6 +489,191 @@ class SelectionConfig:
     w_rs: float = 0.30
     w_invvol: float = 0.05
 
+    # --- v9.0: Individual stock scoring factors ---
+    w_volume_acc: float = 0.00       # Tier 4: volume accumulation weight (0=off)
+    w_high52w: float = 0.00          # Tier 5: 52-week high proximity weight (0=off)
+
+    # --- v9.0: RRG sector rotation detection ---
+    use_rrg_rotation: bool = False   # Replace Tier 3 stock-avg with RRG ETF-based signal
+    rrg_fast_period: int = 50        # RRG RS-ratio EMA period in bars (~10 weeks)
+    rrg_slow_period: int = 200       # RRG RS-momentum EMA period in bars (~40 weeks)
+    sector_breadth_gate: bool = False  # Require >50% of sector stocks above 50d SMA
+
+    # --- v9.0: Mid-cap liquidity gate ---
+    min_dollar_volume: float = 0.0   # Min avg daily dollar vol (0=off; 20_000_000=$20M)
+
+
+class SectorRotationDetector:
+    """
+    v9.0: Relative Rotation Graph (RRG) sector rotation detector.
+
+    Computes RS-Ratio and RS-Momentum for each sector ETF vs. benchmark (SPY).
+    Classifies each sector into one of 4 rotation quadrants:
+
+      Leading   (RS>100, Mom>100): sector outperforming AND accelerating  → score 1.00
+      Improving (RS<100, Mom>100): sector not yet leading but gaining     → score 0.85 ← EARLY SIGNAL
+      Weakening (RS>100, Mom<100): sector leading but losing momentum     → score 0.30
+      Lagging   (RS<100, Mom<100): both below benchmark                   → score 0.00
+
+    "Improving" is the best ENTRY signal — the sector is turning before consensus knows it.
+    All computation uses only OHLCV close prices (no external data needed).
+    """
+
+    QUADRANT_SCORES = {
+        'leading':   1.00,
+        'improving': 0.85,
+        'weakening': 0.30,
+        'lagging':   0.00,
+    }
+
+    SECTOR_ETF_MAP = {
+        'technology':             'XLK',
+        'financials':             'XLF',
+        'healthcare':             'XLV',
+        'industrials':            'XLI',
+        'energy':                 'XLE',
+        'consumer_discretionary': 'XLY',
+        'consumer_staples':       'XLP',
+        'materials':              'XLB',
+        'utilities':              'XLU',
+        'real_estate':            'XLRE',
+        'telecom':                'XLC',
+    }
+
+    def __init__(self, fast_period: int = 50, slow_period: int = 200):
+        self.fast_period = fast_period
+        self.slow_period = slow_period
+
+    def _ema(self, series: np.ndarray, period: int) -> np.ndarray:
+        """EMA with standard smoothing factor alpha = 2/(period+1)."""
+        alpha = 2.0 / (period + 1)
+        ema = np.empty_like(series)
+        ema[0] = series[0]
+        for i in range(1, len(series)):
+            ema[i] = alpha * series[i] + (1 - alpha) * ema[i - 1]
+        return ema
+
+    def compute_rrg_scores(self, sector_etf_datasets: dict, spy_dataset) -> dict:
+        """
+        Compute RRG quadrant scores for each sector ETF vs SPY.
+
+        Returns: dict sector_name -> {quadrant, score, rs_ratio, rs_momentum}
+        """
+        if spy_dataset is None or spy_dataset.prices_test is None:
+            return {}
+
+        spy_closes = spy_dataset.prices_test[:, 3]
+        results = {}
+
+        for sector, etf_ds in sector_etf_datasets.items():
+            if etf_ds is None or etf_ds.prices_test is None:
+                continue
+            etf_closes = etf_ds.prices_test[:, 3]
+
+            n = min(len(spy_closes), len(etf_closes))
+            if n < self.slow_period + 10:
+                continue
+
+            spy_c = spy_closes[-n:]
+            etf_c = etf_closes[-n:]
+
+            # Raw RS: sector price / benchmark price
+            raw_rs = etf_c / (spy_c + 1e-12)
+
+            # RS-Ratio: normalize raw RS to 100 via EMA(fast)
+            ema_fast = self._ema(raw_rs, self.fast_period)
+            rs_ratio = (raw_rs / (ema_fast + 1e-12)) * 100.0
+
+            # RS-Momentum: EMA(RS-Ratio) relative to its own EMA(slow)
+            ema_slow = self._ema(rs_ratio, self.slow_period)
+            rs_momentum = (rs_ratio / (ema_slow + 1e-12)) * 100.0
+
+            cur_rs_ratio = float(rs_ratio[-1])
+            cur_rs_momentum = float(rs_momentum[-1])
+
+            if cur_rs_ratio >= 100 and cur_rs_momentum >= 100:
+                quadrant = 'leading'
+            elif cur_rs_ratio < 100 and cur_rs_momentum >= 100:
+                quadrant = 'improving'
+            elif cur_rs_ratio >= 100 and cur_rs_momentum < 100:
+                quadrant = 'weakening'
+            else:
+                quadrant = 'lagging'
+
+            results[sector] = {
+                'quadrant': quadrant,
+                'score': self.QUADRANT_SCORES[quadrant],
+                'rs_ratio': cur_rs_ratio,
+                'rs_momentum': cur_rs_momentum,
+            }
+
+        return results
+
+    def compute_multitf_rs(self, sector_etf_datasets: dict, spy_dataset) -> dict:
+        """
+        Multi-timeframe RS: compute sector ETF excess return vs SPY at 4 windows.
+
+        Returns per sector:
+          rs_1m, rs_3m, rs_6m, rs_12m  — excess return vs SPY at each horizon
+          rs_accel                      — rs_1m minus rs_3m (positive = accelerating)
+          rs_score_raw                  — weighted composite (short-term biased)
+          rs_score_norm                 — normalized to [0,1] relative to best sector
+        """
+        if spy_dataset is None or spy_dataset.prices_test is None:
+            return {}
+
+        spy_c = spy_dataset.prices_test[:, 3]
+        windows = {'rs_1m': 21, 'rs_3m': 63, 'rs_6m': 126, 'rs_12m': 252}
+        results = {}
+
+        for sector, etf_ds in sector_etf_datasets.items():
+            if etf_ds is None or etf_ds.prices_test is None:
+                continue
+            etf_c = etf_ds.prices_test[:, 3]
+            n = min(len(spy_c), len(etf_c))
+            if n < 252:
+                continue
+
+            spy_aligned = spy_c[-n:]
+            etf_aligned = etf_c[-n:]
+
+            rs_vals = {}
+            for label, w in windows.items():
+                if n < w + 1 or spy_aligned[-w] <= 0 or etf_aligned[-w] <= 0:
+                    rs_vals[label] = 0.0
+                    continue
+                etf_ret = (etf_aligned[-1] / etf_aligned[-w]) - 1.0
+                spy_ret = (spy_aligned[-1] / spy_aligned[-w]) - 1.0
+                rs_vals[label] = etf_ret - spy_ret
+
+            rs_accel = rs_vals['rs_1m'] - rs_vals['rs_3m']
+
+            # Weighted composite: short-term biased
+            rs_score_raw = (
+                0.40 * rs_vals['rs_1m']
+                + 0.30 * rs_vals['rs_3m']
+                + 0.20 * rs_vals['rs_6m']
+                + 0.10 * rs_vals['rs_12m']
+            )
+
+            results[sector] = {
+                **rs_vals,
+                'rs_accel': rs_accel,
+                'rs_score_raw': rs_score_raw,
+            }
+
+        # Normalize rs_score_raw to [0, 1]
+        if results:
+            all_scores = [v['rs_score_raw'] for v in results.values()]
+            min_s, max_s = min(all_scores), max(all_scores)
+            rng = max_s - min_s if max_s > min_s else 1.0
+            for sector in results:
+                results[sector]['rs_score_norm'] = (
+                    results[sector]['rs_score_raw'] - min_s
+                ) / rng
+
+        return results
+
 
 class StockSelector:
     """
@@ -528,6 +713,28 @@ class StockSelector:
             sector = self.sym_to_sector.get(bare_sym, 'other')
             sector_returns.setdefault(sector, []).append(ret)
         return {s: float(np.mean(rets)) for s, rets in sector_returns.items() if rets}
+
+    def _compute_sector_breadth(self, datasets) -> dict:
+        """
+        v9.0 Sector Breadth Gate: fraction of stocks in each sector above their 50d SMA.
+
+        Returns: dict sector_name -> float in [0.0, 1.0]
+        A breadth of 0.7 means 70% of sector stocks are in uptrend.
+        Used to filter out narrow moves driven by 1-2 large-caps.
+        """
+        sector_above = {}
+        for d in datasets:
+            if not hasattr(d, 'prices_test') or d.prices_test is None:
+                continue
+            closes = d.prices_test[:, 3]
+            if len(closes) < 50:
+                continue
+            sma50 = float(np.mean(closes[-50:]))
+            above = float(closes[-1]) > sma50
+            bare_sym = d.symbol.split('_')[0] if '_' in d.symbol else d.symbol
+            sector = self.sym_to_sector.get(bare_sym, 'other')
+            sector_above.setdefault(sector, []).append(above)
+        return {s: float(np.mean(flags)) for s, flags in sector_above.items() if flags}
 
     def rank_universe(self, datasets, spy_returns_lookup=None, sector_momentum=None):
         """
@@ -622,25 +829,71 @@ class StockSelector:
             if vol_20 > vol_cap:
                 continue  # Too volatile, skip
 
+            closes = d.prices_test[:, 3]
+
+            # --- v9.0 Dollar Volume Filter (mid-cap liquidity gate) ---
+            if self.cfg.min_dollar_volume > 0 and d.prices_test.shape[1] > 4:
+                volumes_20 = d.prices_test[-20:, 4]
+                avg_dollar_vol = float(np.mean(volumes_20 * closes[-20:]))
+                if avg_dollar_vol < self.cfg.min_dollar_volume:
+                    continue  # Too illiquid — skip
+
             inv_vol = 1.0 / max(vol_20, 0.01)
 
-            # --- Composite Score ---
+            # --- v9.0 Tier 4: Volume Accumulation Ratio ---
+            # Fraction of total volume on up-days over last 63 bars.
+            # >60% = institutional accumulation. Centered at 0: (vol_acc - 0.5) * 2
+            vol_acc = 0.5  # neutral default
+            if self.cfg.w_volume_acc > 0 and d.prices_test.shape[1] > 4:
+                volumes = d.prices_test[-63:, 4]
+                closes_63 = closes[-63:]
+                if len(volumes) >= 2 and np.sum(volumes) > 0:
+                    up_mask = np.diff(closes_63) > 0
+                    up_days_vol = volumes[1:][up_mask]
+                    total_vol = np.sum(volumes[1:])
+                    if total_vol > 0:
+                        vol_acc = float(np.sum(up_days_vol) / total_vol)
+                        vol_acc = max(0.0, min(1.0, vol_acc))
+
+            # --- v9.0 Tier 5: 52-Week High Proximity ---
+            # 1.0 = stock AT 52-week high (confirmed breakout). 0.0 = far below high.
+            high52w_proximity = 0.0
+            if self.cfg.w_high52w > 0 and d.prices_test.shape[1] > 1:
+                bars_252 = min(len(closes), 252)
+                high52w = float(np.max(d.prices_test[-bars_252:, 1]))  # col 1 = High
+                if high52w > 0:
+                    high52w_proximity = max(0.0, 1.0 - (high52w - float(closes[-1])) / high52w)
+
+            # --- Composite Score with weight normalization ---
+            # When v9.0 factors are active, normalize so total weight always sums to 1.0.
+            total_w = (self.cfg.w_momentum + self.cfg.w_trend + self.cfg.w_rs
+                       + self.cfg.w_invvol + self.cfg.w_volume_acc + self.cfg.w_high52w)
+            if total_w <= 0:
+                total_w = 1.0
+
             score = (
-                self.cfg.w_momentum * momentum
-                + self.cfg.w_trend * (sma_score / 3.0)
-                + self.cfg.w_rs * rs_vs_spy
-                + self.cfg.w_invvol * (inv_vol / 100.0)  # Normalize inv_vol
+                (self.cfg.w_momentum  / total_w) * momentum
+                + (self.cfg.w_trend   / total_w) * (sma_score / 3.0)
+                + (self.cfg.w_rs      / total_w) * rs_vs_spy
+                + (self.cfg.w_invvol  / total_w) * (inv_vol / 100.0)
+                + (self.cfg.w_volume_acc / total_w) * (vol_acc - 0.5) * 2.0
+                + (self.cfg.w_high52w / total_w) * high52w_proximity
             )
 
             # --- Tier 3: Sector Momentum Boost ---
             # Stocks in the hottest sector get +w_sector_momentum; proportional for others.
             # Negative-momentum sectors get 0 boost (no penalty — still rankable on own merit).
-            # Note: _sec_max_mom is pre-computed before this loop (see below).
-            if _sec_max_mom > 0 and sector_momentum:
+            # When use_rrg_rotation=True, sector_momentum is already in [0,1] — skip max normalization.
+            if sector_momentum:
                 bare_sym = d.symbol.split('_')[0] if '_' in d.symbol else d.symbol
                 sec = self.sym_to_sector.get(bare_sym, 'other')
                 sec_mom = sector_momentum.get(sec, 0.0)
-                relative_boost = max(0.0, sec_mom / _sec_max_mom)  # 0.0–1.0
+                if _sec_max_mom > 0 and not self.cfg.use_rrg_rotation:
+                    relative_boost = max(0.0, sec_mom / _sec_max_mom)
+                elif self.cfg.use_rrg_rotation:
+                    relative_boost = max(0.0, min(1.0, sec_mom))  # already [0,1]
+                else:
+                    relative_boost = 0.0
                 score += self.cfg.w_sector_momentum * relative_boost
 
             rankings.append((d.symbol, score, {
@@ -648,28 +901,76 @@ class StockSelector:
                 'sma_score': sma_score,
                 'rs_vs_spy': rs_vs_spy,
                 'vol_20': vol_20,
+                'vol_acc': vol_acc,
+                'high52w_proximity': high52w_proximity,
             }))
 
         # Sort by composite score (descending)
         rankings.sort(key=lambda x: x[1], reverse=True)
         return rankings
 
-    def select(self, datasets, spy_returns_lookup=None):
+    def select(self, datasets, spy_returns_lookup=None,
+               sector_etf_datasets=None, spy_dataset=None):
         """
-        Select stocks: Tier 3 sector boost → rank → Tier 2 adaptive N → no sector cap.
+        Select stocks: Tier 3/RRG sector boost → rank → Tier 2 adaptive N → no sector cap.
 
         Flow:
-          1. Tier 3 (if enabled): compute sector momentum, pass to rank_universe() as boost
-          2. rank_universe(): score and sort all stocks (with optional sector boost)
-          3. Tier 2 (if enabled): compute effective ceiling from score threshold
-          4. Greedy selection: pick top stocks up to effective_ceiling, no sector cap
+          1. Tier 3 (if enabled):
+             a. use_rrg_rotation=True  → RRG ETF-based quadrant scores (v9.0, leading-edge signal)
+             b. use_rrg_rotation=False → mean 6-month stock return per sector (v8.0 default)
+          2. Sector breadth gate (if enabled): exclude sectors where <50% stocks above 50d SMA
+          3. rank_universe(): score and sort all stocks (with optional sector boost)
+          4. Tier 2 (if enabled): compute effective ceiling from score threshold
+          5. Greedy selection: pick top stocks up to effective_ceiling, no sector cap
+
+        Args:
+          sector_etf_datasets: dict sector_name -> SymbolDataset (required for RRG mode)
+          spy_dataset:          SymbolDataset for SPY (required for RRG mode)
         """
-        # Tier 3: compute sector momentum before ranking so it can boost scores
         sector_momentum = None
+        rrg_metadata = {}
+        multitf_metadata = {}
+
         if self.cfg.sector_momentum_gate:
-            sector_momentum = self._compute_sector_momentum(datasets)
+            if self.cfg.use_rrg_rotation and sector_etf_datasets:
+                # v9.0: RRG ETF-based sector rotation — compute quadrant + multi-TF RS
+                rrg_detector = SectorRotationDetector(
+                    fast_period=self.cfg.rrg_fast_period,
+                    slow_period=self.cfg.rrg_slow_period,
+                )
+                rrg_full = rrg_detector.compute_rrg_scores(sector_etf_datasets, spy_dataset)
+                rrg_metadata = rrg_full
+
+                # Multi-TF RS: blend 60% RRG quadrant score + 40% normalized RS score
+                multitf = rrg_detector.compute_multitf_rs(sector_etf_datasets, spy_dataset)
+                multitf_metadata = multitf
+
+                sector_momentum = {}
+                for s, v in rrg_full.items():
+                    rrg_score = v['score']
+                    rs_norm = multitf.get(s, {}).get('rs_score_norm', rrg_score)
+                    sector_momentum[s] = 0.60 * rrg_score + 0.40 * rs_norm
+            else:
+                # v8.0 default: stock-average sector momentum
+                sector_momentum = self._compute_sector_momentum(datasets)
+
+        # v9.0 Sector Breadth Gate: pre-compute per-sector % stocks above 50d SMA
+        sector_breadth = {}
+        if self.cfg.sector_breadth_gate:
+            sector_breadth = self._compute_sector_breadth(datasets)
 
         rankings = self.rank_universe(datasets, spy_returns_lookup, sector_momentum)
+
+        # Breadth gate: remove stocks from sectors with <50% stocks above 50d SMA
+        if sector_breadth:
+            rankings = [
+                (sym, sc, comp) for sym, sc, comp in rankings
+                if sector_breadth.get(
+                    self.sym_to_sector.get(
+                        sym.split('_')[0] if '_' in sym else sym, 'other'
+                    ), 1.0
+                ) >= 0.50
+            ]
 
         # Tier 2: compute effective ceiling based on score threshold.
         # When adaptive_n=True: select exactly the stocks that pass — no floor, no cap, no fallback.
@@ -706,7 +1007,7 @@ class StockSelector:
         sym_set = set(selected)
         filtered = [d for d in datasets if d.symbol in sym_set]
 
-        # Log selection with Tier 2/3 diagnostics
+        # Log selection with full v9.0 diagnostics
         self.selection_log.append({
             'selected': selected,
             'rankings': [(s, sc, comp) for s, sc, comp in rankings],
@@ -714,6 +1015,9 @@ class StockSelector:
             'sector_allocation': dict(sector_counts),
             'effective_n': effective_ceiling,
             'sector_momentum': sector_momentum or {},
+            'rrg_metadata': rrg_metadata,
+            'multitf_metadata': multitf_metadata,
+            'sector_breadth': sector_breadth,
         })
 
         return filtered
