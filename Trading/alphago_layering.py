@@ -3772,6 +3772,104 @@ def main():
                 print(f"    {_sname:<26s}  {_pnl_c}${_spnl:>+11,.0f}{C.RESET}  {_sn:>6d}  {_wr_str:>6s}")
             print(f"    {'─'*26}  {'─'*12}  {'─'*6}  {'─'*6}")
 
+        # ----------------------------------------------------------------
+        # (b.1) Score-quartile vs return validation
+        # Did the composite scoring actually rank winners ahead of losers?
+        # ----------------------------------------------------------------
+        _sel_log_sf = None
+        try:
+            if hasattr(selector, 'selection_log') and selector.selection_log:
+                _sel_log_sf = selector.selection_log[-1]
+        except NameError:
+            pass  # v7 path: no selector object
+
+        if _sel_log_sf:
+            # Build sym -> (score, comp) from full rankings list
+            _sym_to_sf = {s: (sc, c) for s, sc, c in _sel_log_sf.get('rankings', [])}
+
+            # Align: only symbols that appear in BOTH rankings AND per_sym
+            _aligned = []
+            for _k, _psd in _chart_per_sym.items():
+                _bare = _k.split('_')[0] if '_' in _k else _k
+                _sf = _sym_to_sf.get(_k) or _sym_to_sf.get(_bare)
+                if _sf is None:
+                    continue
+                _sc, _comp = _sf
+                _trade_pnl = _psd.get('pnl', 0) - _psd.get('cash_yield_pnl', 0)
+                _aligned.append((_k, _sc, _comp, _trade_pnl, _psd.get('sharpe', 0)))
+
+            if len(_aligned) >= 4:
+                _aligned.sort(key=lambda x: x[1], reverse=True)  # highest score first
+                _n_aln = len(_aligned)
+                _q = max(1, _n_aln // 4)
+                _quartile_defs = [
+                    ('Top 25% (score)',    _aligned[:_q]),
+                    ('Upper-Mid 25%',      _aligned[_q:2*_q]),
+                    ('Lower-Mid 25%',      _aligned[2*_q:3*_q]),
+                    ('Bottom 25% (score)', _aligned[3*_q:]),
+                ]
+                print(f"\n    {C.BOLD}Score Quartile vs Actual Returns{C.RESET}")
+                print(f"    {'─'*66}")
+                print(f"    {'Quartile':<22s}  {'N':>4s}  {'Avg P&L':>12s}  {'Win%':>6s}  {'Avg Sharpe':>10s}")
+                print(f"    {'─'*66}")
+                for _qname, _grp in _quartile_defs:
+                    if not _grp:
+                        continue
+                    _pnls   = [x[3] for x in _grp]
+                    _sharpes = [x[4] for x in _grp]
+                    _avg_pnl   = float(np.mean(_pnls))
+                    _win_rate  = sum(1 for p in _pnls if p > 0) / len(_pnls)
+                    _avg_sharpe = float(np.mean(_sharpes))
+                    _pc = C.GREEN if _avg_pnl >= 0 else C.RED
+                    print(f"    {_qname:<22s}  {len(_grp):>4d}  "
+                          f"{_pc}${_avg_pnl:>+11,.0f}{C.RESET}  "
+                          f"{_win_rate:>5.0%}  {_avg_sharpe:>+9.2f}")
+                print(f"    {'─'*66}")
+
+                # ----------------------------------------------------------------
+                # (b.2) Factor-return Pearson correlation
+                # Which scoring factors actually predicted stock returns?
+                # ----------------------------------------------------------------
+                _factor_map = {
+                    'momentum':          'Momentum (6m)',
+                    'sma_score':         'SMA Alignment',
+                    'rs_vs_spy':         'Rel. Strength vs SPY',
+                    'vol_20':            'Volatility (20d)',
+                    'vol_acc':           'Volume Accumulation',
+                    'high52w_proximity': '52w High Proximity',
+                }
+                _f_vecs = {f: [] for f in _factor_map}
+                _pnl_vec = []
+                for _k, _, _comp2, _pnl2, _ in _aligned:
+                    _pnl_vec.append(_pnl2)
+                    for _f in _factor_map:
+                        _f_vecs[_f].append(float(_comp2.get(_f, 0.0)))
+
+                _pnl_arr = np.array(_pnl_vec)
+                _corr_rows = []
+                for _f, _label in _factor_map.items():
+                    _farr = np.array(_f_vecs[_f])
+                    if np.std(_farr) > 1e-9 and np.std(_pnl_arr) > 1e-9:
+                        _r = float(np.corrcoef(_farr, _pnl_arr)[0, 1])
+                    else:
+                        _r = 0.0
+                    _corr_rows.append((_label, float(np.mean(_farr)), _r))
+                _corr_rows.sort(key=lambda x: abs(x[2]), reverse=True)
+
+                print(f"\n    {C.BOLD}Factor Correlation with Trade P&L{C.RESET}")
+                print(f"    {'─'*54}")
+                print(f"    {'Factor':<28s}  {'Avg Value':>10s}  {'r (P&L)':>8s}")
+                print(f"    {'─'*54}")
+                for _fname, _avg, _r in _corr_rows:
+                    if abs(_r) < 1e-9:
+                        continue  # skip zero-variance factors
+                    _rc = C.GREEN if _r > 0.10 else (C.RED if _r < -0.10 else C.YELLOW)
+                    _arrow = '▲' if _r > 0.10 else ('▼' if _r < -0.10 else '~')
+                    print(f"    {_fname:<28s}  {_avg:>+10.3f}  {_rc}{_arrow} {_r:>+6.2f}{C.RESET}")
+                print(f"    {'─'*54}")
+                print(f"    {C.DIM}r = Pearson correlation across {len(_pnl_vec)} selected stocks. "
+                      f"|r|>0.1 shown in color.{C.RESET}")
+
     # (c) Cumulative % return chart — per-symbol equity summation
     # Build per-symbol equity curves, sum them, convert to cumulative %.
     # This is EXACT: chart_final_% × total_capital = table Total P&L.
