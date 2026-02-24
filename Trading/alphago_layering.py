@@ -52,11 +52,11 @@ import argparse
 import time
 import json
 import math
-from copy import copy
+from copy import copy, deepcopy
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 
 # -- Ensure sibling imports work --
@@ -242,51 +242,83 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
     per_symbol_returns_gross = {} # symbol -> list of per-bar gross returns
     per_symbol_date_returns = {}  # symbol -> [(date_str, net_return), ...] for date-aligned equity
 
-    for d in datasets:
-        # -- Create environment as PURE SIMULATOR --
-        # When running through the pipeline, the env must not independently
-        # manage risk. Kill switches belong to L4. Drawdown-based position
-        # restrictions belong to L3. Enabling both would cause double-gating
-        # and "who killed it?" audit ambiguity.
-        #
-        # Ownership model (pipeline mode):
-        #   Kill switches:     L4 ExecutionEngine  (not env)
-        #   Drawdown scaling:  L3 PortfolioConstructor  (not env action masking)
-        #   Position sizing:   L3 only  (env just executes discrete_action)
-        #
-        # In v3.0 standalone training mode, the env keeps its own risk logic
-        # because no pipeline exists.
+    # ---------- per-symbol worker ----------
+    # Extracted from the serial for-loop so ThreadPoolExecutor can run
+    # multiple symbols concurrently. NumPy releases the GIL on array ops →
+    # real CPU overlap. Each thread gets a pipeline copy from _pl_pool.
+    _unwrapped_net = unwrap_net(net) if HAS_TORCH else net
+
+    def _eval_one(d, pl):
+        """Evaluate one symbol; pl is a thread-local pipeline copy."""
         sim_cfg = copy(cfg)
         sim_cfg.use_kill_switches = False
         sim_cfg.use_action_masking = False
         sim_cfg.use_trailing_stops = False       # L4 owns risk — env stops interfere
         sim_cfg.use_asymmetric_stops = False     # L4 owns risk — env stops interfere
-        # Match env action space to Pipeline's 9-level discretization (Iter 9: added 1.25, 1.5)
+        # Match env action space to Pipeline’s 9-level discretization (Iter 9: added 1.25, 1.5)
         sim_cfg.action_targets = (-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.25, 1.5)
         sim_cfg.n_actions = 9                    # Must match action_targets length
         env = TradingEnv(d.features_test, d.prices_test, sim_cfg, d.symbol, ev=True)
-        # FIX Ãƒâ€šÃ‚Â§4.4: Flag env as pipeline eval mode ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â prevents get_risk_target() future access
+        # FIX §4.4: Flag env as pipeline eval mode — prevents get_risk_target() future access
         env._pipeline_eval_mode = True
         obs, _ = env.reset()
         done = False
 
         # -- Reset pipeline for this symbol --
-        pipeline.reset(cfg.starting_capital)
-        pipeline._current_symbol = d.symbol  # v8.0: for rank-based sizing
+        pl.reset(cfg.starting_capital)
+        pl._current_symbol = d.symbol  # v8.0: for rank-based sizing
 
-        # v8.0: Supply training close prices so SMA200 is available from bar 0
-        if pipeline.use_v8_sizing and hasattr(d, 'prices_train') and d.prices_train is not None:
-            pipeline._v8_train_closes = d.prices_train[-250:, 3].copy()
+        # v8.0: Supply training close prices so SMA200 is available from bar 0.
+        # PERF FIX #2: Pre-concatenate train+test closes ONCE per symbol so that
+        # pipeline.step() can slice in O(1) instead of calling np.concatenate every bar.
+        if pl.use_v8_sizing and hasattr(d, 'prices_train') and d.prices_train is not None:
+            _train_tail = d.prices_train[-250:, 3].copy()
+            pl._v8_train_closes = _train_tail          # kept for fallback compat
+            pl._v8_sma_combined = np.concatenate([_train_tail, d.prices_test[:, 3]])
+            pl._v8_train_len    = len(_train_tail)
         else:
-            pipeline._v8_train_closes = None
+            pl._v8_train_closes = None
+            pl._v8_sma_combined = None
+            pl._v8_train_len    = 0
+
+        # PERF FIX #3: Compute data-quality score ONCE per symbol (not every bar).
+        _sym_dq_score = None
+        _dq_closes_full = d.prices_test[:, 3]
+        _dq_volumes_full = d.prices_test[:, 4] if d.prices_test.shape[1] > 4 else None
+        if len(_dq_closes_full) > 1:
+            if HAS_DATA_QUALITY and _dq_volumes_full is not None:
+                try:
+                    import pandas as _dq_pd
+                    _dq_df = _dq_pd.DataFrame({
+                        'Open':   _dq_closes_full, 'High':  _dq_closes_full,
+                        'Low':    _dq_closes_full, 'Close': _dq_closes_full,
+                        'Volume': _dq_volumes_full,
+                    })
+                    _dq_meta = analyze_ohlcv(_dq_df, label=d.symbol)
+                    _sym_dq_score = _dq_meta.quality_score
+                except Exception:
+                    _sym_dq_score = None
+            if _sym_dq_score is None:
+                _dq_n = len(_dq_closes_full)
+                _dq_nan  = float(np.sum(np.isnan(_dq_closes_full))) / _dq_n
+                _dq_zero = float(np.sum(_dq_closes_full <= 0)) / _dq_n
+                _dq_stale = 0
+                if _dq_n > 5:
+                    _dq_recent = _dq_closes_full[-5:]
+                    _dq_stale = int(np.all(_dq_recent == _dq_recent[0]))
+                _nan_penalty   = getattr(acfg, 'dq_nan_penalty',   500.0)
+                _zero_penalty  = getattr(acfg, 'dq_zero_penalty',  500.0)
+                _stale_penalty = getattr(acfg, 'dq_stale_penalty',  40.0)
+                _sym_dq_score  = max(0.0, 100.0
+                                     - _dq_nan  * _nan_penalty
+                                     - _dq_zero * _zero_penalty
+                                     - _dq_stale * _stale_penalty)
 
         # -- Inject trained network into RL alpha --
-        rl_alpha = None
-        for name in pipeline.alpha_factory.alpha_names:
-            alpha = pipeline.alpha_factory._alphas.get(name)
-            if isinstance(alpha, RLAlphaAdapter):
-                alpha.set_network(unwrap_net(net) if HAS_TORCH else None)
-                rl_alpha = alpha
+        for _aname in pl.alpha_factory.alpha_names:
+            _alpha = pl.alpha_factory._alphas.get(_aname)
+            if isinstance(_alpha, RLAlphaAdapter):
+                _alpha.set_network(_unwrapped_net)
                 break
 
         step_count = 0
@@ -299,14 +331,16 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         bars_in_cash = 0             # bars where not in a position (for cash yield)
         peak_notional = 0.0          # max abs(shares * price) for $ Used
         _notional_sum = 0.0          # sum of notional on bars where in position
+        trade_log = []               # collect for writer; applied in main thread
+        info = {}
 
         while not done:
             bar_idx = env.cs
             # Phase 1: Extract OHLC data for Tier 1 alphas
-            opens = env.prices[:bar_idx + 1, 0] if env.prices.shape[1] > 0 else None
-            highs = env.prices[:bar_idx + 1, 1] if env.prices.shape[1] > 1 else None
-            lows = env.prices[:bar_idx + 1, 2] if env.prices.shape[1] > 2 else None
-            closes = env.prices[:bar_idx + 1, 3]
+            opens   = env.prices[:bar_idx + 1, 0] if env.prices.shape[1] > 0 else None
+            highs   = env.prices[:bar_idx + 1, 1] if env.prices.shape[1] > 1 else None
+            lows    = env.prices[:bar_idx + 1, 2] if env.prices.shape[1] > 2 else None
+            closes  = env.prices[:bar_idx + 1, 3]
             volumes = env.prices[:bar_idx + 1, 4] if env.prices.shape[1] > 4 else None
 
             # Bar return
@@ -320,15 +354,15 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
 
             # Realized vol (for L4 no-trade region)
             if len(closes) > 20:
-                log_rets = np.diff(np.log(closes[-20:] + 1e-12))
-                realized_vol = float(np.std(log_rets)) * np.sqrt(252)
+                _lr = np.diff(np.log(closes[-20:] + 1e-12))
+                realized_vol = float(np.std(_lr)) * np.sqrt(252)
             else:
                 realized_vol = 0.15
 
             # -- SET L3 COST MODEL CONTEXT (canonical cost model) --
             mid_price = float(closes[-1])
             pv = env._portfolio_value()
-            pc = pipeline.portfolio
+            pc = pl.portfolio
             pc._last_mid = mid_price
             pc._last_portfolio_value = pv
             if volumes is not None and len(volumes) > 20:
@@ -337,39 +371,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
             # else: falls back to acfg.cost_default_adv_dollars
 
             # -- RUN FULL L1 -> L2 -> L3 -> L4 PIPELINE --
-            # FIX Ãƒâ€šÃ‚Â§5.2: Compute per-bar L0 data quality score.
-            # Prefer data_quality.analyze_ohlcv() when available; fallback uses
-            # configurable penalty weights instead of hardcoded magic numbers.
-            _dq_score = None
-            if closes is not None and len(closes) > 1:
-                if HAS_DATA_QUALITY and volumes is not None:
-                    try:
-                        import pandas as _pd
-                        _ohlcv_df = _pd.DataFrame({
-                            'Open': closes, 'High': closes, 'Low': closes,
-                            'Close': closes, 'Volume': volumes if volumes is not None else 1e6,
-                        })
-                        _dq_meta = analyze_ohlcv(_ohlcv_df, label="live_bar")
-                        _dq_score = _dq_meta.quality_score
-                    except Exception:
-                        _dq_score = None  # Fall through to fallback
-
-                if _dq_score is None:
-                    # Fallback: configurable penalty weights
-                    _n = len(closes)
-                    _nan_frac = float(np.sum(np.isnan(closes))) / _n if _n > 0 else 0.0
-                    _zero_frac = float(np.sum(closes <= 0)) / _n if _n > 0 else 0.0
-                    _stale = 0
-                    if _n > 5:
-                        _recent = closes[-5:]
-                        _stale = int(np.all(_recent == _recent[0]))
-                    # Configurable penalties (from acfg if available, else defaults)
-                    _nan_penalty = getattr(acfg, 'dq_nan_penalty', 500.0)
-                    _zero_penalty = getattr(acfg, 'dq_zero_penalty', 500.0)
-                    _stale_penalty = getattr(acfg, 'dq_stale_penalty', 40.0)
-                    _dq_score = max(0.0, 100.0 - _nan_frac * _nan_penalty - _zero_frac * _zero_penalty - _stale * _stale_penalty)
-
-            result = pipeline.step(
+            result = pl.step(
                 observation=obs,
                 closes=closes,
                 volumes=volumes,
@@ -379,7 +381,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
                 portfolio_value=pv,
                 regime_probs=None,
                 realized_vol=realized_vol,
-                data_quality_score=_dq_score,
+                data_quality_score=_sym_dq_score,
                 opens=opens,   # Phase 1: Pass OHLC to pipeline
                 highs=highs,   # Phase 1: Pass OHLC to pipeline
                 lows=lows,     # Phase 1: Pass OHLC to pipeline
@@ -394,12 +396,12 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
             step_count += 1
 
             # -- Feed REAL execution costs to L4 from env info --
-            traded_notional = info.get("step_traded_notional", 0.0)
-            step_commission = info.get("step_commission", 0.0)
+            traded_notional   = info.get("step_traded_notional", 0.0)
+            step_commission   = info.get("step_commission", 0.0)
             step_slippage_bps = info.get("step_slippage_bps", 0.0)
-            step_mid = info.get("step_mid_price", 0.0)
+            step_mid          = info.get("step_mid_price", 0.0)
 
-            pipeline.execution_engine.ingest_execution(
+            pl.execution_engine.ingest_execution(
                 traded_notional=traded_notional,
                 commission=step_commission,
                 slippage_bps=step_slippage_bps,
@@ -439,20 +441,19 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
                 spy_ret_this_bar = spy_returns_lookup.get(date_str, 0.0)
             sym_spy_returns.append(spy_ret_this_bar)
 
-            # -- FIX Ãƒâ€šÃ‚Â§5.4: Position reconciliation --
-            # In backtesting, "external" = env ground truth. Verifies L4 tracking.
-            if hasattr(pipeline, '_reconciler') and pipeline._reconciler is not None:
-                pipeline._reconciler.reconcile(
+            # -- FIX §5.4: Position reconciliation --
+            if hasattr(pl, '_reconciler') and pl._reconciler is not None:
+                pl._reconciler.reconcile(
                     bar_idx=bar_idx,
                     internal_position=result.target_exposure,
                     external_position=env.exposure,
-                    internal_nav=pv_after if 'pv_after' in dir() else pv,
+                    internal_nav=pv_after,
                     external_nav=env._portfolio_value(),
                 )
 
-            # -- Log trade to run_artifacts --
-            if writer and traded_notional > 0:
-                writer.log_trade({
+            # -- Collect trade for run_artifacts (applied in main thread) --
+            if traded_notional > 0:
+                trade_log.append({
                     "t": bar_idx,
                     "side": "buy" if result.target_exposure > env.exposure else "sell",
                     "trade_notional": traded_notional,
@@ -464,86 +465,136 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
                     "half_spread": 0.0,
                 })
 
-
-            # -- Record audit --
             if verbose >= 2 and step_count % 200 == 0:
-                pipeline.print_status()
+                pl.print_status()
 
             episode_audit.append(result.audit)
 
-        # -- Episode-scoped L4 stats (correctly reset per symbol) --
-        ep_stats = pipeline.execution_engine.stats
-
-        # -- Collect episode results --
-        all_pnls.append(info["net_pnl"])
-        all_trades.append(info["total_trades"])
-        all_dds.append(info["max_drawdown"])
-        all_sharpes.append(info.get("sharpe_ratio", 0))
-        all_audit.extend(episode_audit)
-
-        # -- FIX Ãƒâ€šÃ‚Â§4.7: Store per-symbol returns separately --
-        # Concatenation is kept for backward compatibility but per-symbol data
-        # enables correct per-symbol metrics (vol, Sharpe, drawdown).
-        per_symbol_returns_net[d.symbol] = sym_bar_returns_net
-        per_symbol_returns_gross[d.symbol] = sym_bar_returns_gross
-        per_symbol_date_returns[d.symbol] = sym_date_returns
-        all_bar_returns_gross.extend(sym_bar_returns_gross)
-        all_bar_returns_net.extend(sym_bar_returns_net)
-        all_spy_returns.extend(sym_spy_returns)
-
+        # -- Episode-scoped L4 stats --
+        ep_stats = dict(pl.execution_engine.stats)
         _bars_in_pos = step_count - bars_in_cash
         avg_notional = _notional_sum / max(_bars_in_pos, 1)
+        cash_yield_pnl = (
+            (cfg.cash_yield_bps_annual * 1e-4 / max(cfg.bars_per_year, 1))
+            * cfg.starting_capital * bars_in_cash
+            if getattr(cfg, 'cash_yield_bps_annual', 0) > 0 else 0.0
+        )
 
-        per_sym[d.symbol] = {
-            "pnl": info["net_pnl"],
-            "trades": info["total_trades"],
-            "win_rate": info.get("win_rate", 0),
-            "profit_factor": info.get("profit_factor", 0),
-            "sharpe": info.get("sharpe_ratio", 0),
-            "max_dd": info["max_drawdown"],
-            "turnover": info.get("turnover", 0.0),
-            # FIX: Cash yield only for bars sitting in cash (not in position)
-            "step_count": step_count,
-            "bars_in_cash": bars_in_cash,
-            "peak_notional": peak_notional,
-            "avg_notional": avg_notional,
-            "cash_yield_pnl": (
-                (cfg.cash_yield_bps_annual * 1e-4 / max(cfg.bars_per_year, 1))
-                * cfg.starting_capital * bars_in_cash
-                if getattr(cfg, 'cash_yield_bps_annual', 0) > 0 else 0.0
-            ),
-            # Episode-scoped L4 stats
-            "pipeline_trades": ep_stats["n_trades"],
-            "pipeline_suppressed": ep_stats["n_suppressed"],
-            "pipeline_suppression_rate": ep_stats["suppression_rate"],
-            "pipeline_fills": ep_stats["n_fills"],
-            "pipeline_avg_slippage_bps": ep_stats["avg_slippage_bps"],
-            "pipeline_worst_slippage_bps": ep_stats["worst_slippage_bps"],
-            "pipeline_total_commission": ep_stats["total_commission"],
-            "pipeline_kill": ep_stats["kill_triggered"],
-            "pipeline_kill_context": ep_stats["kill_context"],
-        }
-
-        # -- Episode boundary log (good-to-have 3) --
         if verbose >= 1:
-            lt_so_far = pipeline.execution_engine.lifetime_stats
-            sym_info = per_sym[d.symbol]
-            sup_rate = sym_info["pipeline_suppressed"] / max(
-                sym_info["pipeline_trades"] + sym_info["pipeline_suppressed"], 1
-            )
-            # FIX §SA-5: Decompose PnL into trading alpha vs cash yield
-            cash_yield = sym_info.get("cash_yield_pnl", 0.0)
-            trading_pnl = sym_info["pnl"] - cash_yield
-            pnl_color = C.GREEN if sym_info["pnl"] > 0 else C.RED
+            sup_rate = (ep_stats.get('n_suppressed', 0) /
+                        max(ep_stats.get('n_trades', 0) + ep_stats.get('n_suppressed', 0), 1))
+            trading_pnl = info.get('net_pnl', 0) - cash_yield_pnl
+            pnl_color   = C.GREEN if info.get('net_pnl', 0) > 0 else C.RED
             trade_color = C.GREEN if trading_pnl > 0 else (C.RED if trading_pnl < -0.01 else C.YELLOW)
             tprint(
-                f"  {d.symbol:>12s}  PnL:{pnl_color}${sym_info['pnl']:>+10,.2f}{C.RESET}  "
+                f"  {d.symbol:>12s}  PnL:{pnl_color}${info.get('net_pnl', 0):>+10,.2f}{C.RESET}  "
                 f"(trade:{trade_color}${trading_pnl:>+8,.2f}{C.RESET} "
-                f"cash:{C.CYAN}${cash_yield:>+8,.2f}{C.RESET})  "
-                f"Sh:{sym_info['sharpe']:>+.2f}  DD:{sym_info['max_dd']:.1f}%  "
-                f"Trades:{sym_info['trades']}  Suppressed:{sup_rate:.0%}",
+                f"cash:{C.CYAN}${cash_yield_pnl:>+8,.2f}{C.RESET})  "
+                f"Sh:{info.get('sharpe_ratio', 0):>+.2f}  DD:{info.get('max_drawdown', 0):.1f}%  "
+                f"Trades:{info.get('total_trades', 0)}  Suppressed:{sup_rate:.0%}",
                 "info"
             )
+
+        return {
+            'symbol': d.symbol,
+            'pnl': info.get('net_pnl', 0),
+            'trades': info.get('total_trades', 0),
+            'max_drawdown': info.get('max_drawdown', 0),
+            'sharpe': info.get('sharpe_ratio', 0),
+            'win_rate': info.get('win_rate', 0),
+            'profit_factor': info.get('profit_factor', 0),
+            'turnover': info.get('turnover', 0.0),
+            'step_count': step_count,
+            'bars_in_cash': bars_in_cash,
+            'peak_notional': peak_notional,
+            'avg_notional': avg_notional,
+            'cash_yield_pnl': cash_yield_pnl,
+            'ep_stats': ep_stats,
+            'sym_bar_returns_net': sym_bar_returns_net,
+            'sym_bar_returns_gross': sym_bar_returns_gross,
+            'sym_spy_returns': sym_spy_returns,
+            'sym_date_returns': sym_date_returns,
+            'episode_audit': episode_audit,
+            'trade_log': trade_log,
+        }
+
+    # ---------- thread pool with pipeline pool ----------
+    # Each worker draws a pipeline copy from the queue; returns it when done.
+    # Cap at 8 workers: NumPy GIL release gives real CPU overlap, but memory
+    # pressure from >8 live pipeline copies outweighs the speedup.
+    from queue import Queue as _Queue
+    n_workers = min(len(datasets), 8)
+    _pl_pool = _Queue()
+    for _ in range(n_workers):
+        _pl_pool.put(deepcopy(pipeline))
+
+    def _task(d):
+        pl = _pl_pool.get()
+        try:
+            return _eval_one(d, pl)
+        finally:
+            _pl_pool.put(pl)
+
+    sym_results = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as _pool:
+        _futs = {_pool.submit(_task, d): d.symbol for d in datasets}
+        for _fut in as_completed(_futs):
+            _sym = _futs[_fut]
+            try:
+                sym_results[_sym] = _fut.result()
+            except Exception as _exc:
+                tprint(f"  [eval] {_sym} raised: {_exc}", "warn")
+                sym_results[_sym] = None
+
+    # ---------- aggregate results in original symbol order ----------
+    for d in datasets:
+        r = sym_results.get(d.symbol)
+        if r is None:
+            continue
+
+        all_pnls.append(r['pnl'])
+        all_trades.append(r['trades'])
+        all_dds.append(r['max_drawdown'])
+        all_sharpes.append(r['sharpe'])
+        all_audit.extend(r['episode_audit'])
+
+        per_symbol_returns_net[d.symbol]   = r['sym_bar_returns_net']
+        per_symbol_returns_gross[d.symbol] = r['sym_bar_returns_gross']
+        per_symbol_date_returns[d.symbol]  = r['sym_date_returns']
+        all_bar_returns_gross.extend(r['sym_bar_returns_gross'])
+        all_bar_returns_net.extend(r['sym_bar_returns_net'])
+        all_spy_returns.extend(r['sym_spy_returns'])
+
+        ep_stats = r['ep_stats']
+        per_sym[d.symbol] = {
+            "pnl": r['pnl'],
+            "trades": r['trades'],
+            "win_rate": r['win_rate'],
+            "profit_factor": r['profit_factor'],
+            "sharpe": r['sharpe'],
+            "max_dd": r['max_drawdown'],
+            "turnover": r['turnover'],
+            "step_count": r['step_count'],
+            "bars_in_cash": r['bars_in_cash'],
+            "peak_notional": r['peak_notional'],
+            "avg_notional": r['avg_notional'],
+            "cash_yield_pnl": r['cash_yield_pnl'],
+            # Episode-scoped L4 stats
+            "pipeline_trades": ep_stats.get("n_trades", 0),
+            "pipeline_suppressed": ep_stats.get("n_suppressed", 0),
+            "pipeline_suppression_rate": ep_stats.get("suppression_rate", 0),
+            "pipeline_fills": ep_stats.get("n_fills", 0),
+            "pipeline_avg_slippage_bps": ep_stats.get("avg_slippage_bps", 0),
+            "pipeline_worst_slippage_bps": ep_stats.get("avg_slippage_bps", 0),
+            "pipeline_total_commission": ep_stats.get("total_commission", 0),
+            "pipeline_kill": ep_stats.get("kill_triggered", False),
+            "pipeline_kill_context": ep_stats.get("kill_context", None),
+        }
+
+        # Apply trade log to run_artifacts writer (main thread — thread-safe)
+        if writer:
+            for _te in r['trade_log']:
+                writer.log_trade(_te)
 
     # -- Aggregate results --
     start_cap = float(cfg.starting_capital)
@@ -621,12 +672,12 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         "per_sym": per_sym,
         "audit_log_size": len(all_audit),
         "run_output_dir": run_output_dir,
-        # FIX Ãƒâ€šÃ‚Â§4.7: Per-bar returns ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â per-symbol series for correct metrics,
+        # FIX §4.7: Per-bar returns — per-symbol series for correct metrics,
         # plus concatenated series for backward compatibility (with warning).
         "daily_returns_gross": np.array(all_bar_returns_gross, dtype=np.float64),
         "daily_returns_net": np.array(all_bar_returns_net, dtype=np.float64),
         "daily_returns_concatenated_warning": (
-            "These are concatenated across symbols ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â observation count is inflated. "
+            "These are concatenated across symbols — observation count is inflated. "
             "Use per_symbol_returns_* for correct per-symbol Sharpe/vol/drawdown."
         ),
         "per_symbol_returns_net": {
@@ -789,27 +840,56 @@ def run_ablation_study(datasets, pipeline, cfg, acfg,
     print(f"  {C.BOLD}{hdr}{C.RESET}")
     print(f"  {'-' * 90}")
 
+    # Pre-compute stock selections serially (fast, no I/O)
+    ablation_jobs = []
     for name, sel_cfg in tests:
         selector = StockSelector(sel_cfg, sector_map)
         filtered = selector.select(datasets, spy_returns_lookup)
+        ablation_jobs.append((name, filtered))
 
+    # Unwrap net once (shared read-only reference across threads)
+    _abl_net = unwrap_net(net) if HAS_TORCH else net
+
+    def _run_one_ablation(job):
+        """Run a single ablation config with its own pipeline deep-copy."""
+        name, filtered = job
         if not filtered:
+            return name, None, 0
+        # Each thread gets its own pipeline copy — no shared mutable state
+        pl = deepcopy(pipeline)
+        pl.use_sma = True
+        pl.use_v8_sizing = False  # Flat sizing for ablation
+        pl.execution_engine.reset_lifetime_stats()
+        try:
+            results = evaluate_with_pipeline(
+                net=_abl_net,
+                datasets=filtered,
+                pipeline=pl, cfg=cfg, acfg=acfg,
+                label=f"ablation_{name}", verbose=0,
+                spy_returns_lookup=spy_returns_lookup,
+            )
+        except Exception as _e:
+            tprint(f"  [ablation] {name} raised: {_e}", "warn")
+            results = None
+        return name, results, len(filtered)
+
+    # Run all 8 configs in parallel; NumPy releases GIL → real CPU overlap
+    n_workers = min(len(ablation_jobs), 4)  # cap at 4 to control memory
+    abl_results = {}   # name -> (results_dict_or_None, n_selected)
+    with ThreadPoolExecutor(max_workers=n_workers) as _abl_pool:
+        _futures = {_abl_pool.submit(_run_one_ablation, job): job[0]
+                    for job in ablation_jobs}
+        for _fut in as_completed(_futures):
+            _n, _res, _n_sel = _fut.result()
+            abl_results[_n] = (_res, _n_sel)
+
+    # Print in original order (threads finished out-of-order)
+    for name, _ in tests:
+        results, n_sel = abl_results.get(name, (None, 0))
+
+        if n_sel == 0:
             print(f"  {name:<30s}  -- no stocks selected --")
             continue
-
-        # Reset pipeline for fresh eval
-        pipeline.use_sma = True
-        pipeline.use_v8_sizing = False  # Flat sizing for ablation
-        pipeline.execution_engine.reset_lifetime_stats()
-
-        results = evaluate_with_pipeline(
-            net=unwrap_net(net) if HAS_TORCH else net,
-            datasets=filtered,
-            pipeline=pipeline, cfg=cfg, acfg=acfg,
-            label=f"ablation_{name}", verbose=0,
-            spy_returns_lookup=spy_returns_lookup,
-        )
-
         if results is None:
             print(f"  {name:<30s}  -- eval failed --")
             continue
@@ -818,7 +898,6 @@ def run_ablation_study(datasets, pipeline, cfg, acfg,
         r_sharpe = results.get('avg_sh', 0)
         r_pnl = results.get('total_pnl', 0)
         r_dd = results.get('dd_max', 0)
-        n_sel = len(filtered)
 
         beats_v7 = r_score > benchmarks['v7_sma_score']
         beats_spy = r_pnl > benchmarks['spy_pnl']
@@ -1093,9 +1172,8 @@ def _process_single_dataset_validation(args):
     # next-bar prediction targets)
     closes_full = prices[:, close_col].copy()
     log_rets = np.zeros(n_obs)
-    for i in range(1, n_obs):
-        if closes_full[i] > 0 and closes_full[i - 1] > 0:
-            log_rets[i] = math.log(closes_full[i] / closes_full[i - 1])
+    _valid = (closes_full[1:] > 0) & (closes_full[:-1] > 0)
+    log_rets[1:][_valid] = np.log(closes_full[1:][_valid] / closes_full[:-1][_valid])
 
     # Generate alpha signals for every bar ONCE (signals are deterministic
     # given the price history up to that point -- no future leakage).
@@ -1189,12 +1267,14 @@ def _process_single_dataset_validation(args):
                            for name in alpha_names}
 
     # Vectorized cumulative returns at 5-bar and 15-bar horizons
+    # Use cumsum for O(n) instead of O(n*w) rolling sum loops
+    _cs = np.cumsum(log_rets)
     cum_rets_5bar = np.zeros(n_obs)
     cum_rets_15bar = np.zeros(n_obs)
-    for t in range(50, n_obs - 5):
-        cum_rets_5bar[t] = log_rets[t+1:t+6].sum()
-    for t in range(50, n_obs - 15):
-        cum_rets_15bar[t] = log_rets[t+1:t+16].sum()
+    if n_obs > 55:
+        cum_rets_5bar[50:n_obs - 5] = _cs[55:n_obs] - _cs[50:n_obs - 5]
+    if n_obs > 65:
+        cum_rets_15bar[50:n_obs - 15] = _cs[65:n_obs] - _cs[50:n_obs - 15]
 
     # ---- VECTORIZED fold evaluation (replaces nested Python loops) ----
     dataset_alpha_returns = {name: {'is': [], 'oos': []} for name in alpha_names}

@@ -825,14 +825,29 @@ class StockSelector:
         # Pre-compute sector max for Tier 3 boost (avoids recomputing inside loop)
         _sec_max_mom = max(sector_momentum.values()) if sector_momentum else 0.0
 
+        # PERF FIX #7: Pre-compute normalized weights ONCE before the symbol loop.
+        # Previously divided by total_w inside the loop (250x redundant divisions).
+        _total_w = (self.cfg.w_momentum + self.cfg.w_trend + self.cfg.w_rs
+                    + self.cfg.w_invvol + self.cfg.w_volume_acc + self.cfg.w_high52w)
+        if _total_w <= 0:
+            _total_w = 1.0
+        _w_mom   = self.cfg.w_momentum   / _total_w
+        _w_trend = self.cfg.w_trend      / _total_w
+        _w_rs    = self.cfg.w_rs         / _total_w
+        _w_invvol= self.cfg.w_invvol     / _total_w
+        _w_vacc  = self.cfg.w_volume_acc / _total_w
+        _w_h52w  = self.cfg.w_high52w    / _total_w
+        _has_vol_col = True  # checked per-dataset below
+
         for d, momentum, sma_score, rs_vs_spy, vol_20 in symbol_data:
             if vol_20 > vol_cap:
                 continue  # Too volatile, skip
 
             closes = d.prices_test[:, 3]
+            _ncols = d.prices_test.shape[1]
 
             # --- v9.0 Dollar Volume Filter (mid-cap liquidity gate) ---
-            if self.cfg.min_dollar_volume > 0 and d.prices_test.shape[1] > 4:
+            if self.cfg.min_dollar_volume > 0 and _ncols > 4:
                 volumes_20 = d.prices_test[-20:, 4]
                 avg_dollar_vol = float(np.mean(volumes_20 * closes[-20:]))
                 if avg_dollar_vol < self.cfg.min_dollar_volume:
@@ -844,40 +859,33 @@ class StockSelector:
             # Fraction of total volume on up-days over last 63 bars.
             # >60% = institutional accumulation. Centered at 0: (vol_acc - 0.5) * 2
             vol_acc = 0.5  # neutral default
-            if self.cfg.w_volume_acc > 0 and d.prices_test.shape[1] > 4:
+            if _w_vacc > 0 and _ncols > 4:
                 volumes = d.prices_test[-63:, 4]
                 closes_63 = closes[-63:]
-                if len(volumes) >= 2 and np.sum(volumes) > 0:
-                    up_mask = np.diff(closes_63) > 0
-                    up_days_vol = volumes[1:][up_mask]
-                    total_vol = np.sum(volumes[1:])
+                if len(volumes) >= 2:
+                    total_vol = float(np.sum(volumes[1:]))
                     if total_vol > 0:
-                        vol_acc = float(np.sum(up_days_vol) / total_vol)
+                        up_mask = np.diff(closes_63) > 0
+                        vol_acc = float(np.sum(volumes[1:][up_mask]) / total_vol)
                         vol_acc = max(0.0, min(1.0, vol_acc))
 
             # --- v9.0 Tier 5: 52-Week High Proximity ---
             # 1.0 = stock AT 52-week high (confirmed breakout). 0.0 = far below high.
             high52w_proximity = 0.0
-            if self.cfg.w_high52w > 0 and d.prices_test.shape[1] > 1:
+            if _w_h52w > 0 and _ncols > 1:
                 bars_252 = min(len(closes), 252)
                 high52w = float(np.max(d.prices_test[-bars_252:, 1]))  # col 1 = High
                 if high52w > 0:
                     high52w_proximity = max(0.0, 1.0 - (high52w - float(closes[-1])) / high52w)
 
-            # --- Composite Score with weight normalization ---
-            # When v9.0 factors are active, normalize so total weight always sums to 1.0.
-            total_w = (self.cfg.w_momentum + self.cfg.w_trend + self.cfg.w_rs
-                       + self.cfg.w_invvol + self.cfg.w_volume_acc + self.cfg.w_high52w)
-            if total_w <= 0:
-                total_w = 1.0
-
+            # --- Composite Score (weights pre-normalized above the loop) ---
             score = (
-                (self.cfg.w_momentum  / total_w) * momentum
-                + (self.cfg.w_trend   / total_w) * (sma_score / 3.0)
-                + (self.cfg.w_rs      / total_w) * rs_vs_spy
-                + (self.cfg.w_invvol  / total_w) * (inv_vol / 100.0)
-                + (self.cfg.w_volume_acc / total_w) * (vol_acc - 0.5) * 2.0
-                + (self.cfg.w_high52w / total_w) * high52w_proximity
+                _w_mom   * momentum
+                + _w_trend * (sma_score / 3.0)
+                + _w_rs    * rs_vs_spy
+                + _w_invvol* (inv_vol / 100.0)
+                + _w_vacc  * (vol_acc - 0.5) * 2.0
+                + _w_h52w  * high52w_proximity
             )
 
             # --- Tier 3: Sector Momentum Boost ---
@@ -6272,9 +6280,16 @@ class InstitutionalPipeline:
         if self.use_sma and closes is not None and len(closes) >= 50:
             current_price = float(closes[-1])
 
-            # v8.0: Prepend training prices so SMA200 is available from bar 0
-            if (self.use_v8_sizing and hasattr(self, '_v8_train_closes')
+            # v8.0: Prepend training prices so SMA200 is available from bar 0.
+            # PERF FIX: _v8_sma_combined is pre-built once per symbol in evaluate_with_pipeline
+            # (train_closes + full test_closes concatenated). We slice to current bar in O(1)
+            # instead of calling np.concatenate every bar (which was O(n) per bar).
+            if (self.use_v8_sizing and hasattr(self, '_v8_sma_combined')
+                    and self._v8_sma_combined is not None):
+                _sma_closes = self._v8_sma_combined[:self._v8_train_len + bar_idx + 1]
+            elif (self.use_v8_sizing and hasattr(self, '_v8_train_closes')
                     and self._v8_train_closes is not None):
+                # Fallback for callers that haven't set _v8_sma_combined
                 _sma_closes = np.concatenate([self._v8_train_closes, closes])
             else:
                 _sma_closes = closes
