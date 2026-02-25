@@ -4088,60 +4088,75 @@ def main():
                 print(f"    {C.DIM}r = Pearson correlation across {len(_pnl_vec)} selected stocks. "
                       f"|r|>0.1 shown in color.{C.RESET}")
 
-    # (b.5) Multi-strategy per-symbol chart — only when v8/v9 comparison is available
-    # Shows each stock's Trade P&L across all strategies side-by-side as ASCII bars.
-    # Stocks selected by that strategy are marked with ★; untraded shown as --.
-    _multistrat_data = {}  # sym -> {label: trade_pnl or None}
+    # (b.5) Multi-strategy comparison table — one row per symbol, strategy columns side-by-side
+    # Layout: Symbol | v7.0: [bar P&L] | v8.0: [bar P&L] | v9.0: [bar P&L]
+    # Each cell shows a mini proportional bar + dollar P&L.  "──" = not traded in that strategy.
     _ms_labels = ['v7.0', 'v8.0', 'v9.0'] if _has_v9_col else (['v7.0', 'v8.0'] if _has_v8_chart else [])
     if len(_ms_labels) >= 2:
-        # Collect all symbols across all strategies
         _ms_all_syms = sorted(set(
             list(_pip_per_sym.keys())
             + list(_vc_per_sym.keys())
             + (list(_xc_per_sym.keys()) if _has_v9_col else [])
         ))
+        # Build data: sym -> {label: trade_pnl or None}
+        _ms_data = {}
         for _ms_sym in _ms_all_syms:
             _p7 = _pip_per_sym.get(_ms_sym)
-            _p7_pnl = (_p7.get('pnl', 0) - _p7.get('cash_yield_pnl', 0)) if _p7 else None
             _p8 = _vc_per_sym.get(_ms_sym) if _has_v8_chart else None
-            _p8_pnl = (_p8.get('pnl', 0) - _p8.get('cash_yield_pnl', 0)) if _p8 else None
             _p9 = _xc_per_sym.get(_ms_sym) if _has_v9_col else None
-            _p9_pnl = (_p9.get('pnl', 0) - _p9.get('cash_yield_pnl', 0)) if _p9 else None
-            _multistrat_data[_ms_sym] = {'v7.0': _p7_pnl, 'v8.0': _p8_pnl, 'v9.0': _p9_pnl}
+            _ms_data[_ms_sym] = {
+                'v7.0': (_p7.get('pnl', 0) - _p7.get('cash_yield_pnl', 0)) if _p7 else None,
+                'v8.0': (_p8.get('pnl', 0) - _p8.get('cash_yield_pnl', 0)) if _p8 else None,
+                'v9.0': (_p9.get('pnl', 0) - _p9.get('cash_yield_pnl', 0)) if _p9 else None,
+            }
 
-        if _multistrat_data:
-            # Find max absolute P&L across all strategies for bar scaling
-            _ms_all_vals = [abs(v) for d in _multistrat_data.values()
-                            for v in d.values() if v is not None]
-            _ms_max = max(_ms_all_vals) if _ms_all_vals else 1.0
-            _ms_bar_width = 20  # max bar width in chars
+        if _ms_data:
+            # Scale bars per-column (each strategy's max sets its column scale)
+            _ms_col_max = {}
+            for _lbl in _ms_labels:
+                _vals = [abs(d[_lbl]) for d in _ms_data.values() if d.get(_lbl) is not None]
+                _ms_col_max[_lbl] = max(_vals) if _vals else 1.0
 
-            # Color per strategy
-            _ms_colors = {'v7.0': C.CYAN, 'v8.0': C.YELLOW, 'v9.0': C.MAGENTA}
+            _ms_bar_w = 12   # chars per mini-bar
+            _ms_cell_w = _ms_bar_w + 11  # bar + "  $+999,999"
+            _ms_sym_w = max(len(s) for s in _ms_data) + 1
 
-            print(f"\n    {C.BOLD}Multi-Strategy Trade P&L by Symbol{C.RESET}")
-            print(f"    {C.DIM}Each bar shows Trade P&L for that strategy. "
-                  f"[S]=selected/traded, --=not traded.{C.RESET}")
-            _lbl_w = max(len(s) for s in _multistrat_data) + 2  # symbol column width
+            # Strategy column header colors
+            _ms_hdr = {'v7.0': C.CYAN, 'v8.0': C.YELLOW, 'v9.0': C.MAGENTA}
 
-            for _ms_sym in sorted(_multistrat_data):
-                _ms_d = _multistrat_data[_ms_sym]
-                _rows = []
+            # Header row
+            _hdr_parts = [f"{'Symbol':<{_ms_sym_w}}"]
+            for _lbl in _ms_labels:
+                _col = _ms_hdr.get(_lbl, C.WHITE)
+                _hdr_parts.append(f"{_col}{_lbl:^{_ms_cell_w}}{C.RESET}")
+            _divider = '─' * (_ms_sym_w + len(_ms_labels) * (_ms_cell_w + 3) + 2)
+
+            print(f"\n    {C.BOLD}Strategy Comparison — Trade P&L by Symbol{C.RESET}")
+            print(f"    {C.DIM}Bar width ∝ P&L within each strategy column.  ── = not traded.{C.RESET}")
+            print(f"    {'  '.join(_hdr_parts)}")
+            print(f"    {_divider}")
+
+            for _ms_sym in sorted(_ms_data):
+                _row_parts = [f"{_ms_sym:<{_ms_sym_w}}"]
+                _ms_d = _ms_data[_ms_sym]
                 for _lbl in _ms_labels:
                     _val = _ms_d.get(_lbl)
-                    _col = _ms_colors.get(_lbl, C.WHITE)
                     if _val is None:
-                        _rows.append(f"  {_lbl}: {C.DIM}{'--':>{_ms_bar_width + 10}}{C.RESET}")
+                        # Not traded — grey dashes centered in cell
+                        _cell = f"{C.DIM}{'──':^{_ms_cell_w}}{C.RESET}"
                     else:
-                        _bar_len = max(1, int(abs(_val) / _ms_max * _ms_bar_width))
+                        _col_max = _ms_col_max[_lbl]
+                        _bar_len = max(1, int(abs(_val) / _col_max * _ms_bar_w))
                         _bar_c = C.GREEN if _val >= 0 else C.RED
-                        _bar = ('█' * _bar_len) if _val >= 0 else ('▒' * _bar_len)
+                        _bar_char = '█' if _val >= 0 else '▒'
+                        _bar_str = _bar_char * _bar_len
                         _pnl_s = f"${_val:>+,.0f}"
-                        _rows.append(f"  {_lbl}: {_bar_c}{_bar:<{_ms_bar_width}}{C.RESET} {_col}{_pnl_s:>10}{C.RESET} [S]")
-                _sym_line = f"    {_ms_sym:<{_lbl_w}}"
-                print(_sym_line)
-                for _r in _rows:
-                    print(f"    {' ' * _lbl_w}{_r}")
+                        # bar left-aligned, P&L right-aligned within cell
+                        _cell = f"{_bar_c}{_bar_str:<{_ms_bar_w}}{C.RESET}  {_bar_c}{_pnl_s:>9}{C.RESET}"
+                    _row_parts.append(_cell)
+                print(f"    {'  │  '.join(_row_parts)}")
+
+            print(f"    {_divider}")
 
     # (c) Cumulative % return chart — per-symbol equity summation
     # Build per-symbol equity curves, sum them, convert to cumulative %.
