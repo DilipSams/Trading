@@ -2563,8 +2563,8 @@ def main():
         n_iterations=args.iterations,
         total_timesteps_per_iter=args.steps_per_iter,
         mcts_rollouts=args.mcts_rollouts,
-        mcts_schedule_base=min(args.mcts_rollouts, 64),  # schedule base respects user's limit
-        mcts_schedule_max=args.mcts_rollouts,              # schedule max respects user's limit
+        mcts_schedule_base=min(args.mcts_rollouts, 64),   # start shallow: network still weak early
+        mcts_schedule_max=min(args.mcts_rollouts, 512),   # cap at 512; grows to max over iterations
         hidden_dim=args.hidden_dim,
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,

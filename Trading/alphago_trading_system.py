@@ -4017,7 +4017,9 @@ class AlphaTradeSystem:
                     tprint(f"Fallback to BatchedMCTSPlanner: {e}","warn")
                 all_mcts_states=[]
                 all_mcts_policies=[]
-                for d in sel[:3]:
+                # Scale symbol count with universe size: ~10% of available, minimum 3
+                n_mcts_syms = min(len(sel), max(3, len(sel) // 10))
+                for d in sel[:n_mcts_syms]:
                     env=TradingEnv(d.features_train,d.prices_train,self.cfg,d.symbol)
                     env.reset()
                     # Scale down roots inversely with rollout count to keep time budget
@@ -5328,7 +5330,7 @@ def parse_args():
     p.add_argument("--timeframes",type=str,default="5m,15m,30m,1h,1d")
     p.add_argument("--iterations",type=int,default=3)        # v7.0 optimal: 3 iterations
     p.add_argument("--steps-per-iter",type=int,default=50_000)  # v7.0 optimal: 50k per iter (3 × 50k = 150k total)
-    p.add_argument("--mcts-rollouts",type=int,default=32)
+    p.add_argument("--mcts-rollouts",type=int,default=256)  # Match Config design intent; schedule grows 64→512
     p.add_argument("--capital",type=float,default=100_000)
     p.add_argument("--hidden-dim",type=int,default=256)
     p.add_argument("--batch-size",type=int,default=512)
