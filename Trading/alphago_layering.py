@@ -59,6 +59,10 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 
+# -- UTF-8 stdout: required for Unicode chart characters (█ etc.) on Windows --
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # -- Ensure sibling imports work --
 script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
@@ -2238,9 +2242,10 @@ Examples:
     # v8.0 Stock Selection
     g = p.add_argument_group("v8.0 Stock Selection")
     g.add_argument("--version", type=str, default="v7",
-                   choices=["v7", "v8", "v9"],
+                   choices=["v7", "v8", "v9", "letf"],
                    help="Strategy version: v7=baseline, v8=stock selection engine, "
-                        "v9=full stack (v8 + RRG rotation + volume/breakout factors + sector breadth)")
+                        "v9=full stack (v8 + RRG rotation + volume/breakout factors + sector breadth) | "
+                        "letf=S2 standalone LETF strategy (QQQ SMA-200 → TQQQ/Cash, $50k allocation)")
     g.add_argument("--top-n", type=int, default=15,
                    help="v8.0: fallback fixed-N cap used only when --no-adaptive-n is passed (default: 15). "
                         "In v8 mode adaptive selection is ON by default — all stocks passing the threshold are traded.")
@@ -2493,8 +2498,236 @@ def resolve_symbols(args):
     return DEFAULT_SYMBOLS[:args.n_symbols]
 
 
+# ============================================================================
+# S2 LETF: QQQ SMA-200 → TQQQ / Cash  (--version letf)
+# ============================================================================
+
+def _run_letf_strategy(args):
+    """
+    Standalone S2 LETF strategy.
+
+    Signal : IF QQQ.close > SMA(QQQ.close, 200)  →  hold TQQQ
+             ELSE                                 →  hold Cash (0% return)
+    Capital: $50,000 (or args.capital if > 50,000)
+    Costs  : 5 bps one-way on every signal change
+    Benchmarks: SPY B&H, TQQQ B&H (same starting capital, same period)
+    No RL, no pipeline — pure pandas/numpy.
+    """
+    import pandas as _pd
+
+    ALLOCATION  = max(float(getattr(args, 'capital', 50_000)), 50_000)
+    SMA_PERIOD  = 200
+    COST_BPS    = 5          # 5 bps one-way per trade
+    COST        = COST_BPS / 10_000
+    norgate_dir = Path(NORGATE_DIR) / "US_Equities"
+
+    print_section("", reset=True)
+    print_box(
+        "ALPHA-TRADE S2 — LETF SMA-200 Strategy",
+        f"Signal: QQQ > SMA({SMA_PERIOD}) -> TQQQ  |  else -> Cash  |  "
+        f"Capital: ${ALLOCATION:,.0f}  |  Costs: {COST_BPS}bps/trade  |  "
+        f"{datetime.now():%Y-%m-%d %H:%M}",
+    )
+
+    # ── 1. Load parquet files ─────────────────────────────────────────────
+    print_section("DATA LOADING")
+    series = {}
+    for sym in ("QQQ", "TQQQ", "SPY"):
+        fp = norgate_dir / f"{sym}.parquet"
+        if not fp.exists():
+            tprint(f"{sym}.parquet not found at {fp}", "err")
+            return
+        df = _pd.read_parquet(fp)
+        # Normalise column names (mirrors load_from_norgate logic)
+        col_map = {}
+        for c in df.columns:
+            cl = c.lower().strip()
+            if cl == "close" and "unadj" not in cl:
+                col_map[c] = "Close"
+        df = df.rename(columns=col_map)
+        if "Close" not in df.columns:
+            # Fallback: try first column named 'Close' case-insensitively
+            for c in df.columns:
+                if "close" in c.lower() and "unadj" not in c.lower():
+                    df = df.rename(columns={c: "Close"})
+                    break
+        if "Close" not in df.columns:
+            tprint(f"{sym}: no Close column found. Columns: {list(df.columns)}", "err")
+            return
+        df.index = _pd.to_datetime(df.index)
+        series[sym] = df["Close"].rename(sym)
+        tprint(f"  {sym}: {len(df):,} bars  "
+               f"({str(df.index[0])[:10]} – {str(df.index[-1])[:10]})", "ok")
+
+    # ── 2. Align on common dates (inner join, starts at TQQQ inception) ──
+    common_idx = (series["QQQ"].index
+                  .intersection(series["TQQQ"].index)
+                  .intersection(series["SPY"].index)
+                  .sort_values())
+    qqq_c  = series["QQQ"].reindex(common_idx)
+    tqqq_c = series["TQQQ"].reindex(common_idx)
+    spy_c  = series["SPY"].reindex(common_idx)
+    tprint(f"  Common period: {str(common_idx[0])[:10]} – {str(common_idx[-1])[:10]}"
+           f"  ({len(common_idx):,} trading days)", "info")
+
+    # ── 3. Signal: QQQ > SMA-200, lagged 1 day to avoid lookahead ────────
+    print_section("SIGNAL")
+    qqq_sma = qqq_c.rolling(SMA_PERIOD, min_periods=SMA_PERIOD).mean()
+    raw_sig  = (qqq_c > qqq_sma).astype(float).fillna(0.0)
+    signal   = raw_sig.shift(1).fillna(0.0)   # use yesterday's close signal today
+
+    in_tqqq = int(signal.sum())
+    in_cash = len(signal) - in_tqqq
+    tprint(f"  TQQQ: {in_tqqq:,} days ({in_tqqq/len(signal):.1%})   "
+           f"Cash:  {in_cash:,} days ({in_cash/len(signal):.1%})", "info")
+    transitions = int((signal.diff().abs() > 0.5).sum())
+    tprint(f"  Signal changes (trades): {transitions}  "
+           f"(~{transitions / (len(signal)/252):.1f}/year)", "info")
+
+    # ── 4. Daily returns ──────────────────────────────────────────────────
+    tqqq_ret = tqqq_c.pct_change().fillna(0.0)
+    spy_ret  = spy_c.pct_change().fillna(0.0)
+    trade_days = (signal.diff().abs() > 0.5).astype(float)
+    strat_ret  = signal * tqqq_ret - trade_days * COST
+
+    # ── 5. Equity curves ──────────────────────────────────────────────────
+    print_section("BACKTEST")
+
+    def _equity_curve(rets, cap):
+        eq = [cap]
+        for r in rets:
+            eq.append(eq[-1] * (1 + float(r)))
+        return eq[1:]
+
+    strat_eq = _equity_curve(strat_ret,  ALLOCATION)
+    spy_eq   = _equity_curve(spy_ret,    ALLOCATION)
+    tqqq_eq  = _equity_curve(tqqq_ret,   ALLOCATION)
+
+    dates_str = [str(d)[:10] for d in common_idx]
+    strat_cum = np.array([(v - ALLOCATION) / ALLOCATION * 100 for v in strat_eq])
+    spy_cum   = np.array([(v - ALLOCATION) / ALLOCATION * 100 for v in spy_eq])
+    tqqq_cum  = np.array([(v - ALLOCATION) / ALLOCATION * 100 for v in tqqq_eq])
+
+    # ── 6. Chart ──────────────────────────────────────────────────────────
+    print_section("EQUITY CURVE")
+    multi_line_chart(
+        [("S2 LETF", strat_cum), ("TQQQ B&H", tqqq_cum), ("SPY B&H", spy_cum)],
+        width=70, height=14, fmt="%", dates=dates_str,
+        title=f"S2 LETF vs Benchmarks — Cumulative Return (${ALLOCATION:,.0f})",
+    )
+    print()
+    for _lbl, _cum in [("S2 LETF", strat_cum), ("TQQQ B&H", tqqq_cum), ("SPY B&H", spy_cum)]:
+        _fp  = float(_cum[-1])
+        _pnl = ALLOCATION * _fp / 100
+        _col = C.GREEN if _fp >= 0 else C.RED
+        print(f"    {_col}{_lbl:<12}: {_fp:>+8.1f}%{C.RESET}"
+              f"  ({'+'if _pnl>=0 else ''}${abs(_pnl):>12,.0f}"
+              f" P&L / ${ALLOCATION:,.0f} committed)")
+
+    # ── 7. Year-by-year table ─────────────────────────────────────────────
+    print_section("ANNUAL PERFORMANCE")
+
+    def _annual(eq_list):
+        year_end = {}
+        for i, d in enumerate(dates_str):
+            year_end[d[:4]] = eq_list[i]
+        result, prev = {}, ALLOCATION
+        for yr in sorted(year_end):
+            result[yr] = (year_end[yr] / prev - 1.0) * 100
+            prev = year_end[yr]
+        return result
+
+    ann_s = _annual(strat_eq)
+    ann_t = _annual(tqqq_eq)
+    ann_b = _annual(spy_eq)
+
+    _strats = [("S2 LETF", ann_s), ("TQQQ B&H", ann_t), ("SPY B&H", ann_b)]
+    _yrs    = sorted({yr for _, d in _strats for yr in d})
+    _cw     = 10
+
+    print(f"\n    {C.BOLD}Year-by-Year Returns ({_yrs[0]}–{_yrs[-1]}){C.RESET}")
+    print(f"    {'Year':<6}" + "".join(f"  {lb:>{_cw}}" for lb, _ in _strats))
+    print(f"    {'─'*6}" + f"  {'─'*_cw}" * len(_strats))
+    for _yr in _yrs:
+        _row = f"    {_yr:<6}"
+        for _, _ann in _strats:
+            _v = _ann.get(_yr)
+            if _v is None:
+                _row += f"  {'N/A':>{_cw}}"
+            else:
+                _c = C.GREEN if _v >= 0 else C.RED
+                _row += f"  {_c}{_v:>+8.1f}%{C.RESET}"
+        print(_row)
+    print(f"    {'─'*6}" + f"  {'─'*_cw}" * len(_strats))
+    for _rname in ("Total", "CAGR"):
+        _row = f"    {_rname:<6}"
+        for _, _ann in _strats:
+            _vals = [_ann[yr] for yr in _yrs if yr in _ann]
+            if _vals:
+                _comp = 1.0
+                for _v in _vals:
+                    _comp *= (1 + _v / 100)
+                _res = (_comp - 1.0) * 100 if _rname == "Total" \
+                       else ((_comp ** (1.0 / len(_vals))) - 1.0) * 100
+                _c = C.GREEN if _res >= 0 else C.RED
+                _row += f"  {_c}{_res:>+8.1f}%{C.RESET}"
+            else:
+                _row += f"  {'N/A':>{_cw}}"
+        print(_row)
+    print()
+
+    # ── 8. Risk summary ───────────────────────────────────────────────────
+    def _max_dd(eq_list):
+        peak, worst = eq_list[0], 0.0
+        for v in eq_list:
+            if v > peak:
+                peak = v
+            dd = (v - peak) / peak
+            if dd < worst:
+                worst = dd
+        return worst * 100
+
+    def _sharpe(rets_series):
+        r = rets_series.dropna()
+        return float((r.mean() / r.std()) * np.sqrt(252)) if r.std() > 0 else 0.0
+
+    def _cagr(eq_list):
+        n_years = len(eq_list) / 252
+        return ((eq_list[-1] / ALLOCATION) ** (1 / n_years) - 1) * 100
+
+    print(f"    {C.BOLD}Risk & Return Summary{C.RESET}")
+    print(f"    {'Strategy':<14}  {'CAGR':>7}  {'Sharpe':>7}  {'MaxDD':>8}  {'$10k→':>12}")
+    print(f"    {'─'*14}  {'─'*7}  {'─'*7}  {'─'*8}  {'─'*12}")
+    for _lbl, _eq, _rets in [
+        ("S2 LETF",  strat_eq, strat_ret),
+        ("TQQQ B&H", tqqq_eq,  tqqq_ret),
+        ("SPY B&H",  spy_eq,   spy_ret),
+    ]:
+        _cagr_v  = _cagr(_eq)
+        _sh      = _sharpe(_rets)
+        _dd      = _max_dd(_eq)
+        _final10 = 10_000 * (_eq[-1] / ALLOCATION)
+        _dc      = C.RED if _dd < -50 else C.YELLOW if _dd < -30 else C.GREEN
+        _cc      = C.GREEN if _cagr_v > 0 else C.RED
+        print(f"    {_lbl:<14}  {_cc}{_cagr_v:>6.1f}%{C.RESET}  "
+              f"{_sh:>7.2f}  {_dc}{_dd:>7.1f}%{C.RESET}  ${_final10:>10,.0f}")
+    print()
+
+    print_box(
+        "DONE — S2 LETF Strategy",
+        f"SMA({SMA_PERIOD}) filter  |  ${ALLOCATION:,.0f} committed  |  "
+        f"{dates_str[0]} – {dates_str[-1]}  |  {transitions} trades  |  "
+        f"Final equity: ${strat_eq[-1]:,.0f}",
+    )
+
+
 def main():
     args = parse_args()
+
+    # --- S2 LETF: standalone, no RL/pipeline needed — exit early ----------
+    if args.version == "letf":
+        _run_letf_strategy(args)
+        return
 
     # --- v9.0: auto-enable all v9.0 features when --version v9 ---
     # v9 = v8 base + RRG rotation + volume accumulation + 52w high proximity
