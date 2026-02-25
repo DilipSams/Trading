@@ -415,7 +415,7 @@ When uncertain, ask ONE clarifying question at a time, but still provide the bes
 
 | File | Lines (approx) | Role |
 |---|---|---|
-| `alphago_trading_system.py` | ~5,100 | v3.0 core: Config, TradingEnv, PPO, MCTS, features, MID_CAP_SYMBOLS |
+| `alphago_trading_system.py` | ~5,100 | v3.0 core: Config, TradingEnv, PPO, MCTS, features, discover_midcap_symbols() |
 | `alphago_architecture.py` | ~5,200 | v6–v9 pipeline: L1–L4 classes + SelectionConfig, StockSelector, SectorRotationDetector |
 | `alphago_layering.py` | ~4,300 | Launcher: v7/v8/v9 wiring, walk-forward, evaluation, charts, sector output |
 | `alphago_cost_model.py` | ~153 | Shared cost model: half-spread + sqrt-impact + fees |
@@ -812,8 +812,17 @@ high52w_proximity = max(0, 1 - (high52w - price) / high52w)
 
 ### Mid-Cap Rising Stars Universe
 
-`MID_CAP_SYMBOLS` defined in `alphago_trading_system.py` (~70 stocks, $2B–$15B market cap range).
-Organized by sector: tech, industrials, energy/cleantech, healthcare, financials, consumer, materials.
+`discover_midcap_symbols()` in `alphago_trading_system.py` — dynamically scans the Norgate
+`US_Equities` database at runtime using objective OHLCV-only filters (no hand-curation):
+- Avg daily dollar volume $20M–$2B/day — proxy for ~$1B+ market cap
+- Avg daily share volume >= 300K/day — float proxy, rules out low-float / spike-only names
+- Close price >= $10 — eliminates sub-institutional / penny stocks
+- History >= 252 bars (1 year minimum for reliable signal computation)
+- Not already in `DEFAULT_SYMBOLS` (no large-cap duplication)
+
+Tune with `--min-dollar-volume`, `--max-dollar-volume`, `--min-avg-volume`.
+
+Activated via `--include-midcap`. Tune bounds with `--min-dollar-volume` / `--max-dollar-volume`.
 
 Universe in v9: 206 large-caps + ~70 mid-caps = ~276 stocks (de-duplicated).
 The same `StockSelector` composite scoring naturally filters weak mid-caps — only genuine

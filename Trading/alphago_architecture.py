@@ -475,7 +475,7 @@ class SelectionConfig:
     """Configuration for v8.0 stock selection engine."""
     top_n: int = 15                          # Stocks to select when adaptive_n=False
     adaptive_n: bool = False                 # Tier 2: variable N — let quality threshold decide
-    min_score_pct: float = 0.50             # Tier 2: select stocks scoring >= top_score - abs(top_score)*(1-pct)
+    min_score_pct: float = 0.35             # Tier 2: select stocks scoring >= top_score - abs(top_score)*(1-pct)
     momentum_lookback: int = 252             # 12-month momentum window
     momentum_skip: int = 21                  # Skip last month (reversal effect)
     min_bars: int = 63                       # P3: Fast-track new listings — 63 bars (3 months) min

@@ -2249,9 +2249,9 @@ Examples:
                         "Always ON when --version v8 (default). 4 qualify in a weak market → take 4; 25 qualify in a bull run → take 25.")
     g.add_argument("--no-adaptive-n", action="store_true",
                    help="v8.0: disable adaptive N and use a fixed --top-n cap instead (overrides v8 default).")
-    g.add_argument("--min-score-pct", type=float, default=0.50,
+    g.add_argument("--min-score-pct", type=float, default=0.35,
                    help="v8.0 Tier 2: quality threshold — select stocks within this fraction of the top score "
-                        "(default: 0.50, i.e. threshold = 50%% of top score magnitude). "
+                        "(default: 0.35, i.e. threshold = 35%% of top score magnitude). "
                         "Lower = wider net (more stocks). Higher = tighter (fewer, higher-conviction). "
                         "Must be in [0.0, 1.0].")
     g.add_argument("--sector-momentum-gate", action="store_true",
@@ -2280,7 +2280,16 @@ Examples:
                         "Adds ~70 mid-cap stocks ($2B-$10B); same selector filters out weak names.")
     g.add_argument("--min-dollar-volume", type=float, default=0.0,
                    help="v9.0: minimum average daily dollar volume in $ (e.g. 20000000 for $20M, default: off). "
-                        "Proxy for mid-cap liquidity gate — ensures institutional participation.")
+                        "Used in rank_universe to filter illiquid stocks, and as lower bound for "
+                        "--include-midcap discovery (defaults to $20M when --include-midcap is set).")
+    g.add_argument("--max-dollar-volume", type=float, default=0.0,
+                   help="v9.0: maximum average daily dollar volume in $ for --include-midcap discovery "
+                        "(e.g. 2000000000 for $2B, default: $2B when --include-midcap is set). "
+                        "Caps the upper end so blue-chip large-caps not in DEFAULT_SYMBOLS are excluded.")
+    g.add_argument("--min-avg-volume", type=float, default=0.0,
+                   help="v9.0: minimum average daily volume in shares for --include-midcap discovery "
+                        "(e.g. 300000 for 300K shares/day, default: 300K when --include-midcap is set). "
+                        "Float proxy — rules out low-float stocks that hit dollar thresholds only on spike days.")
     g.add_argument("--kill-loss", type=float, default=None,
                    help="Kill switch max portfolio loss fraction (default: ArchitectureConfig default=0.30)")
     g.add_argument("--skip-ablation", action="store_true",
@@ -2454,18 +2463,32 @@ def resolve_symbols(args):
     # Default: for v8.0, load full diversified universe; otherwise first n_symbols
     if getattr(args, 'version', 'v7') in ('v8', 'v9'):
         base = DEFAULT_SYMBOLS[:206]  # All 206 stocks across 11 sectors
-        # v9.0: --include-midcap expands universe with Rising Stars (~70 additional symbols)
+        # v9.0: --include-midcap dynamically discovers mid-cap candidates from Norgate
+        # using objective OHLCV-only filters (price, dollar volume, history length).
+        # No hand-curation — the data decides.
         if getattr(args, 'include_midcap', False):
             try:
-                from alphago_trading_system import MID_CAP_SYMBOLS
-                # De-duplicate: add only mid-cap symbols not already in the large-cap universe
+                from alphago_trading_system import discover_midcap_symbols, NORGATE_DIR
                 base_set = set(base)
-                extra = [s for s in MID_CAP_SYMBOLS if s not in base_set]
-                tprint(f"  [Mid-Cap] Adding {len(extra)} Rising Stars to universe "
-                       f"(total: {len(base) + len(extra)} stocks)", "info")
+                # Dollar volume bounds: --min/max-dollar-volume if set, else function defaults
+                _min_dv  = getattr(args, 'min_dollar_volume', 0.0) or 20_000_000   # $20M/day
+                _max_dv  = getattr(args, 'max_dollar_volume', 0.0) or 2_000_000_000 # $2B/day
+                _min_vol = getattr(args, 'min_avg_volume', 0.0)    or 300_000        # 300K shares/day
+                tprint(f"  [Mid-Cap] Scanning Norgate for candidates "
+                       f"(dv ${_min_dv/1e6:.0f}M\u2013${_max_dv/1e6:.0f}M/day, "
+                       f"vol \u2265{_min_vol/1e3:.0f}K shares/day, price \u2265$10)...", "info")
+                extra = discover_midcap_symbols(
+                    norgate_dir=NORGATE_DIR,
+                    exclude_symbols=base_set,
+                    min_dollar_volume=_min_dv,
+                    max_dollar_volume=_max_dv,
+                    min_avg_volume_shares=_min_vol,
+                )
+                tprint(f"  [Mid-Cap] Found {len(extra)} candidates "
+                       f"(total universe: {len(base) + len(extra)} stocks)", "info")
                 return base + extra
-            except ImportError:
-                tprint("  [Mid-Cap] MID_CAP_SYMBOLS not found in alphago_trading_system.py", "warn")
+            except Exception as e:
+                tprint(f"  [Mid-Cap] Discovery failed: {e}", "warn")
         return base
     return DEFAULT_SYMBOLS[:args.n_symbols]
 
@@ -3242,16 +3265,12 @@ def main():
                 tprint("  Sector breadth (% stocks > 50d SMA): " +
                        ", ".join(f"{s}={b:.0%}" for s, b in _top_breadth), "info")
 
-            # v9.0: Rising Stars (mid-cap names selected)
-            try:
-                from alphago_trading_system import MID_CAP_SYMBOLS as _MCS
-                _midcap_set = set(_MCS)
-                _rising = [_s for _s in _log['selected']
-                           if (_s.split('_')[0] if '_' in _s else _s) in _midcap_set]
-                if _rising:
-                    tprint(f"  Rising Stars selected: {', '.join(_rising)}", "info")
-            except ImportError:
-                pass
+            # v9.0: Rising Stars — selected stocks not in the large-cap DEFAULT_SYMBOLS universe
+            _large_cap_set = set(DEFAULT_SYMBOLS)
+            _rising = [_s for _s in _log['selected']
+                       if (_s.split('_')[0] if '_' in _s else _s) not in _large_cap_set]
+            if _rising:
+                tprint(f"  Rising Stars selected: {', '.join(_rising)}", "info")
 
     # Build rank map
     _v8_rank = {}
@@ -3308,7 +3327,7 @@ def main():
             top_n=args.top_n,
             adaptive_n=_adaptive_n,
             min_score_pct=args.min_score_pct,
-            sector_momentum_gate=args.sector_momentum_gate,
+            sector_momentum_gate=False,   # v8 default — don't inherit v9's auto-enabled gate
             w_sector_momentum=args.sector_momentum_weight,
             # v9 features explicitly OFF for clean v8 baseline:
             w_volume_acc=0.0,
@@ -3319,6 +3338,14 @@ def main():
         )
         _v8b_selector = StockSelector(_v8b_sel_cfg, SECTOR_MAP)
         _v8b_datasets = _v8b_selector.select(datasets, spy_returns_lookup)
+        # Warn if v8 and v9 select identical portfolios
+        _v8b_selected_syms = set(_v8b_selector.selection_log[-1]['selected']) if _v8b_selector.selection_log else set()
+        _v9_selected_syms = set(selector.selection_log[-1]['selected']) if selector.selection_log else set()
+        if _v8b_selected_syms and _v8b_selected_syms == _v9_selected_syms:
+            tprint(f"  Note: v8 and v9 selected identical portfolios "
+                   f"({', '.join(sorted(_v8b_selected_syms))}). "
+                   f"v9 features did not change selection on this universe. "
+                   f"Try broader universe or lower --min-score-pct.", "warn")
         _v8b_rank = {sym: i for i, sym in enumerate(
             (_v8b_selector.selection_log[-1]['selected']
              if _v8b_selector.selection_log else [])

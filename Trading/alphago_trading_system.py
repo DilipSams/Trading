@@ -4996,102 +4996,6 @@ SECTOR_MAP = {
     "telecom":       ["T","VZ","TMUS","CMCSA"],
 }
 
-# v9.0: Mid-Cap "Rising Stars" universe — stocks in the $500M–$10B range.
-# These are candidates for the mid-cap → large-cap graduation that drives multibagger returns.
-# Organized by sector to mirror SECTOR_MAP. Review quarterly as market caps shift.
-#
-# Market cap tiers (for reference):
-#   Mega:  >$200B   (AAPL, NVDA, MSFT)
-#   Large: $10B–200B (S&P 500)  ← DEFAULT_SYMBOLS universe
-#   Mid:   $2B–10B  (S&P MidCap 400) ← THIS LIST (multibagger sweet spot)
-#   Small: $300M–2B (Russell 2000)
-#   Micro: $50M–300M
-#
-# Proxy filter (no market cap in Norgate): use --min-dollar-volume 20000000 ($20M/day)
-# to ensure institutional-grade liquidity before selection.
-#
-# Note: Some names may have graduated to large-cap. StockSelector's composite score
-# naturally filters weak names — this list only defines the eligible universe.
-MID_CAP_SYMBOLS = [
-    # --- Technology mid-caps ---
-    "DUOL",   # Duolingo AI edtech
-    "MNDY",   # Monday.com work OS
-    "GTLB",   # GitLab DevSecOps
-    "BILL",   # Bill.com SMB finance
-    "ZI",     # ZoomInfo B2B data
-    "SEMR",   # Semrush digital marketing
-    "TOST",   # Toast restaurant tech
-    "SMAR",   # Smartsheet work management
-    "TASK",   # TaskUs BPO/AI services
-    "AEHR",   # Aehr Test Systems semiconductor testing
-    "PLAB",   # Photronics photomasks
-    "SKYT",   # SkyWater Technology (quantum/AI chips)
-    "CLFD",   # Clearfield fiber optics
-    "SMTC",   # Semtech IoT semiconductors
-    "AMBA",   # Ambarella AI vision chips
-    "ACLS",   # Axcelis Technologies ion implant equipment
-    "FORM",   # FormFactor semiconductor test
-    "RIOT",   # Riot Platforms Bitcoin mining/data center
-    "IREN",   # Iris Energy AI data center + Bitcoin
-
-    # --- Industrials / Infrastructure mid-caps ---
-    "KNF",    # Knife River aggregates (recent spin-off)
-    "PLPC",   # Preformed Line Products grid infrastructure
-    "DY",     # Dycom Industries utility contractor
-    "NVT",    # nVent Electric enclosures
-    "CSWI",   # CSW Industrials HVAC/plumbing products
-    "AWI",    # Armstrong World Industries ceilings
-    "GMS",    # GMS building products
-    "IBP",    # Installed Building Products insulation
-    "IESC",   # IEC Electronics specialty manufacturing
-    "ROAD",   # Construction Partners paving/road-building
-    "KTOS",   # Kratos Defense autonomous systems
-
-    # --- Energy / Cleantech mid-caps ---
-    "ARRY",   # Array Technologies utility-scale solar trackers
-    "SHLS",   # Shoals Technologies solar balance-of-system
-    "ENVX",   # Enovix next-gen silicon batteries
-    "BE",     # Bloom Energy solid-oxide fuel cells
-    "RUN",    # Sunrun residential solar
-    "CWEN",   # Clearway Energy wind/solar yieldco
-    "GPRE",   # Green Plains ethanol/clean fuel
-    "FLNC",   # Fluence Energy grid storage
-
-    # --- Healthcare mid-caps ---
-    "RXRX",   # Recursion Pharmaceuticals AI drug discovery
-    "CERT",   # Certara biosimulation / drug modeling
-    "HIMS",   # Hims & Hers telehealth / compounding pharmacy
-    "EXAS",   # Exact Sciences multi-cancer screening
-    "INSP",   # Inspire Medical neurostimulation for sleep apnea
-    "IRTC",   # iRhythm cardiac patch monitoring
-    "TMDX",   # TransMedics organ transport system
-    "NVCR",   # Novocure tumor treatment fields
-    "ACAD",   # ACADIA Pharmaceuticals CNS disorders
-    "PRAX",   # Praxis Precision neurology
-
-    # --- Financials mid-caps ---
-    "CWAN",   # Clearwater Analytics investment management SaaS
-    "RELY",   # Remitly global digital payments
-    "AFRM",   # Affirm BNPL (buy-now-pay-later)
-    "UPST",   # Upstart AI lending platform
-    "HOOD",   # Robinhood Markets retail brokerage
-    "SAIC",   # SAIC government IT services
-
-    # --- Consumer / Retail mid-caps ---
-    "CELH",   # Celsius Holdings functional energy drinks
-    "CAVA",   # CAVA Mediterranean fast casual
-    "BROS",   # Dutch Bros coffee drive-through
-    "WING",   # Wingstop fast casual franchising
-    "CHWY",   # Chewy pet e-commerce / telehealth
-    "DNUT",   # Krispy Kreme donut brands
-    "ONON",   # On Holding running performance
-
-    # --- Materials / Commodities mid-caps ---
-    "MP",     # MP Materials rare earth mining/processing
-    "MTRN",   # Materion specialty performance alloys
-    "CMC",    # Commercial Metals steel mini-mills
-    "RYI",    # Ryerson Tull metals distribution
-]
 
 YF_INTRADAY_MAX_PERIOD={"1m":"7d","2m":"60d","5m":"60d","15m":"60d","30m":"60d",
     "60m":"730d","1h":"730d","90m":"60d","1d":"max","5d":"max","1wk":"max","1mo":"max"}
@@ -5303,6 +5207,103 @@ def load_from_norgate(norgate_dir=NORGATE_DIR, databases=None, symbols=None, mb=
     tprint(f"Norgate: {total_loaded} symbols from {len(databases)} databases "
            f"({total_skipped} skipped, {elapsed:.1f}s)", "ok")
     return data
+
+
+def discover_midcap_symbols(
+    norgate_dir: str = NORGATE_DIR,
+    exclude_symbols: set = None,
+    min_dollar_volume: float = 20_000_000,    # $20M/day — proxy for ~$1B+ market cap
+    max_dollar_volume: float = 2_000_000_000, # $2B/day  — below mega large-cap territory
+    min_avg_volume_shares: float = 300_000,   # 300K shares/day — float proxy (low-float gate)
+    min_price: float = 10.0,                  # $10 minimum — eliminates sub-institutional stocks
+    min_history_bars: int = 252,              # require at least 1 year of data
+    lookback_bars: int = 63,                  # 3-month window for stable liquidity estimate
+    database: str = "US_Equities",
+    max_workers: int = 8,
+) -> list:
+    """
+    Systematically discover mid-cap stock candidates from Norgate OHLCV data.
+
+    No hand-curation. All criteria are objective and computed from OHLCV only
+    (Norgate provides no market cap or float data — we use tradeable proxies):
+
+      1. Avg daily dollar volume (close × volume, last 63 bars) in
+         [min_dollar_volume, max_dollar_volume]:
+           $20M/day lower bound  → proxy for ~$1B+ market cap at typical 1-2% daily turnover
+           $2B/day upper bound   → below blue-chip large-caps not already in DEFAULT_SYMBOLS
+      2. Avg daily volume in shares >= min_avg_volume_shares (default 300K/day):
+           Float proxy — low-float stocks can hit $20M/day on a spike but have thin,
+           erratic volume day-to-day. Consistent 300K shares/day implies adequate float
+           for institutional-size entries/exits without excessive slippage.
+      3. Close price >= min_price ($10)  → eliminates sub-institutional / penny stocks
+      4. At least min_history_bars of data  → ensures reliable signal computation
+      5. Not already in exclude_symbols  → avoids duplicating the large-cap universe
+
+    Uses a thread pool for parallel I/O across potentially thousands of parquet files.
+    Returns a sorted list of symbol strings (without _1d suffix).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    db_dir = Path(norgate_dir) / database
+    if not db_dir.exists():
+        tprint(f"  [Mid-Cap] Norgate database not found: {db_dir}", "warn")
+        return []
+
+    exclude = exclude_symbols or set()
+    files = sorted(db_dir.glob("*.parquet"))
+
+    def _check_file(fp):
+        sym = fp.stem.upper()
+        if sym in exclude:
+            return None
+        try:
+            df = pd.read_parquet(fp)
+            # Normalize column names (same logic as load_from_norgate)
+            cols = {}
+            for c in df.columns:
+                cl = c.lower().strip()
+                if cl == "close" and "unadj" not in cl.replace(" ", ""):
+                    cols[c] = "Close"
+                elif cl in ("volume", "vol"):
+                    cols[c] = "Volume"
+            df = df.rename(columns=cols)
+
+            if "Close" not in df.columns or "Volume" not in df.columns:
+                return None
+            if len(df) < min_history_bars:
+                return None
+
+            tail = df.tail(lookback_bars)
+            closes  = tail["Close"].values.astype(float)
+            volumes = tail["Volume"].values.astype(float)
+
+            if len(closes) == 0 or float(closes[-1]) < min_price:
+                return None
+
+            # Dollar volume gate: proxy for ~$1B+ market cap
+            avg_dv = float(np.mean(closes * volumes))
+            if avg_dv < min_dollar_volume or avg_dv > max_dollar_volume:
+                return None
+
+            # Share volume gate: float proxy — rules out low-float / erratic-volume stocks
+            if min_avg_volume_shares > 0:
+                avg_vol_shares = float(np.mean(volumes))
+                if avg_vol_shares < min_avg_volume_shares:
+                    return None
+
+            return sym
+        except Exception:
+            return None
+
+    candidates = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_check_file, fp): fp for fp in files}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                candidates.append(result)
+
+    return sorted(candidates)
 
 
 # ============================================================================
