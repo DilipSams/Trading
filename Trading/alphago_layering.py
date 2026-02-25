@@ -73,7 +73,7 @@ try:
         unwrap_net, DEFAULT_SYMBOLS, SECTOR_MAP, HAS_YF, NUM_FEATURES,
         print_box, print_divider, print_gpu_info, tprint, C, progress_bar,
         build_feature_matrix, compute_indicators,  # For RL observation construction
-        hbar_chart, line_chart, dual_line_chart,  # Terminal charts
+        hbar_chart, line_chart, multi_line_chart,  # Terminal charts
         SymbolDataset,  # v9.0: used for constructing sector ETF datasets for RRG
     )
     HAS_BASE = True
@@ -4174,103 +4174,231 @@ def main():
             except UnicodeEncodeError:
                 print(rendered_ms.encode('ascii', errors='replace').decode('ascii'))
 
-    # (c) Cumulative % return chart — per-symbol equity summation
-    # Build per-symbol equity curves, sum them, convert to cumulative %.
-    # This is EXACT: chart_final_% × total_capital = table Total P&L.
-    # SPY: cumprod on same dates, also as cumulative %.
-    _date_rets = pipeline_results.get("per_symbol_date_returns", {})
-    if _date_rets:
-        _n_syms = len(_date_rets)
-        _total_capital = cfg.starting_capital * _n_syms
+    # (c) Cumulative % return chart — ALL strategies vs SPY
+    # ─────────────────────────────────────────────────────────────────────────
+    # $ used = total COMMITTED capital = starting_capital × n_syms.
+    #
+    # Why committed, not avg_notional?
+    #   Example: 5 symbols × $10k = $50k committed.
+    #            avg notional deployed = $38k (24% cash drag on average).
+    #            Equity after period   = $55k  →  P&L = $5k.
+    #   WRONG:   $5k / $38k =  13.2%  ← inflated by ignoring cash drag
+    #   CORRECT: $5k / $50k =  10.0%  ← return on committed capital
+    #
+    # avg_notional is shown as informational context ("avg deployed: $38k") but
+    # is never used as a denominator.  This keeps the % directly comparable to
+    # SPY (which always uses its own starting_capital as denominator).
 
-        # Build per-symbol equity indexed by date
-        _sym_equity_by_date = {}
-        for _sym, _pairs in _date_rets.items():
-            _eq = cfg.starting_capital
-            _sym_eq = {}
-            for _dt, _ret in _pairs:
-                _eq *= (1 + _ret)
-                _sym_eq[_dt] = _eq
-            _sym_equity_by_date[_sym] = _sym_eq
+    def _build_curve(result_dict, ref_dates=None):
+        """Build cumulative % equity curve from evaluate_with_pipeline() output.
 
-        # Collect all unique dates
-        _all_dates = set()
-        for _sym_eq in _sym_equity_by_date.values():
-            _all_dates.update(_sym_eq.keys())
-        _dates_sorted = sorted(_all_dates)
+        Returns (cum_pct_array, total_capital, total_eq_list, dates_sorted).
+        total_capital = starting_capital × n_syms — the committed capital.
+        cum_pct[i]   = (total_equity[i] - total_capital) / total_capital × 100.
+        """
+        dr = (result_dict or {}).get("per_symbol_date_returns", {})
+        if not dr:
+            return None, 0, [], []
+        cap = cfg.starting_capital * len(dr)
+        sym_eq = {}
+        for sym, pairs in dr.items():
+            eq = cfg.starting_capital
+            d = {}
+            for dt, ret in pairs:
+                eq *= (1 + ret)
+                d[dt] = eq
+            sym_eq[sym] = d
+        if ref_dates is None:
+            all_d = set()
+            for d in sym_eq.values():
+                all_d.update(d.keys())
+            ref_dates = sorted(all_d)
+        last = {s: cfg.starting_capital for s in sym_eq}
+        total_eq = []
+        for dt in ref_dates:
+            for s, deq in sym_eq.items():
+                if dt in deq:
+                    last[s] = deq[dt]
+            total_eq.append(sum(last.values()))
+        cum_pct = np.array([(v - cap) / cap * 100 for v in total_eq])
+        return cum_pct, cap, total_eq, ref_dates
+
+    def _annual_returns(ref_dates, total_eq, total_capital):
+        """Per-calendar-year % return.
+
+        Year-start equity = prev year's closing equity (total_capital for yr 0).
+        annual_return[year] = (year_end_equity / year_start_equity) − 1, as %.
+        """
+        if not ref_dates or not total_eq:
+            return {}
+        year_end = {}
+        for i, dt in enumerate(ref_dates):
+            year_end[dt[:4]] = total_eq[i]
+        result, prev = {}, total_capital
+        for yr in sorted(year_end):
+            result[yr] = (year_end[yr] / prev - 1.0) * 100
+            prev = year_end[yr]
+        return result
+
+    # Pipeline v7 dates are the master x-axis; all other strategies align to them.
+    _pipe_dr = pipeline_results.get("per_symbol_date_returns", {})
+    if _pipe_dr:
+        _pip_cum, _pip_cap, _pip_eq, _dates_sorted = _build_curve(pipeline_results)
+        _n_syms = len(_pipe_dr)
 
         if len(_dates_sorted) > 2:
-            # Sum equity across symbols per date → cumulative %
-            _last_eq = {s: cfg.starting_capital for s in _sym_equity_by_date}
-            _total_eq = []
-            for _dt in _dates_sorted:
-                for _sym, _sym_eq in _sym_equity_by_date.items():
-                    if _dt in _sym_eq:
-                        _last_eq[_sym] = _sym_eq[_dt]
-                _total_eq.append(sum(_last_eq.values()))
-            # Total $ Used (peak notional per symbol, summed) — computed first
-            # because it is the denominator for BOTH the chart y-axis and the label.
-            _chart_per_sym = pipeline_results.get('per_sym', {})
-            _total_used = sum(s.get('avg_notional', 0) for s in _chart_per_sym.values())
-            if _total_used <= 0:
-                _total_used = _total_capital  # fallback
+            # ── Build curves for every available strategy ──────────────────
+            _nosma_cum, _nosma_cap, _nosma_eq, _ = _build_curve(
+                nosma_results if 'nosma_results' in dir() else None, _dates_sorted)
 
-            # Portfolio curve: PnL / $ Used → chart endpoint == label %
-            _port_cum_pct = np.array([(v - _total_capital) / _total_used * 100
-                                      for v in _total_eq])
+            _v8_label = (
+                "v9.0 (Select)" if args.version == "v9"
+                else "v8.0 (Select)" if args.version == "v8"
+                else "v8.0 (Sizing)"
+            )
+            _v8_cum,  _v8_cap,  _v8_eq,  _ = _build_curve(
+                v8_results if v8_results is not None else None, _dates_sorted)
+            _v9b_cum, _v9b_cap, _v9b_eq, _ = _build_curve(
+                _v8b_results if _v8b_results is not None else None, _dates_sorted)
 
-            # SPY cumulative % — start from FULL test period (bar 0) for fair benchmark.
-            # The portfolio chart starts post-lookback, but SPY should include the
-            # lookback window period so returns aren't inflated by starting at a bottom.
+            # ── SPY curve: pre-compounded through lookback window ──────────
+            # The portfolio chart starts post-lookback; SPY must start at the
+            # same point so returns are not inflated by a lucky lookback entry.
             _spy_cum_pct = None
+            _spy_base    = cfg.starting_capital
+            _spy_vals    = []
             if has_spy_bench and spy_returns_lookup:
-                # Get full test dates from datasets (including lookback window)
                 _full_test_dates = set()
-                for d in datasets:
-                    if hasattr(d, 'timestamps_test') and d.timestamps_test is not None:
-                        for ts in d.timestamps_test:
-                            _full_test_dates.add(str(ts)[:10])
-                _full_spy_dates = sorted(_full_test_dates)
-                # SPY benchmark: $10k (starting_capital), NOT total across symbols
-                _spy_base = cfg.starting_capital
-                # Pre-compound SPY through lookback period (before chart starts)
+                for _d in datasets:
+                    if hasattr(_d, 'timestamps_test') and _d.timestamps_test is not None:
+                        for _ts in _d.timestamps_test:
+                            _full_test_dates.add(str(_ts)[:10])
                 _spy_eq = _spy_base
-                for _dt in _full_spy_dates:
+                for _dt in sorted(_full_test_dates):
                     if _dt < _dates_sorted[0]:
                         _spy_eq *= (1 + spy_returns_lookup.get(_dt, 0.0))
-                # Now compound through chart dates
-                _spy_vals = []
                 for _dt in _dates_sorted:
                     _spy_eq *= (1 + spy_returns_lookup.get(_dt, 0.0))
                     _spy_vals.append(_spy_eq)
-                _spy_cum_pct = np.array([(v - _spy_base) / _spy_base * 100
-                                         for v in _spy_vals])
+                _spy_cum_pct = np.array(
+                    [(v - _spy_base) / _spy_base * 100 for v in _spy_vals])
 
-            # Summary values — _port_final_pct IS the return on $ Used (matches label)
-            _port_final_pct = float(_port_cum_pct[-1])
-            _port_pnl = _total_used * _port_final_pct / 100   # actual dollar PnL
-            _p_sign = "+" if _port_pnl >= 0 else "-"
-            _p_c = C.GREEN if _port_final_pct > 0 else C.RED
-
+            # ── Assemble ordered series list for multi_line_chart ──────────
+            # Order = display priority (first = drawn on top on overlaps).
+            _chart_series = []
+            if _v8_cum is not None and args.version in ("v8", "v9"):
+                _chart_series.append((_v8_label, _v8_cum))
+            if _v9b_cum is not None and args.version == "v9":
+                _chart_series.append(("v8.0 (baseline)", _v9b_cum))
+            _chart_series.append(("Pipeline v7", _pip_cum))
+            if _nosma_cum is not None:
+                _chart_series.append(("v7 (no SMA)", _nosma_cum))
             if _spy_cum_pct is not None:
-                dual_line_chart(_port_cum_pct, _spy_cum_pct, width=70, height=14,
-                               title=f"Cumulative Return: Portfolio vs SPY ({_n_syms} syms × ${cfg.starting_capital/1e3:.0f}k)",
-                               label1=_chart_ver, label2="SPY", fmt="%",
-                               dates=_dates_sorted)
-                _spy_final_pct = float(_spy_cum_pct[-1])
-                _spy_pnl = _spy_base * _spy_final_pct / 100
-                _s_sign = "+" if _spy_pnl >= 0 else "-"
-                _s_c = C.GREEN if _spy_final_pct > 0 else C.RED
-                print(f"    {_chart_ver}: {_p_c}{_port_final_pct:+.1f}%{C.RESET}"
-                      f" ({_p_sign}${abs(_port_pnl):,.0f} / ${_total_used:,.0f} used)"
-                      f"    SPY: {_s_c}{_spy_final_pct:+.1f}%{C.RESET}"
-                      f" ({_s_sign}${abs(_spy_pnl):,.0f} / ${_spy_base:,.0f})")
-            else:
-                line_chart(_port_cum_pct, width=70, height=14,
-                          title=f"Cumulative Return: Portfolio ({_n_syms} syms × ${cfg.starting_capital/1e3:.0f}k)",
-                          fmt="%", dates=_dates_sorted)
-                print(f"    {_chart_ver}: {_p_c}{_port_final_pct:+.1f}%{C.RESET}"
-                      f" ({_p_sign}${abs(_port_pnl):,.0f} / ${_total_used:,.0f} used)")
+                _chart_series.append(("SPY", _spy_cum_pct))
+
+            _n_label = f"{_n_syms} syms × ${cfg.starting_capital/1e3:.0f}k"
+            multi_line_chart(
+                _chart_series, width=70, height=14, fmt="%",
+                dates=_dates_sorted,
+                title=f"Cumulative Return: All Strategies vs SPY ({_n_label})",
+            )
+
+            # ── Legend lines ───────────────────────────────────────────────
+            # Shows: return % on committed capital, dollar P&L, and avg
+            # notional deployed (informational — not the denominator).
+            def _legend(label, cum_pct, total_cap, res):
+                if cum_pct is None or len(cum_pct) == 0:
+                    return
+                fp  = float(cum_pct[-1])
+                pnl = total_cap * fp / 100
+                avg = sum(s.get('avg_notional', 0)
+                          for s in (res or {}).get('per_sym', {}).values())
+                col = C.GREEN if fp >= 0 else C.RED
+                dep = f", avg deployed ${avg:,.0f}" if avg > 0 else ""
+                print(f"    {col}{label}: {fp:+.1f}%{C.RESET}"
+                      f"  ({'+'if pnl>=0 else ''}${abs(pnl):,.0f}"
+                      f" / ${total_cap:,.0f} committed{dep})")
+
+            print()
+            if _v8_cum is not None and args.version in ("v8", "v9"):
+                _legend(_v8_label, _v8_cum, _v8_cap, v8_results)
+            if _v9b_cum is not None and args.version == "v9":
+                _legend("v8.0 (baseline)", _v9b_cum, _v9b_cap, _v8b_results)
+            _legend("Pipeline v7", _pip_cum, _pip_cap, pipeline_results)
+            if _nosma_cum is not None:
+                _legend("v7 (no SMA)", _nosma_cum, _nosma_cap,
+                        nosma_results if 'nosma_results' in dir() else None)
+            if _spy_cum_pct is not None and _spy_vals:
+                _sf  = float(_spy_cum_pct[-1])
+                _spl = _spy_base * _sf / 100
+                _sc  = C.GREEN if _sf >= 0 else C.RED
+                print(f"    {_sc}SPY: {_sf:+.1f}%{C.RESET}"
+                      f"  ({'+'if _spl>=0 else ''}${abs(_spl):,.0f}"
+                      f" / ${_spy_base:,.0f} per $10k invested)")
+
+            # ── Year-by-year backtest table ────────────────────────────────
+            # Annual return = (year-end equity / prev-year equity) − 1.
+            # Covers whatever the test period spans — up to 35 years with full
+            # Norgate history from 1990.
+            _ann_strats = []   # [(label, {year: pct})]
+            if _v8_cum is not None and args.version in ("v8", "v9"):
+                _ann_strats.append(
+                    (_v8_label, _annual_returns(_dates_sorted, _v8_eq, _v8_cap)))
+            if _v9b_cum is not None and args.version == "v9":
+                _ann_strats.append(
+                    ("v8.0 (base)", _annual_returns(_dates_sorted, _v9b_eq, _v9b_cap)))
+            _ann_strats.append(
+                ("Pipe v7", _annual_returns(_dates_sorted, _pip_eq, _pip_cap)))
+            if _nosma_cum is not None:
+                _ann_strats.append(
+                    ("v7 no SMA", _annual_returns(_dates_sorted, _nosma_eq, _nosma_cap)))
+            if _spy_cum_pct is not None and _spy_vals:
+                _spy_ye, _prev_s = {}, _spy_base
+                for _i, _dt in enumerate(_dates_sorted):
+                    _spy_ye[_dt[:4]] = _spy_vals[_i]
+                _spy_ann = {}
+                for _yr in sorted(_spy_ye):
+                    _spy_ann[_yr] = (_spy_ye[_yr] / _prev_s - 1.0) * 100
+                    _prev_s = _spy_ye[_yr]
+                _ann_strats.append(("SPY", _spy_ann))
+
+            _all_yrs = sorted({yr for _, ann in _ann_strats for yr in ann})
+            if _all_yrs and _ann_strats:
+                _cw = 10   # column width per strategy
+                _slabels = [lb for lb, _ in _ann_strats]
+                print(f"\n    {C.BOLD}Year-by-Year Returns"
+                      f" ({_all_yrs[0]}–{_all_yrs[-1]}){C.RESET}")
+                _hdr = f"    {'Year':<6}" + "".join(f"  {lb:>{_cw}}" for lb in _slabels)
+                print(_hdr)
+                print(f"    {'─'*6}" + f"  {'─'*_cw}" * len(_slabels))
+                for _yr in _all_yrs:
+                    _row = f"    {_yr:<6}"
+                    for _, _ann in _ann_strats:
+                        _v = _ann.get(_yr)
+                        if _v is None:
+                            _row += f"  {'N/A':>{_cw}}"
+                        else:
+                            _c = C.GREEN if _v >= 0 else C.RED
+                            _row += f"  {_c}{_v:>+8.1f}%{C.RESET}"
+                    print(_row)
+                print(f"    {'─'*6}" + f"  {'─'*_cw}" * len(_slabels))
+                # Total compound + CAGR rows
+                for _rname in ("Total", "CAGR"):
+                    _row = f"    {_rname:<6}"
+                    for _, _ann in _ann_strats:
+                        _vals = [_ann[yr] for yr in _all_yrs if yr in _ann]
+                        if _vals:
+                            _comp = 1.0
+                            for _v in _vals:
+                                _comp *= (1 + _v / 100)
+                            _res = (_comp - 1.0) * 100 if _rname == "Total" \
+                                   else ((_comp ** (1.0 / len(_vals))) - 1.0) * 100
+                            _c = C.GREEN if _res >= 0 else C.RED
+                            _row += f"  {_c}{_res:>+8.1f}%{C.RESET}"
+                        else:
+                            _row += f"  {'N/A':>{_cw}}"
+                    print(_row)
+                print()
 
     # (d) Training loss chart (only when training was run)
     if training_hist:

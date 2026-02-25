@@ -452,6 +452,88 @@ def dual_line_chart(values1, values2, width=60, height=12, title="",
     print("\n".join(lines))
 
 
+def multi_line_chart(series_list, width=70, height=14, title="", indent=4,
+                     fmt="%", dates=None):
+    """Print ASCII line chart with N overlaid series.
+
+    series_list : list of (label, values_array) in display-priority order.
+                  The first series is drawn last (highest priority on overlap).
+    Colors assigned in order: GREEN, CYAN, YELLOW, MAGENTA, BLUE, WHITE, RED.
+    """
+    if not series_list:
+        return
+
+    COLORS = [C.GREEN, C.CYAN, C.YELLOW, C.MAGENTA, C.BLUE, C.WHITE, C.RED]
+
+    # Downsample / align every series to the same chart width
+    processed = []
+    ref_dates = None
+    for label, values in series_list:
+        arr, ds = _chart_common(values, width, fmt, dates=dates)
+        if len(arr) < 2:
+            continue
+        processed.append((label, arr))
+        if ref_dates is None:
+            ref_dates = ds
+    if not processed:
+        return
+
+    n = min(len(arr) for _, arr in processed)
+    processed = [(lbl, arr[:n]) for lbl, arr in processed]
+    if ref_dates is not None:
+        ref_dates = ref_dates[:n]
+
+    # Global y-axis range across ALL series
+    vmin = min(float(np.min(arr)) for _, arr in processed)
+    vmax = max(float(np.max(arr)) for _, arr in processed)
+    rng = vmax - vmin
+    if rng == 0:
+        rng = abs(vmax) * 0.1 or 1.0
+        vmin -= rng / 2; vmax += rng / 2; rng = vmax - vmin
+
+    pad = " " * indent
+    y_labels = [_fmt_y(vmin + rng * i / (height - 1), fmt) for i in range(height)]
+    label_width = max(len(lbl) for lbl in y_labels)
+
+    # Build one canvas per series
+    canvases = []
+    for _, arr in processed:
+        canvas = [[" "] * n for _ in range(height)]
+        rows = _compute_rows(arr, vmin, vmax, rng, height)
+        _draw_line_on_canvas(canvas, rows, n)
+        canvases.append(canvas)
+
+    lines = []
+    if title:
+        lines.append(f"\n{pad}{C.BOLD}{title}{C.RESET}")
+        legend_parts = [
+            f"{COLORS[i % len(COLORS)]}──{C.RESET} {lbl}"
+            for i, (lbl, _) in enumerate(processed)
+        ]
+        lines.append(f"{pad}  " + "    ".join(legend_parts))
+        lines.append(f"{pad}{' ' * label_width} ┌{'─' * n}┐")
+
+    for row_idx in range(height):
+        y_idx = height - 1 - row_idx
+        label = y_labels[y_idx].rjust(label_width)
+        row_str = ""
+        for c in range(n):
+            cell = " "
+            # Iterate in reverse priority so first series wins on overlap
+            for i in range(len(canvases) - 1, -1, -1):
+                if canvases[i][row_idx][c] in _LINE_CHARS:
+                    col = COLORS[i % len(COLORS)]
+                    cell = f"{col}{canvases[i][row_idx][c]}{C.RESET}"
+            row_str += cell
+        lines.append(f"{pad}{C.DIM}{label}{C.RESET} ┤{row_str}│")
+
+    lines.append(f"{pad}{' ' * label_width} └{'─' * n}┘")
+    year_line = _year_axis(ref_dates, n, label_width, indent)
+    if year_line:
+        lines.append(year_line)
+    print("\n".join(lines))
+
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
