@@ -4110,68 +4110,42 @@ def main():
                 'v9.0': (_p9.get('pnl', 0) - _p9.get('cash_yield_pnl', 0)) if _p9 else None,
             }
 
-        if _ms_data:
-            # Scale bars per-column (each strategy's max sets its column scale)
+        if _ms_data and HAS_TABLE_FORMATTER:
+            # Scale bars per-column (each strategy's max = full bar width)
             _ms_col_max = {}
             for _lbl in _ms_labels:
                 _vals = [abs(d[_lbl]) for d in _ms_data.values() if d.get(_lbl) is not None]
                 _ms_col_max[_lbl] = max(_vals) if _vals else 1.0
 
-            # Fixed visible widths — compute all padding on PLAIN strings before adding
-            # ANSI color codes.  Python's f-string alignment (:<N, :>N, :^N) counts
-            # invisible escape bytes toward the width, so color must be added AFTER padding.
-            _ms_bar_w = 12   # visible chars for the bar segment
-            _ms_pnl_w = 11   # visible chars for "$+9,999,999" (widest realistic value)
-            _ms_cell_w = _ms_bar_w + 2 + _ms_pnl_w  # 25 visible chars per data cell
-            _ms_sep = '  │  '                         # 5-char visible separator
-            _ms_sym_w = max(max(len(s) for s in _ms_data), len('Symbol')) + 1
-
-            # Strategy column colors (applied AFTER plain-string padding)
+            _ms_bar_w = 12
             _ms_hdr_color = {'v7.0': C.CYAN, 'v8.0': C.YELLOW, 'v9.0': C.MAGENTA}
 
-            # ── Header row ──
-            # Plain-pad the label to cell width, then wrap with color
-            _hdr_plain = [f"{'Symbol':<{_ms_sym_w}}"]
+            ms_table = TableFormatter(title="Strategy Comparison — Trade P&L by Symbol")
+            ms_table.add_column('Symbol', align='left')
             for _lbl in _ms_labels:
-                _plain = f"{_lbl:^{_ms_cell_w}}"          # pad FIRST (no ANSI yet)
-                _hdr_plain.append(
-                    f"{_ms_hdr_color.get(_lbl, C.WHITE)}{_plain}{C.RESET}"
-                )
-
-            _divider_w = _ms_sym_w + len(_ms_labels) * (_ms_cell_w + len(_ms_sep))
-            _divider = '─' * _divider_w
-
-            print(f"\n    {C.BOLD}Strategy Comparison — Trade P&L by Symbol{C.RESET}")
-            print(f"    {C.DIM}Bar ∝ P&L within each strategy column.  ── = not traded.{C.RESET}")
-            print(f"    {_ms_sep.join(_hdr_plain)}")
-            print(f"    {_divider}")
+                _col = _ms_hdr_color.get(_lbl, C.WHITE)
+                ms_table.add_column(f"{_col}{_lbl}{C.RESET}", align='left')
 
             for _ms_sym in sorted(_ms_data):
                 _ms_d = _ms_data[_ms_sym]
-                _row_parts = [f"{_ms_sym:<{_ms_sym_w}}"]   # symbol cell (no ANSI needed)
-
+                _row = [_ms_sym]
                 for _lbl in _ms_labels:
                     _val = _ms_d.get(_lbl)
                     if _val is None:
-                        # Not traded: plain dashes centered, THEN dim color
-                        _plain = f"{'──':^{_ms_cell_w}}"
-                        _cell = f"{C.DIM}{_plain}{C.RESET}"
+                        _row.append(f"{C.DIM}──{C.RESET}")
                     else:
-                        _col_max = _ms_col_max[_lbl]
-                        _bar_len = max(1, int(abs(_val) / _col_max * _ms_bar_w))
+                        _bar_len = max(1, int(abs(_val) / _ms_col_max[_lbl] * _ms_bar_w))
                         _bar_char = '█' if _val >= 0 else '▒'
-                        # Build plain content at exact visible width, THEN colorise
-                        _bar_plain = f"{_bar_char * _bar_len:<{_ms_bar_w}}"   # left-pad to bar_w
-                        _pnl_plain = f"${_val:>+,.0f}"
-                        _pnl_plain = f"{_pnl_plain:>{_ms_pnl_w}}"            # right-pad to pnl_w
                         _bar_c = C.GREEN if _val >= 0 else C.RED
-                        _cell = f"{_bar_c}{_bar_plain}  {_pnl_plain}{C.RESET}"
+                        _row.append(f"{_bar_c}{_bar_char * _bar_len}  ${_val:>+,.0f}{C.RESET}")
+                ms_table.add_row(_row)
 
-                    _row_parts.append(_cell)
-
-                print(f"    {_ms_sep.join(_row_parts)}")
-
-            print(f"    {_divider}")
+            print(f"\n    {C.DIM}Bar ∝ P&L within each strategy column.  ── = not traded.{C.RESET}")
+            rendered_ms = "  " + ms_table.render().replace("\n", "\n  ")
+            try:
+                print(rendered_ms)
+            except UnicodeEncodeError:
+                print(rendered_ms.encode('ascii', errors='replace').decode('ascii'))
 
     # (c) Cumulative % return chart — per-symbol equity summation
     # Build per-symbol equity curves, sum them, convert to cumulative %.
