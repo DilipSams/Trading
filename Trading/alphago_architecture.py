@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Callable
 from collections import deque, OrderedDict
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
 # NEW: Import crowding detection
@@ -545,13 +546,18 @@ class SectorRotationDetector:
         self.slow_period = slow_period
 
     def _ema(self, series: np.ndarray, period: int) -> np.ndarray:
-        """EMA with standard smoothing factor alpha = 2/(period+1)."""
+        """Vectorized EMA using pandas EWM — ~50x faster than a Python loop for long series.
+        Falls back to a pure-NumPy loop if pandas is not available."""
         alpha = 2.0 / (period + 1)
-        ema = np.empty_like(series)
-        ema[0] = series[0]
-        for i in range(1, len(series)):
-            ema[i] = alpha * series[i] + (1 - alpha) * ema[i - 1]
-        return ema
+        try:
+            import pandas as _pd
+            return _pd.Series(series).ewm(alpha=alpha, adjust=False).mean().to_numpy()
+        except ImportError:
+            out = np.empty(len(series), dtype=np.float64)
+            out[0] = series[0]
+            for i in range(1, len(series)):
+                out[i] = alpha * series[i] + (1.0 - alpha) * out[i - 1]
+            return out
 
     def compute_rrg_scores(self, sector_etf_datasets: dict, spy_dataset) -> dict:
         """
@@ -673,6 +679,88 @@ class SectorRotationDetector:
                 ) / rng
 
         return results
+
+
+def _score_symbol_chunk(chunk, vol_cap, min_dollar_volume,
+                        use_rrg_rotation, w_sector_momentum, sec_max_mom,
+                        w_mom, w_trend, w_rs, w_invvol, w_vacc, w_h52w,
+                        sector_momentum, sym_to_sector):
+    """
+    Score a batch of pre-filtered symbols independently.
+
+    Called from ThreadPoolExecutor workers in rank_universe() — all inputs are
+    read-only so no locking is required.  Returns a list of
+    (symbol, score, components_dict) tuples.
+    """
+    rankings = []
+    for d, momentum, sma_score, rs_vs_spy, vol_20 in chunk:
+        if vol_20 > vol_cap:
+            continue
+
+        closes = d.prices_test[:, 3]
+        _ncols = d.prices_test.shape[1]
+
+        # Dollar volume liquidity gate (mid-cap filter)
+        if min_dollar_volume > 0 and _ncols > 4:
+            volumes_20 = d.prices_test[-20:, 4]
+            avg_dollar_vol = float(np.mean(volumes_20 * closes[-20:]))
+            if avg_dollar_vol < min_dollar_volume:
+                continue
+
+        inv_vol = 1.0 / max(vol_20, 0.01)
+
+        # Tier 4: Volume Accumulation Ratio
+        vol_acc = 0.5
+        if w_vacc > 0 and _ncols > 4:
+            volumes = d.prices_test[-63:, 4]
+            closes_63 = closes[-63:]
+            if len(volumes) >= 2:
+                total_vol = float(np.sum(volumes[1:]))
+                if total_vol > 0:
+                    up_mask = np.diff(closes_63) > 0
+                    vol_acc = float(np.sum(volumes[1:][up_mask]) / total_vol)
+                    vol_acc = max(0.0, min(1.0, vol_acc))
+
+        # Tier 5: 52-Week High Proximity
+        high52w_proximity = 0.0
+        if w_h52w > 0 and _ncols > 1:
+            bars_252 = min(len(closes), 252)
+            high52w = float(np.max(d.prices_test[-bars_252:, 1]))
+            if high52w > 0:
+                high52w_proximity = max(0.0, 1.0 - (high52w - float(closes[-1])) / high52w)
+
+        # Composite score
+        score = (
+            w_mom    * momentum
+            + w_trend * (sma_score / 3.0)
+            + w_rs    * rs_vs_spy
+            + w_invvol * (inv_vol / 100.0)
+            + w_vacc  * (vol_acc - 0.5) * 2.0
+            + w_h52w  * high52w_proximity
+        )
+
+        # Tier 3: Sector Momentum Boost
+        if sector_momentum:
+            bare_sym = d.symbol.split('_')[0] if '_' in d.symbol else d.symbol
+            sec = sym_to_sector.get(bare_sym, 'other')
+            sec_mom = sector_momentum.get(sec, 0.0)
+            if sec_max_mom > 0 and not use_rrg_rotation:
+                relative_boost = max(0.0, sec_mom / sec_max_mom)
+            elif use_rrg_rotation:
+                relative_boost = max(0.0, min(1.0, sec_mom))
+            else:
+                relative_boost = 0.0
+            score += w_sector_momentum * relative_boost
+
+        rankings.append((d.symbol, score, {
+            'momentum': momentum,
+            'sma_score': sma_score,
+            'rs_vs_spy': rs_vs_spy,
+            'vol_20': vol_20,
+            'vol_acc': vol_acc,
+            'high52w_proximity': high52w_proximity,
+        }))
+    return rankings
 
 
 class StockSelector:
@@ -839,79 +927,35 @@ class StockSelector:
         _w_h52w  = self.cfg.w_high52w    / _total_w
         _has_vol_col = True  # checked per-dataset below
 
-        for d, momentum, sma_score, rs_vs_spy, vol_20 in symbol_data:
-            if vol_20 > vol_cap:
-                continue  # Too volatile, skip
+        # Parallel scoring: split symbol_data across up to 16 workers.
+        # Each worker scores its chunk independently (no shared mutable state).
+        # NumPy operations inside each worker release the GIL → real CPU overlap.
+        _n_workers = max(1, min(len(symbol_data), 16))
+        _chunk_size = max(1, (len(symbol_data) + _n_workers - 1) // _n_workers)
+        _chunks = [symbol_data[i:i + _chunk_size]
+                   for i in range(0, len(symbol_data), _chunk_size)]
 
-            closes = d.prices_test[:, 3]
-            _ncols = d.prices_test.shape[1]
-
-            # --- v9.0 Dollar Volume Filter (mid-cap liquidity gate) ---
-            if self.cfg.min_dollar_volume > 0 and _ncols > 4:
-                volumes_20 = d.prices_test[-20:, 4]
-                avg_dollar_vol = float(np.mean(volumes_20 * closes[-20:]))
-                if avg_dollar_vol < self.cfg.min_dollar_volume:
-                    continue  # Too illiquid — skip
-
-            inv_vol = 1.0 / max(vol_20, 0.01)
-
-            # --- v9.0 Tier 4: Volume Accumulation Ratio ---
-            # Fraction of total volume on up-days over last 63 bars.
-            # >60% = institutional accumulation. Centered at 0: (vol_acc - 0.5) * 2
-            vol_acc = 0.5  # neutral default
-            if _w_vacc > 0 and _ncols > 4:
-                volumes = d.prices_test[-63:, 4]
-                closes_63 = closes[-63:]
-                if len(volumes) >= 2:
-                    total_vol = float(np.sum(volumes[1:]))
-                    if total_vol > 0:
-                        up_mask = np.diff(closes_63) > 0
-                        vol_acc = float(np.sum(volumes[1:][up_mask]) / total_vol)
-                        vol_acc = max(0.0, min(1.0, vol_acc))
-
-            # --- v9.0 Tier 5: 52-Week High Proximity ---
-            # 1.0 = stock AT 52-week high (confirmed breakout). 0.0 = far below high.
-            high52w_proximity = 0.0
-            if _w_h52w > 0 and _ncols > 1:
-                bars_252 = min(len(closes), 252)
-                high52w = float(np.max(d.prices_test[-bars_252:, 1]))  # col 1 = High
-                if high52w > 0:
-                    high52w_proximity = max(0.0, 1.0 - (high52w - float(closes[-1])) / high52w)
-
-            # --- Composite Score (weights pre-normalized above the loop) ---
-            score = (
-                _w_mom   * momentum
-                + _w_trend * (sma_score / 3.0)
-                + _w_rs    * rs_vs_spy
-                + _w_invvol* (inv_vol / 100.0)
-                + _w_vacc  * (vol_acc - 0.5) * 2.0
-                + _w_h52w  * high52w_proximity
+        if _n_workers == 1:
+            # Avoid executor overhead for trivially small universes
+            rankings = _score_symbol_chunk(
+                _chunks[0], vol_cap, self.cfg.min_dollar_volume,
+                self.cfg.use_rrg_rotation, self.cfg.w_sector_momentum, _sec_max_mom,
+                _w_mom, _w_trend, _w_rs, _w_invvol, _w_vacc, _w_h52w,
+                sector_momentum, self.sym_to_sector,
             )
-
-            # --- Tier 3: Sector Momentum Boost ---
-            # Stocks in the hottest sector get +w_sector_momentum; proportional for others.
-            # Negative-momentum sectors get 0 boost (no penalty — still rankable on own merit).
-            # When use_rrg_rotation=True, sector_momentum is already in [0,1] — skip max normalization.
-            if sector_momentum:
-                bare_sym = d.symbol.split('_')[0] if '_' in d.symbol else d.symbol
-                sec = self.sym_to_sector.get(bare_sym, 'other')
-                sec_mom = sector_momentum.get(sec, 0.0)
-                if _sec_max_mom > 0 and not self.cfg.use_rrg_rotation:
-                    relative_boost = max(0.0, sec_mom / _sec_max_mom)
-                elif self.cfg.use_rrg_rotation:
-                    relative_boost = max(0.0, min(1.0, sec_mom))  # already [0,1]
-                else:
-                    relative_boost = 0.0
-                score += self.cfg.w_sector_momentum * relative_boost
-
-            rankings.append((d.symbol, score, {
-                'momentum': momentum,
-                'sma_score': sma_score,
-                'rs_vs_spy': rs_vs_spy,
-                'vol_20': vol_20,
-                'vol_acc': vol_acc,
-                'high52w_proximity': high52w_proximity,
-            }))
+        else:
+            with ThreadPoolExecutor(max_workers=_n_workers) as _rank_pool:
+                _rank_futs = [
+                    _rank_pool.submit(
+                        _score_symbol_chunk, chunk, vol_cap, self.cfg.min_dollar_volume,
+                        self.cfg.use_rrg_rotation, self.cfg.w_sector_momentum, _sec_max_mom,
+                        _w_mom, _w_trend, _w_rs, _w_invvol, _w_vacc, _w_h52w,
+                        sector_momentum, self.sym_to_sector,
+                    )
+                    for chunk in _chunks
+                ]
+                for _fut in _rank_futs:
+                    rankings.extend(_fut.result())
 
         # Sort by composite score (descending)
         rankings.sort(key=lambda x: x[1], reverse=True)
@@ -1000,15 +1044,15 @@ class StockSelector:
         else:
             effective_ceiling = self.cfg.top_n
 
-        # Greedy selection — no sector cap, ride momentum
+        # Greedy selection — pure score order, no sector cap
         selected = []
         sector_counts = {}
         for sym, _, _ in rankings:
             if len(selected) >= effective_ceiling:
                 break
-            selected.append(sym)
             bare_sym = sym.split('_')[0] if '_' in sym else sym
             sector = self.sym_to_sector.get(bare_sym, 'other')
+            selected.append(sym)
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
         # Filter datasets to only selected symbols

@@ -523,7 +523,7 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
     # Cap at 8 workers: NumPy GIL release gives real CPU overlap, but memory
     # pressure from >8 live pipeline copies outweighs the speedup.
     from queue import Queue as _Queue
-    n_workers = min(len(datasets), 8)
+    n_workers = max(1, min(len(datasets), 16))
     _pl_pool = _Queue()
     for _ in range(n_workers):
         _pl_pool.put(deepcopy(pipeline))
@@ -874,7 +874,7 @@ def run_ablation_study(datasets, pipeline, cfg, acfg,
         return name, results, len(filtered)
 
     # Run all 8 configs in parallel; NumPy releases GIL → real CPU overlap
-    n_workers = min(len(ablation_jobs), 4)  # cap at 4 to control memory
+    n_workers = min(len(ablation_jobs), 16)  # 16-core machine — run all jobs in parallel
     abl_results = {}   # name -> (results_dict_or_None, n_selected)
     with ThreadPoolExecutor(max_workers=n_workers) as _abl_pool:
         _futures = {_abl_pool.submit(_run_one_ablation, job): job[0]
@@ -2238,17 +2238,21 @@ Examples:
     # v8.0 Stock Selection
     g = p.add_argument_group("v8.0 Stock Selection")
     g.add_argument("--version", type=str, default="v7",
-                   choices=["v7", "v8"],
-                   help="Strategy version: v7=current, v8=stock selection engine")
+                   choices=["v7", "v8", "v9"],
+                   help="Strategy version: v7=baseline, v8=stock selection engine, "
+                        "v9=full stack (v8 + RRG rotation + volume/breakout factors + sector breadth)")
     g.add_argument("--top-n", type=int, default=15,
-                   help="v8.0: stocks to select when --adaptive-n is OFF (default: 15). "
-                        "With --adaptive-n, ignored — N expands to all stocks that pass the threshold.")
+                   help="v8.0: fallback fixed-N cap used only when --no-adaptive-n is passed (default: 15). "
+                        "In v8 mode adaptive selection is ON by default — all stocks passing the threshold are traded.")
     g.add_argument("--adaptive-n", action="store_true",
                    help="v8.0 Tier 2: variable N — select all stocks within min-score-pct drop of the top score. "
-                        "4 qualify in a weak market → take 4; 25 qualify in a bull run → take 25.")
+                        "Always ON when --version v8 (default). 4 qualify in a weak market → take 4; 25 qualify in a bull run → take 25.")
+    g.add_argument("--no-adaptive-n", action="store_true",
+                   help="v8.0: disable adaptive N and use a fixed --top-n cap instead (overrides v8 default).")
     g.add_argument("--min-score-pct", type=float, default=0.50,
-                   help="v8.0 Tier 2: quality threshold as fraction of top score drop allowed (default: 0.50). "
-                        "0.50 means select stocks within 50%% of the top score's absolute magnitude. "
+                   help="v8.0 Tier 2: quality threshold — select stocks within this fraction of the top score "
+                        "(default: 0.50, i.e. threshold = 50%% of top score magnitude). "
+                        "Lower = wider net (more stocks). Higher = tighter (fewer, higher-conviction). "
                         "Must be in [0.0, 1.0].")
     g.add_argument("--sector-momentum-gate", action="store_true",
                    help="v8.0 Tier 3: boost composite scores for stocks in high-momentum sectors")
@@ -2448,7 +2452,7 @@ def resolve_symbols(args):
     if args.symbols:
         return [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     # Default: for v8.0, load full diversified universe; otherwise first n_symbols
-    if getattr(args, 'version', 'v7') == 'v8':
+    if getattr(args, 'version', 'v7') in ('v8', 'v9'):
         base = DEFAULT_SYMBOLS[:206]  # All 206 stocks across 11 sectors
         # v9.0: --include-midcap expands universe with Rising Stars (~70 additional symbols)
         if getattr(args, 'include_midcap', False):
@@ -2468,6 +2472,25 @@ def resolve_symbols(args):
 
 def main():
     args = parse_args()
+
+    # --- v9.0: auto-enable all v9.0 features when --version v9 ---
+    # v9 = v8 base + RRG rotation + volume accumulation + 52w high proximity
+    #      + sector breadth gate + mid-cap Rising Stars universe.
+    # Individual flags can still be passed to override these defaults.
+    if args.version == "v9":
+        if not args.sector_momentum_gate:
+            args.sector_momentum_gate = True          # required for RRG to activate
+        if not getattr(args, 'rrg_rotation', False):
+            args.rrg_rotation = True                  # RRG quadrant sector scoring
+        # NOTE: sector_breadth_gate is NOT auto-enabled — it filters entire sectors and
+        # causes 0 stocks selected when the universe is single-sector (e.g. all tech).
+        # Enable manually with --sector-breadth-gate for diverse multi-sector universes.
+        if getattr(args, 'volume_acc_weight', 0.0) == 0.0:
+            args.volume_acc_weight = 0.10             # Tier 4: institutional accumulation
+        if getattr(args, 'high52w_weight', 0.0) == 0.0:
+            args.high52w_weight = 0.05                # Tier 5: 52-week high proximity / breakout
+        if not getattr(args, 'include_midcap', False):
+            args.include_midcap = True                # Mid-cap Rising Stars universe extension
 
     # -- Handle --sector list early (before heavy init) --
     if args.sector.strip().lower() == "list":
@@ -2576,7 +2599,11 @@ def main():
     # BANNER
     # **********************************************************************
     print_section("", reset=True)  # Reset section counter for this run
-    _ver_label = "v8.0 -- Stock Selection Engine" if args.version == "v8" else "v7.0 -- Institutional Architecture"
+    _ver_label = (
+        "v9.0 -- RRG + Multi-Factor Selection Engine" if args.version == "v9"
+        else "v8.0 -- Stock Selection Engine" if args.version == "v8"
+        else "v7.0 -- Institutional Architecture"
+    )
     print_box(
         f"ALPHA-TRADE {_ver_label}",
         f"L1->L2->L3->L4 | RL is one alpha of many | cfg:{config_hash} | {datetime.now():%Y-%m-%d %H:%M}"
@@ -2732,92 +2759,71 @@ def main():
     spy_dataset_for_rrg = None
 
     if getattr(args, 'rrg_rotation', False):
+        import pandas as _etf_pd  # noqa: F811 — local import for RRG ETF loading
+        from concurrent.futures import ThreadPoolExecutor as _TPEX, as_completed as _ac
+
         _etf_dir = Path(NORGATE_DIR) / "US_Equities"
-        for _sector_name, _etf_sym in _SECTOR_ETF_MAP.items():
-            _etf_path = _etf_dir / f"{_etf_sym}.parquet"
-            if not _etf_path.exists():
-                tprint(f"  [RRG] {_etf_sym} not found in Norgate, skipping {_sector_name}", "warn")
-                continue
+
+        def _load_one_etf(sector_sym_pair):
+            """Load and build a SymbolDataset for one sector ETF — runs in thread pool."""
+            _sn, _sym = sector_sym_pair
+            _path = _etf_dir / f"{_sym}.parquet"
+            if not _path.exists():
+                return _sn, _sym, None, f"{_sym} not found in Norgate"
             try:
-                _etf_df = pd.read_parquet(_etf_path)
-                # Normalize column names
-                _col_map = {}
-                for _c in _etf_df.columns:
+                _df = _etf_pd.read_parquet(_path)
+                _cmap = {}
+                for _c in _df.columns:
                     _cl = _c.lower().strip()
                     if _cl == 'close' and 'unadj' not in _cl:
-                        _col_map[_c] = 'Close'
+                        _cmap[_c] = 'Close'
                     elif _cl == 'high':
-                        _col_map[_c] = 'High'
+                        _cmap[_c] = 'High'
                     elif _cl == 'open':
-                        _col_map[_c] = 'Open'
+                        _cmap[_c] = 'Open'
                     elif _cl == 'low':
-                        _col_map[_c] = 'Low'
+                        _cmap[_c] = 'Low'
                     elif _cl == 'volume':
-                        _col_map[_c] = 'Volume'
-                _etf_df = _etf_df.rename(columns=_col_map)
-                if 'Close' not in _etf_df.columns:
-                    continue
-                _ec = _etf_df['Close'].values.astype(np.float32)
-                _eh = _etf_df['High'].values.astype(np.float32) if 'High' in _etf_df else _ec.copy()
-                _eo = _etf_df['Open'].values.astype(np.float32) if 'Open' in _etf_df else _ec.copy()
-                _el = _etf_df['Low'].values.astype(np.float32) if 'Low' in _etf_df else _ec.copy()
-                _ev = _etf_df['Volume'].values.astype(np.float32) if 'Volume' in _etf_df else np.zeros(len(_ec), dtype=np.float32)
+                        _cmap[_c] = 'Volume'
+                _df = _df.rename(columns=_cmap)
+                if 'Close' not in _df.columns:
+                    return _sn, _sym, None, "no Close column"
+                _ec = _df['Close'].values.astype(np.float32)
+                _eh = _df['High'].values.astype(np.float32) if 'High' in _df else _ec.copy()
+                _eo = _df['Open'].values.astype(np.float32) if 'Open' in _df else _ec.copy()
+                _el = _df['Low'].values.astype(np.float32)  if 'Low'  in _df else _ec.copy()
+                _ev = (_df['Volume'].values.astype(np.float32)
+                       if 'Volume' in _df else np.zeros(len(_ec), dtype=np.float32))
                 _n = len(_ec)
-                _prices = np.column_stack([_eo, _eh, _el, _ec, _ev])
                 _ds = SymbolDataset(
-                    symbol=_etf_sym,
+                    symbol=_sym,
                     features_train=np.zeros((0, 49), dtype=np.float32),
                     features_val=np.zeros((0, 49), dtype=np.float32),
                     features_test=np.zeros((0, 49), dtype=np.float32),
                     prices_train=np.zeros((0, 5), dtype=np.float32),
                     prices_val=np.zeros((0, 5), dtype=np.float32),
-                    prices_test=_prices,
+                    prices_test=np.column_stack([_eo, _eh, _el, _ec, _ev]),
                     n_train=0, n_val=0, n_test=_n,
                 )
-                sector_etf_datasets[_sector_name] = _ds
+                return _sn, _sym, _ds, None
             except Exception as _e:
-                tprint(f"  [RRG] Failed to load {_etf_sym}: {_e}", "warn")
-        tprint(f"  [RRG] Loaded {len(sector_etf_datasets)}/11 sector ETFs", "info")
+                return _sn, _sym, None, str(_e)
 
-        # SPY dataset for RRG (full OHLCV, not just returns dict)
-        _spy_path2 = Path(NORGATE_DIR) / "US_Equities" / "SPY.parquet"
-        if _spy_path2.exists():
-            try:
-                _spy_df2 = pd.read_parquet(_spy_path2)
-                _scol_map = {}
-                for _c in _spy_df2.columns:
-                    _cl = _c.lower().strip()
-                    if _cl == 'close' and 'unadj' not in _cl:
-                        _scol_map[_c] = 'Close'
-                    elif _cl == 'high':
-                        _scol_map[_c] = 'High'
-                    elif _cl == 'open':
-                        _scol_map[_c] = 'Open'
-                    elif _cl == 'low':
-                        _scol_map[_c] = 'Low'
-                    elif _cl == 'volume':
-                        _scol_map[_c] = 'Volume'
-                _spy_df2 = _spy_df2.rename(columns=_scol_map)
-                if 'Close' in _spy_df2.columns:
-                    _sc = _spy_df2['Close'].values.astype(np.float32)
-                    _sh = _spy_df2['High'].values.astype(np.float32) if 'High' in _spy_df2 else _sc.copy()
-                    _so = _spy_df2['Open'].values.astype(np.float32) if 'Open' in _spy_df2 else _sc.copy()
-                    _sl = _spy_df2['Low'].values.astype(np.float32) if 'Low' in _spy_df2 else _sc.copy()
-                    _sv = _spy_df2['Volume'].values.astype(np.float32) if 'Volume' in _spy_df2 else np.zeros(len(_sc), dtype=np.float32)
-                    _sn = len(_sc)
-                    spy_dataset_for_rrg = SymbolDataset(
-                        symbol='SPY',
-                        features_train=np.zeros((0, 49), dtype=np.float32),
-                        features_val=np.zeros((0, 49), dtype=np.float32),
-                        features_test=np.zeros((0, 49), dtype=np.float32),
-                        prices_train=np.zeros((0, 5), dtype=np.float32),
-                        prices_val=np.zeros((0, 5), dtype=np.float32),
-                        prices_test=np.column_stack([_so, _sh, _sl, _sc, _sv]),
-                        n_train=0, n_val=0, n_test=_sn,
-                    )
-                    tprint("  [RRG] SPY dataset loaded for RRG normalization", "ok")
-            except Exception as _e:
-                tprint(f"  [RRG] Failed to load SPY for RRG: {_e}", "warn")
+        # Load all 11 ETFs + SPY in parallel (I/O-bound — real speedup from concurrency)
+        _etf_items = list(_SECTOR_ETF_MAP.items()) + [('__spy__', 'SPY')]
+        with _TPEX(max_workers=min(len(_etf_items), 16)) as _etf_pool:
+            _etf_futs = {_etf_pool.submit(_load_one_etf, item): item for item in _etf_items}
+            for _fut in _ac(_etf_futs):
+                _sn, _sym, _ds, _err = _fut.result()
+                if _err:
+                    tprint(f"  [RRG] {_sym}: {_err}", "warn")
+                elif _sn == '__spy__':
+                    spy_dataset_for_rrg = _ds
+                else:
+                    sector_etf_datasets[_sn] = _ds
+
+        tprint(f"  [RRG] Loaded {len(sector_etf_datasets)}/11 sector ETFs"
+               + (" + SPY" if spy_dataset_for_rrg else ""), "info")
 
     # -- L0 DATA QUALITY CHECKS --
     quality_results = []
@@ -3134,16 +3140,20 @@ def main():
     v8_results = None
     v8_lt = {}
 
-    if args.version == "v8":
-        print_section("V8.0 STOCK SELECTION ENGINE")
-        # Failure post-mortem (verbose, v8 mode only)
+    if args.version in ("v8", "v9"):
+        _sel_label = "V9.0 STOCK SELECTION ENGINE" if args.version == "v9" else "V8.0 STOCK SELECTION ENGINE"
+        print_section(_sel_label)
+        # Failure post-mortem (verbose, v8/v9 mode only)
         tprint("Analyzing why v3.0 and v7.0 (no SMA) underperform...", "info")
         run_postmortem(base_results, nosma_results, pipeline_results, datasets)
 
     # Stock selection — always run so v8 column appears in comparison table
+    # v8 defaults to adaptive N (trade all stocks meeting criteria).
+    # --no-adaptive-n overrides back to fixed --top-n cap.
+    _adaptive_n = (args.adaptive_n or args.version in ("v8", "v9")) and not getattr(args, 'no_adaptive_n', False)
     sel_cfg = SelectionConfig(
         top_n=args.top_n,
-        adaptive_n=args.adaptive_n,
+        adaptive_n=_adaptive_n,
         min_score_pct=args.min_score_pct,
         sector_momentum_gate=args.sector_momentum_gate,
         w_sector_momentum=args.sector_momentum_weight,
@@ -3164,7 +3174,7 @@ def main():
         spy_dataset=spy_dataset_for_rrg if getattr(args, 'rrg_rotation', False) else None,
     )
 
-    if args.version == "v8":
+    if args.version in ("v8", "v9"):
         tprint(f"Selected {len(selected_datasets)} stocks from "
                f"{len(datasets)} universe:", "ok")
         if selector.selection_log:
@@ -3188,11 +3198,10 @@ def main():
             _sec_alloc = _log.get('sector_allocation', {})
             if _sec_alloc:
                 tprint(f"  Sector allocation: {dict(_sec_alloc)}", "info")
-            # Tier 2: always log when adaptive_n is on so the user can see N in action
-            _eff_n = _log.get('effective_n', args.top_n)
-            if args.adaptive_n:
-                tprint(f"  Adaptive N: {_eff_n} stocks passed threshold "
-                       f"(min_score_pct={args.min_score_pct:.0%} of top score)", "info")
+            # Tier 2: log N in action (always on in v8 mode)
+            if _adaptive_n:
+                tprint(f"  Adaptive N: {len(_log['selected'])} stocks selected "
+                       f"(threshold={args.min_score_pct:.0%} of top score)", "info")
             # Tier 3: log top-3 sector momentum scores (v8 stock-avg mode)
             _sec_mom = _log.get('sector_momentum', {})
             if _sec_mom and not getattr(args, 'rrg_rotation', False):
@@ -3250,10 +3259,10 @@ def main():
     for _rank_idx, _sel_sym in enumerate(_v8_sel_log['selected'] if _v8_sel_log else []):
         _v8_rank[_sel_sym] = _rank_idx
 
-    # Evaluate v8.0 with rank-based sizing.
-    # --version v8: use selector-filtered datasets (top-N from full universe).
-    # comparison mode: use same datasets as v7 so all symbols appear; only sizing differs.
-    _v8_eval_datasets = selected_datasets if args.version == "v8" else datasets
+    # Evaluate v8/v9 with rank-based sizing.
+    # --version v8/v9: use selector-filtered datasets (stocks passing quality threshold).
+    # comparison mode (v7): use same datasets as v7 so all symbols appear; only sizing differs.
+    _v8_eval_datasets = selected_datasets if args.version in ("v8", "v9") else datasets
     pipeline.use_sma = True
     pipeline.use_v8_sizing = True
     pipeline._v8_rank = _v8_rank
@@ -3264,12 +3273,12 @@ def main():
         datasets=_v8_eval_datasets,
         pipeline=pipeline, cfg=cfg, acfg=acfg,
         label="Pipeline v8.0",
-        verbose=args.verbose if args.version == "v8" else 0,
+        verbose=args.verbose if args.version in ("v8", "v9") else 0,
         spy_returns_lookup=spy_returns_lookup,
     )
     v8_lt = dict(pipeline.execution_engine.lifetime_stats)
 
-    if args.version == "v8":
+    if args.version in ("v8", "v9"):
         print_results(v8_results)
 
     # Restore pipeline to v7.0 mode
@@ -3320,8 +3329,9 @@ def main():
         _spy_period_str = f"{_test_dates_sorted[0]} to {_test_dates_sorted[-1]}"
 
     # -- v8.0 Ablation study (needs spy_total_pnl computed above) --
-    if args.version == "v8" and not args.skip_ablation and pipeline_results is not None:
-        print_section("V8.0 ABLATION STUDY")
+    if args.version in ("v8", "v9") and not args.skip_ablation and pipeline_results is not None:
+        _abl_label = "V9.0 ABLATION STUDY" if args.version == "v9" else "V8.0 ABLATION STUDY"
+        print_section(_abl_label)
         tprint("Testing each selection factor independently — KEEP or DISCARD.", "info")
         run_ablation_study(
             datasets=datasets, pipeline=pipeline, cfg=cfg, acfg=acfg,
@@ -3447,7 +3457,12 @@ def main():
 
             _groups = [('', 1), ('Base v3.0', 4), ('v7.0 (no SMA)', 4), ('Pipeline v7.0', 4)]
             if _has_v8:
-                _groups.append(('v8.0 (Select)', 4))
+                _v8_col_label = (
+                    'v9.0 (Select)' if args.version == "v9"
+                    else 'v8.0 (Select)' if args.version == "v8"
+                    else 'v8.0 (Sizing)'
+                )
+                _groups.append((_v8_col_label, 4))
             table.set_header_groups(_groups)
 
             # Helper: build row — each strategy gets (pnl, tr, used, cagr)
@@ -3709,7 +3724,11 @@ def main():
     tprint("Visual summaries — quick-glance performance charts.", "info")
 
     # Version-aware chart label: charts always use pipeline_results data
-    _chart_ver = "v8.0 (Select)" if args.version == "v8" else "Pipeline v7.0"
+    _chart_ver = (
+        "v9.0 (Select)" if args.version == "v9"
+        else "v8.0 (Select)" if args.version == "v8"
+        else "Pipeline v7.0"
+    )
 
     # (a) Per-symbol Trade P&L horizontal bars (green/red)
     _chart_per_sym = pipeline_results.get('per_sym', {})
@@ -4181,7 +4200,7 @@ def main():
     if HAS_TORCH and torch.cuda.is_available():
         tprint(f"Peak GPU: {torch.cuda.max_memory_allocated()/1024**3:.2f}GB", "gpu")
 
-    _complete_ver = "v8.0" if args.version == "v8" else "v7.0"
+    _complete_ver = "v9.0" if args.version == "v9" else "v8.0" if args.version == "v8" else "v7.0"
     _complete_score = v8_results['score'] if v8_results is not None else pipeline_results['score']
     print_box(
         f"COMPLETE -- ALPHA-TRADE {_complete_ver}",

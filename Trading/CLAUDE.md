@@ -54,6 +54,77 @@ Design, review, and improve a modular, auditable, production-realistic quantitat
    - Example: Before adding curriculum learning, research if it's appropriate for the use case
    - Rationale: Prevents incorrect implementations that need to be reverted (e.g., curriculum learning over datasets was wrong for PPO)
 
+10) **Mandatory Parallelization — ALWAYS SATURATE ALL 16 CPU CORES**
+    - The machine has 16 CPU cores. Every loop or batch operation that is computationally
+      non-trivial MUST be parallelized. Sequential code is a performance bug.
+    - Use `concurrent.futures.ThreadPoolExecutor` for I/O-bound and NumPy-heavy tasks
+      (NumPy releases the GIL → real CPU overlap). Use `ProcessPoolExecutor` for pure-Python
+      CPU-bound tasks where pickling cost is justified (e.g. walk-forward CV folds).
+    - Default worker count: `max_workers = max(1, min(N, 16))` where N = number of independent
+      tasks. Never hard-cap below 16 unless there is an explicit memory constraint documented
+      inline.
+    - Any new loop over datasets, symbols, sectors, ETFs, configurations, folds, or simulation
+      runs MUST use a thread/process pool unless the loop body has fewer than ~10 iterations
+      AND each iteration is trivially fast (<1 ms). Document the exception inline if skipping.
+    - Scoring / ranking loops (e.g. `rank_universe`): use `_score_symbol_chunk` pattern —
+      module-level worker function + `ThreadPoolExecutor` chunked submit + `extend` collect +
+      single final `sort`. Worker functions must be pure (no shared mutable state).
+    - ETF / file loading loops: always parallel — I/O latency hides behind concurrency for free.
+    - Ablation / config-sweep loops: always parallel up to 16 workers.
+    - Vectorize inner loops before parallelizing outer ones. Example: `_ema()` must use
+      `pandas.Series.ewm()` (vectorized), not a Python `for` loop, before the per-sector
+      outer loop is submitted to a pool.
+    - When adding any new loop, the code review checklist (CODE REVIEW MODE item 9) must
+      include: "Is this loop parallelized? If not, why not?"
+
+11) **Hypothesis-Driven Sectoral Research — PRICE/VOLUME ONLY, BACKTESTED FROM 1990**
+    - We have Norgate daily OHLCV data going back to 1990. This is the ONLY permitted data source
+      for all sectoral churn and stock selection research. No fundamental data, no sentiment, no
+      macro indicators, no external feeds. Pure price and volume.
+    - The system must proactively generate hypotheses about HOW to detect sectoral churn and
+      WHICH stocks benefit — then validate every hypothesis through historical backtesting
+      on the full 1990–present dataset.
+    - A "hypothesis" is NOT valid until it has a backtest result. Anecdote is not evidence.
+    - Every proposed signal, indicator, or selection rule must specify:
+        a) The economic hypothesis (WHY should this work?)
+        b) The detection method (WHAT price/volume pattern signals it?)
+        c) The backtest result across the full history since 1990 (DOES it actually work?)
+        d) Performance across distinct regime periods (does it work in ALL regimes, or just one?)
+    - Sectoral churn research must cover AT MINIMUM these regime periods:
+        1990–1999: Tech/Growth bull market
+        2000–2002: Tech bust, value outperforms
+        2003–2007: Commodities/Energy supercycle, Financials peak
+        2008–2009: GFC — Energy/Financials collapse, Utilities/Staples defend
+        2010–2019: QE-era, low-vol Growth/Tech dominance
+        2020: COVID crash and V-recovery — Healthcare, Tech lead
+        2021: Reopening — Energy, Industrials, Financials surge
+        2022: Rates shock — Energy only positive sector; Growth/Tech collapse
+        2023–2024: AI supercycle — Tech/Comm Services rebound
+    - Research outputs must answer:
+        "Which OHLCV-only signals, computable at time T with data ≤ T, predicted sector rotation
+         BEFORE it was obvious to the consensus?"
+    - Permitted signal families (all OHLCV-derivable):
+        Price momentum at multiple timeframes (1m, 3m, 6m, 12m)
+        Relative strength of sector ETF vs SPY (multi-timeframe)
+        RRG quadrant transitions (RS-Ratio × RS-Momentum — already in v9.0)
+        Sector breadth (% stocks above 50d/200d SMA)
+        Volume expansion on up-days vs down-days (institutional accumulation)
+        52-week high breakouts within a sector (breadth of breakouts, not just price)
+        ATR expansion (volatility awakening before a move)
+        Inter-sector relative performance divergence (widening gap = rotation starting)
+        New 52-week high count acceleration within a sector
+    - Research must always separate "sector detection" from "stock selection within sector":
+        Tier A: Which sector is about to lead? (sector-level signal)
+        Tier B: Which stocks WITHIN that sector benefit first? (stock-level signal)
+    - For Tier B (individual stock selection in churning sector), examine:
+        Stocks near 52-week highs WITHIN sector before sector moves
+        Stocks with volume accumulation ratio > 60% over 63 bars WITHIN sector
+        Stocks with highest RS vs. sector ETF (intra-sector relative strength leaders)
+        Stocks with lowest drawdown from 52-week high (resilience = quiet accumulation)
+    - All backtests must report: hit rate, average return in subsequent 1m/3m/6m,
+      Sharpe of a signal-triggered selection vs. random sector stock selection,
+      and false positive rate (how often does the signal fire but sector does NOT rotate?)
+
 ## REQUIRED ARCHITECTURE (STRICT 5 LAYERS)
 
 ### L0 — Data Infrastructure & Integrity
@@ -310,14 +381,21 @@ When code is provided:
    - significance thresholds, multiple testing correction, OOS decay, complexity justification, CV protocol
 8) Verify reproducibility:
    - config-driven, seeded, versioned, deterministic
-9) Produce a prioritized upgrade list:
-   - "Must fix for correctness" (bugs, leakage, lookahead)
-   - "Must fix for robustness" (missing constraints, no kill switches, no cost model)
-   - "Should fix for production readiness" (logging gaps, no reconciliation, no alerting)
-   - "Nice-to-have improvements" (additional alphas, better ensembling, UI/reporting)
-10) Provide concrete code snippets for each recommended change (minimal patches when possible).
-11) Be precise: do not claim features exist unless they are present in the code.
-12) Call out all assumptions and "unknowns" explicitly.
+9) **Verify parallelization (Absolute Rule #10):**
+   - Identify every loop over datasets, symbols, sectors, folds, or configs.
+   - Flag any that are sequential and non-trivial as "performance bug."
+   - Confirm worker count uses `max(1, min(N, 16))` pattern.
+   - Confirm inner loops (e.g. EMA, indicator computation) are vectorized before outer loops
+     are parallelized.
+10) Produce a prioritized upgrade list:
+    - "Must fix for correctness" (bugs, leakage, lookahead)
+    - "Must fix for performance" (sequential loops that should be parallel — Absolute Rule #10)
+    - "Must fix for robustness" (missing constraints, no kill switches, no cost model)
+    - "Should fix for production readiness" (logging gaps, no reconciliation, no alerting)
+    - "Nice-to-have improvements" (additional alphas, better ensembling, UI/reporting)
+11) Provide concrete code snippets for each recommended change (minimal patches when possible).
+12) Be precise: do not claim features exist unless they are present in the code.
+13) Call out all assumptions and "unknowns" explicitly.
 
 ## SAFETY & CONSERVATISM
 
@@ -335,11 +413,11 @@ When uncertain, ask ONE clarifying question at a time, but still provide the bes
 
 ## File Map
 
-| File | Lines | Role |
+| File | Lines (approx) | Role |
 |---|---|---|
-| `alphago_trading_system.py` | ~4,200 | v3.0 core: Config, TradingEnv, PPO, MCTS, features |
-| `alphago_architecture.py` | ~4,590 | v6.0 pipeline: L1-L4 classes, AlphaSignal, MetaLearner, PortfolioConstructor, ExecutionEngine |
-| `alphago_layering.py` | ~1,800 | Launcher: wires L1→L2→L3→L4, walk-forward validation, evaluation |
+| `alphago_trading_system.py` | ~5,100 | v3.0 core: Config, TradingEnv, PPO, MCTS, features, MID_CAP_SYMBOLS |
+| `alphago_architecture.py` | ~5,200 | v6–v9 pipeline: L1–L4 classes + SelectionConfig, StockSelector, SectorRotationDetector |
+| `alphago_layering.py` | ~4,300 | Launcher: v7/v8/v9 wiring, walk-forward, evaluation, charts, sector output |
 | `alphago_cost_model.py` | ~153 | Shared cost model: half-spread + sqrt-impact + fees |
 | `data_quality.py` | ~1,220 | L0: quality scoring, missing data, schema validation |
 | `validation_engine.py` | ~990 | Anti-overfitting: purged walk-forward CV, deflated Sharpe, significance gates |
@@ -358,6 +436,7 @@ When uncertain, ask ONE clarifying question at a time, but still provide the bes
 | L2 | `alphago_architecture.py` (MetaLearner, SignalEnsemble, etc.) | 1275-2660 |
 | L3 | `alphago_architecture.py` (PortfolioConstructor) | 2665-3200 |
 | L4 | `alphago_architecture.py` (ExecutionEngine) | 3200-3800 |
+| Stock Selection | `alphago_architecture.py` (SelectionConfig, StockSelector, SectorRotationDetector) | ~472-1100 |
 
 ## Data Flow (one bar through the full pipeline)
 
@@ -522,6 +601,253 @@ These fixes target `alphago_trading_system.py` (the v3.0 RL engine) and `alphago
 - `alphago_mcts_parallel.py` — Fix 1
 - `alphago_trading_system.py` — Fixes 2-8
 
+### Performance Optimizations (Feb 2026) — 7 Hot-Path Fixes
+
+Target: reduce full backtest runtime from ~1h20m to ~30-40 min.
+
+**Fix P1: Parallel `evaluate_with_pipeline()` across symbols**
+- `ThreadPoolExecutor` with up to 8 workers; each thread draws a `deepcopy(pipeline)` from a `Queue`
+- NumPy releases the GIL enabling real CPU overlap
+- **File:** `alphago_layering.py`
+
+**Fix P2: Pre-concatenate training closes (O(1) SMA slice)**
+- Build `_v8_sma_combined = np.concatenate([train_tail, test_closes])` once per symbol
+- `pipeline.step()` slices `[:train_len + bar_idx + 1]` instead of calling `np.concatenate` every bar
+- **File:** `alphago_architecture.py` (`pipeline.step()`)
+
+**Fix P3: `_dq_score` → `_sym_dq_score` bug**
+- Dataset quality score is stable; moved outside `while not done:` loop, renamed to avoid NameError
+- **File:** `alphago_layering.py` (~line 396)
+
+**Fix P4: Parallel ablation study**
+- Ablation study parallelized with `ThreadPoolExecutor`; each thread gets `deepcopy(pipeline)`
+- Results printed in deterministic order after `as_completed`
+- **File:** `alphago_layering.py`
+
+**Fix P5: Vectorized log returns**
+- `log_rets[1:][_valid] = np.log(closes[1:][_valid] / closes[:-1][_valid])` replaces Python for-loop
+- **File:** `alphago_layering.py`
+
+**Fix P6: Vectorized cumulative returns**
+- `_cs = np.cumsum(log_rets)`, then slice-based 5-bar and 15-bar windows replace O(n×w) Python loops
+- **File:** `alphago_layering.py`
+
+**Fix P7: Pre-compute normalized weights**
+- `_w_mom`, `_w_trend`, `_w_rs`, `_w_invvol`, `_w_vacc`, `_w_h52w` computed once before the symbol loop
+- **File:** `alphago_architecture.py` (`rank_universe()`)
+
+### Sector/Symbol Output Fixes (Feb 2026)
+
+**Sector chart `_1d` suffix mismatch**
+- `SECTOR_MAP` uses plain symbols (`AAPL`); Norgate keys are `AAPL_1d`
+- Fixed with `_bare_to_key = {k.split('_')[0]: k for k in per_sym}` reverse lookup
+- **File:** `alphago_layering.py` (CHARTS section)
+
+**Sector text table added**
+- Companion text table alongside hbar chart showing: sector, total P&L, stock count, win rate
+- Visible in CI/log files where terminal charts may not render
+- **File:** `alphago_layering.py`
+
+**Score Quartile vs Returns table**
+- Groups selected stocks by composite score quartile (Top 25%, Upper-Mid, Lower-Mid, Bottom 25%)
+- Shows Avg P&L, Win%, Avg Sharpe per quartile — validates that score rank predicts actual returns
+- **File:** `alphago_layering.py`
+
+**Factor Correlation table**
+- Pearson correlation between each scoring factor and actual trade P&L
+- Factors: momentum, SMA alignment, RS vs SPY, volatility, volume accumulation, 52w high proximity
+- **File:** `alphago_layering.py`
+
+---
+
+## v8.0 Stock Selection Engine (FULLY IMPLEMENTED)
+
+### Overview
+Pre-pipeline stock selection layer that filters a 206-stock large-cap universe down to the highest-conviction names before the L1–L4 pipeline runs. The selection decision is pure price/volume — no RL or ML predictions involved.
+
+Activated with `--version v8` or `--version v9`.
+
+### SelectionConfig (`alphago_architecture.py`, ~line 472)
+
+| Field | Default | Description |
+|---|---|---|
+| `top_n` | 15 | Fixed cap (only used when `--no-adaptive-n` passed) |
+| `adaptive_n` | False | **Auto-True in v8/v9**: trade all stocks passing quality threshold |
+| `min_score_pct` | 0.50 | Quality gate: select stocks within 50% of top score's magnitude |
+| `momentum_lookback` | 252 | 12-month momentum window |
+| `momentum_skip` | 21 | Skip last month (avoids short-term reversal noise) |
+| `min_bars` | 63 | Minimum 3 months of data required |
+| `sma_alignment_required` | True | Drop stocks not in uptrend (P > SMA50 > SMA100 > SMA200) |
+| `volatility_cap_percentile` | 95.0 | Exclude top 5% most volatile stocks |
+| `sector_momentum_gate` | False | Enable Tier 3 sector boost |
+| `w_sector_momentum` | 0.10 | Max additive boost from sector momentum |
+| `w_momentum` | 0.50 | Composite score: 12-1m momentum weight |
+| `w_trend` | 0.15 | Composite score: SMA alignment weight |
+| `w_rs` | 0.30 | Composite score: relative strength vs SPY weight |
+| `w_invvol` | 0.05 | Composite score: inverse volatility weight |
+| `w_volume_acc` | 0.00 | v9.0 Tier 4: volume accumulation weight (0=off) |
+| `w_high52w` | 0.00 | v9.0 Tier 5: 52-week high proximity weight (0=off) |
+| `use_rrg_rotation` | False | v9.0: use RRG ETF quadrant scores for Tier 3 |
+| `rrg_fast_period` | 50 | v9.0: RRG fast EMA (~10 trading weeks) |
+| `rrg_slow_period` | 200 | v9.0: RRG slow EMA (~40 trading weeks) |
+| `sector_breadth_gate` | False | v9.0: require >50% of sector stocks above 50d SMA |
+| `min_dollar_volume` | 0.0 | v9.0: min avg daily dollar volume (mid-cap liquidity gate) |
+
+### Composite Scoring (rank_universe)
+
+All weights are pre-normalized to sum to 1.0 before the symbol loop (Fix P7).
+
+```
+score = w_momentum  * momentum_12_1m
+      + w_trend     * (sma_score / 3.0)          # SMA score is 0-3
+      + w_rs        * rs_vs_spy_6m
+      + w_invvol    * (inv_vol / 100.0)
+      + w_volume_acc * (vol_acc - 0.5) * 2.0     # centered: >50% up-vol = positive
+      + w_high52w   * high52w_proximity           # 1.0 = at 52w high
+```
+
+**Tier 3 Sector Boost** (when `sector_momentum_gate=True`):
+```
+score += w_sector_momentum * relative_boost
+```
+where `relative_boost` is RRG quadrant score (v9) or normalized mean 6-month sector return (v8).
+
+### Adaptive N (Tier 2)
+
+Default behavior in v8/v9: select ALL stocks above quality threshold.
+```
+threshold = top_score - abs(top_score) * (1 - min_score_pct)
+effective_n = count(stocks where score >= threshold)
+```
+- Weak market: threshold is high relative to the pool → fewer stocks qualify
+- Bull market: many stocks above threshold → larger portfolio automatically
+- Override with `--no-adaptive-n --top-n N` for fixed-size portfolios
+
+### Rank-Based Position Sizing
+
+Selected stocks get position sizes proportional to their composite score rank. Top-ranked stock gets the largest allocation. Implemented via `pipeline.use_v8_sizing=True` and `pipeline._v8_rank` dict passed to the execution layer.
+
+### Selection Log
+
+Every `selector.select()` call appends to `selector.selection_log`:
+- `selected`: list of symbols chosen
+- `rankings`: full sorted list of (symbol, score, components) for all universe stocks
+- `scores`: dict symbol → score
+- `sector_allocation`: sector → count of selected stocks
+- `effective_n`: actual N selected (key for adaptive N monitoring)
+- `sector_momentum`: sector → momentum score (or RRG score)
+- `rrg_metadata`: full RRG quadrant data per sector (when `use_rrg_rotation=True`)
+- `sector_breadth`: sector → fraction of stocks above 50d SMA
+
+---
+
+## v9.0 Full Stack (FULLY IMPLEMENTED)
+
+v9.0 = v8.0 + RRG sector rotation + volume/breakout factors + sector breadth gate + mid-cap universe.
+
+All v9.0 features auto-enable when `--version v9` is passed. Individual flags can still override.
+
+### Auto-Enabled Features in v9
+
+| Feature | Auto-Value | Overridable |
+|---|---|---|
+| `--sector-momentum-gate` | True | `--no-sector-momentum-gate` (if added) |
+| `--rrg-rotation` | True | `--no-rrg-rotation` (if added) |
+| `--sector-breadth-gate` | True | pass flag explicitly to override |
+| `--volume-acc-weight` | 0.10 | `--volume-acc-weight 0.0` to disable |
+| `--high52w-weight` | 0.05 | `--high52w-weight 0.0` to disable |
+| `--include-midcap` | True | `--no-include-midcap` (if added) |
+
+### SectorRotationDetector (RRG)
+
+Relative Rotation Graph framework (de Kempenaer) for leading-edge sector detection.
+
+**Quadrant classification** (using RS-Ratio and RS-Momentum vs. SPY):
+```
+RS-Momentum > 100
+      │
+ ┌────┴────┐    ┌────────────┐
+ │IMPROVING│───▶│  LEADING   │
+ │(EARLY!) │    │(RIDE WAVE) │
+ └────┬────┘    └────┬───────┘
+      │              │
+ ┌────┴────┐    ┌────┴───────┐
+ │ LAGGING │◀───│ WEAKENING  │
+ │ (AVOID) │    │(START EXIT)│
+ └─────────┘    └────────────┘
+      │
+RS-Momentum < 100
+```
+
+**Quadrant scores** (used as sector boost multiplier):
+- Leading: 1.00 (confirmed outperformance)
+- Improving: 0.85 (BEST ENTRY — sector turning before consensus)
+- Weakening: 0.30 (momentum leaving)
+- Lagging: 0.00 (no boost)
+
+**ETF mapping**: XLK (tech), XLF (fins), XLV (health), XLI (indus), XLE (energy), XLY (cons disc), XLP (cons staples), XLB (materials), XLU (utilities), XLRE (real estate), XLC (telecom)
+
+**Combined score** (when both RRG and multi-TF RS enabled):
+```
+sector_score = 0.60 × RRG_quadrant_score + 0.40 × multitf_rs_norm_score
+```
+
+### Tier 4: Volume Accumulation
+
+Fraction of total dollar volume traded on up-days over 63 bars.
+```
+vol_acc = sum(volume on up-days) / sum(all volume)
+# >60% = institutional accumulation (strong buy signal)
+# Centered: (vol_acc - 0.5) × 2.0 maps [0,1] → [-1,+1]
+# 50% up-volume = neutral (zero contribution to score)
+```
+
+### Tier 5: 52-Week High Proximity
+
+```
+high52w_proximity = max(0, 1 - (high52w - price) / high52w)
+# 1.0 = stock AT 52-week high (confirmed breakout)
+# 0.0 = stock far below its 52-week high (value trap risk)
+```
+
+### Mid-Cap Rising Stars Universe
+
+`MID_CAP_SYMBOLS` defined in `alphago_trading_system.py` (~70 stocks, $2B–$15B market cap range).
+Organized by sector: tech, industrials, energy/cleantech, healthcare, financials, consumer, materials.
+
+Universe in v9: 206 large-caps + ~70 mid-caps = ~276 stocks (de-duplicated).
+The same `StockSelector` composite scoring naturally filters weak mid-caps — only genuine
+momentum/breakout mid-caps float above the quality threshold.
+
+Dollar volume liquidity gate: `--min-dollar-volume 20000000` ensures $20M/day minimum
+(institutional participation threshold) for mid-cap names.
+
+**Rising Stars log**: when a mid-cap stock is selected, it is flagged in terminal output:
+```
+Rising Stars selected: CAVA, BROS, HIMS
+```
+
+---
+
+## Version Summary
+
+| Feature | `--version v7` | `--version v8` | `--version v9` |
+|---|---|---|---|
+| Stock selection (pre-pipeline filter) | Off | On | On |
+| Adaptive N (all qualifying stocks) | Off | **On by default** | On |
+| Sector momentum gate | Off | Opt-in | **On** |
+| RRG quadrant sector scoring | Off | Opt-in | **On** |
+| Sector breadth gate (>50% above 50d SMA) | Off | Opt-in | **On** |
+| Volume accumulation (Tier 4) | Off | Opt-in | **0.10 weight** |
+| 52-week high proximity (Tier 5) | Off | Opt-in | **0.05 weight** |
+| Mid-cap Rising Stars universe extension | Off | Opt-in | **On** |
+| Rank-based position sizing | Off | On | On |
+| Universe size | `--n-symbols` | 206 | 206 + ~70 mid-cap |
+
+**Key behavioral rule**: In v8/v9, `adaptive_n` is always `True` by default. The system trades ALL stocks meeting the composite score quality threshold — NOT a fixed top-N. Use `--no-adaptive-n --top-n N` to override back to fixed-size selection.
+
+---
+
 ## Decisions Made (Do NOT revisit without explicit user approval)
 
 1. **Weights stay static during holdout.** Walk-forward CV learns weights, online adaptation
@@ -540,6 +866,151 @@ These fixes target `alphago_trading_system.py` (the v3.0 RL engine) and `alphago
 4. **Competing ensemble methods approved in principle.** Ridge, inverse-variance, elastic net,
    and trimmed mean — blend their outputs (don't pick a winner), weight by rolling OOS IC.
    Implementation deferred until after multi-horizon profiling.
+
+5. **v8/v9 always uses adaptive N.** Fixed top-N (e.g., top-15) is NOT the intended production
+   behavior. The research conclusion is "trade all stocks meeting the quality threshold" — the
+   market regime determines the portfolio size, not an arbitrary cap.
+
+6. **v9 mid-cap extension is on by default.** The StockSelector's composite scoring is the
+   self-cleaning filter — weak mid-caps score below the threshold and are naturally excluded.
+   No manual curating needed at runtime.
+
+---
+
+## Norgate Data & Sectoral Churn Research Mandate
+
+### Data Available
+
+**Source:** Norgate Premium — daily OHLCV (Open, High, Low, Close, Volume), adjusted for splits and dividends.
+**History:** 1990–present (35+ years).
+**Universe:** US equities — ~8,000+ symbols including delisted stocks (survivorship-bias free).
+**Sector ETFs available:** XLK, XLF, XLV, XLI, XLE, XLY, XLP, XLB, XLU, XLRE, XLC, SPY.
+**Location:** Norgate parquet files, accessed via `alphago_layering.py` data loading block.
+
+**CRITICAL CONSTRAINT:** All research, hypotheses, and selection signals must be derivable
+from OHLCV data alone. No fundamentals, no earnings, no macro, no sentiment. Pure price + volume.
+
+---
+
+### Research Mandate: Detect Sectoral Churn Before Consensus
+
+The core unsolved question driving v9.0+ research:
+
+> **"Using only historical OHLCV data available at time T, what signals predict that sector X
+> is about to become the market leader — before it is obvious to the consensus?"**
+
+This must be answered empirically via backtesting from 1990. No hypothetical arguments.
+Every candidate signal must produce a testable backtest result.
+
+---
+
+### Known Regime Periods for Backtesting (MANDATORY coverage)
+
+Every proposed signal must be validated across ALL of these:
+
+| Period | Dominant Rotation | Key Signal Opportunity |
+|---|---|---|
+| 1991–1999 | Tech/Growth → everything | Growth momentum, SMA breakouts |
+| 2000–2002 | Tech bust → Value/Staples | RS divergence, breadth collapse in Tech |
+| 2003–2007 | Energy/Materials supercycle | Commodity price momentum, volume expansion |
+| 2008–2009 | GFC — Financials collapse | Breadth deterioration, vol expansion leading |
+| 2010–2019 | QE era — Tech/Growth dominance | Low-vol, high-RS, 52w high density in Tech |
+| 2020 Q1 | COVID crash — All sectors down | Volume spike, breadth collapse as early warning |
+| 2020 Q2–Q4 | V-recovery — Healthcare, Tech | 52w high breakouts in Health/Tech before SPY |
+| 2021 | Reopening — Energy, Industrials, Fins | RS acceleration in cyclicals vs SPY |
+| 2022 | Rates shock — Energy only positive | XLE RS-ratio moving to Leading while XLK Lagging |
+| 2023–2024 | AI supercycle — Tech/Comm Services | Volume accumulation in Semis/Cloud before move |
+
+---
+
+### Signal Families to Hypothesis-Test (OHLCV-only, all computable)
+
+#### Tier A: Sector-Level Rotation Detection
+
+| Signal | Hypothesis | Detection Method |
+|---|---|---|
+| RRG Quadrant Transition | Improving sectors are the leading-edge entry — they are gaining RS before consensus | RS-Ratio crosses 100 while RS-Momentum already > 100 (already in v9.0) |
+| Multi-TF RS Acceleration | 1m RS > 3m RS → sector outperforming SPY more recently than before = momentum building | `rs_accel = rs_1m - rs_3m > 0` (already in v9.0) |
+| Sector Breadth Expansion | When % of sector stocks above 50d SMA rises from <40% to >60% in 4 weeks, institutional rotation is underway | `breadth_now / breadth_4w_ago > 1.5` |
+| 52-Week High Density Surge | Count of sector stocks hitting 52w highs accelerating → institutional buying pressure broadening | `new_highs_this_week / sector_size` trending up over 4 weeks |
+| Volume Expansion on Up-Days | Sector-level up-day volume fraction rising → institutional accumulation preceding the price move | Sector aggregate: `sum(vol on up-days) / sum(all vol)` over 21 bars |
+| ATR Expansion + Upward Bias | Volatility awakening with upward direction → sector waking up | `ATR_21 / ATR_63 > 1.3` AND `close > close[21]` |
+| Low-Vol → High-Vol Transition | A sector going from quiet to active with upward price = accumulation complete, markup beginning | Rolling 10d vol / rolling 63d vol crossing above 1.2 |
+| Intra-Sector RS Dispersion Collapse | When stocks in a sector start moving together (lower pairwise dispersion), an institutional theme is consolidating | Pairwise correlation of sector member 20d returns rising |
+
+#### Tier B: Stock-Level Selection Within Rotating Sector
+
+| Signal | Hypothesis | Detection Method |
+|---|---|---|
+| Intra-Sector RS Leader | Stocks beating the sector ETF WITHIN the rotating sector capture the most upside | Stock 6m return > sector ETF 6m return |
+| Resilience Under Pressure | Stocks with smallest drawdown from 52w high during sector weakness = quiet accumulation = next leader | `(52w_high - price) / 52w_high < 5%` while sector is Lagging or Weakening |
+| Volume Accumulation Leader | Stocks with highest up-day volume fraction within the sector = most institutional buying | `vol_acc > 0.65` (>65% of volume on up-days over 63 bars) |
+| 52-Week High Breakout Pioneer | First stocks in a sector to make new 52w highs = leading indicators for the sector move | `close > max(close[-252:])` within sector before sector ETF makes new high |
+| Low Drawdown + High Momentum | Stocks that held up best in the down phase AND have highest 6m momentum entering the up phase | `drawdown_from_52w < 10%` AND `momentum_6m > sector_avg_momentum_6m` |
+
+---
+
+### Research Output Format
+
+For every hypothesis tested, document:
+
+```
+HYPOTHESIS: [Name]
+SIGNAL: [Exact formula, computable from OHLCV at time T only]
+ECONOMIC RATIONALE: [Why should this work? What behavior does it detect?]
+
+BACKTEST RESULTS (1990–2024):
+  Hit rate:        X% of signals followed by sector outperformance in next 63 bars
+  Avg excess return (vs SPY, 63-bar):  +X%
+  Sharpe of signal-triggered portfolio: X.XX
+  False positive rate:  X% (signal fires but sector does NOT rotate in next 63 bars)
+  Worst regime:    [period where signal failed most]
+  Best regime:     [period where signal worked best]
+
+REGIME BREAKDOWN:
+  2003–2007 (commodities): hit_rate=X%, avg_return=+X%
+  2010–2019 (QE/Tech):     hit_rate=X%, avg_return=+X%
+  2022 (rates shock):      hit_rate=X%, avg_return=+X%
+  ... (all mandatory periods)
+
+VERDICT: KEEP / DISCARD / CONDITIONAL (works only in regime X)
+IMPLEMENTATION: [If KEEP: which SelectionConfig field / weight to add]
+```
+
+---
+
+### Research Pipeline (How to Generate and Test Hypotheses)
+
+1. **Propose** — state the hypothesis in the format above (signal + economic rationale)
+2. **Backtest script** — write a standalone analysis script in `d:\Experiments\Trading\` that reads Norgate parquet files directly and measures the signal's predictive power from 1990
+3. **Report** — produce the Research Output Format table above for every signal tested
+4. **Discuss** — present findings to user before any implementation changes
+5. **Implement** — if approved, wire into `SelectionConfig` / `StockSelector` / `SectorRotationDetector`
+
+**Backtest scripts naming convention:** `sector_research_<signal_name>.py`
+**Never modify core system files during research phase** — research scripts are standalone and read-only against Norgate data.
+
+---
+
+### Current Research Status
+
+| Signal | Status | Verdict |
+|---|---|---|
+| RRG Quadrant (RS-Ratio × RS-Momentum) | Implemented in v9.0 | Implemented — needs 1990 backtest validation |
+| Multi-TF RS Acceleration (1m vs 3m) | Implemented in v9.0 | Implemented — needs 1990 backtest validation |
+| Sector Breadth (% above 50d SMA) | Implemented in v9.0 | Implemented — needs 1990 backtest validation |
+| Volume Accumulation (up-day vol fraction) | Implemented in v9.0 | Implemented — needs 1990 backtest validation |
+| 52-Week High Proximity | Implemented in v9.0 | Implemented — needs 1990 backtest validation |
+| 52-Week High Density Surge (sector-level) | Not yet tested | HYPOTHESIS — needs backtest |
+| ATR Expansion + Upward Bias | Not yet tested | HYPOTHESIS — needs backtest |
+| Intra-Sector RS Dispersion Collapse | Not yet tested | HYPOTHESIS — needs backtest |
+| Resilience Under Pressure (drawdown filter) | Not yet tested | HYPOTHESIS — needs backtest |
+| 52-Week High Breakout Pioneer (stock-level) | Not yet tested | HYPOTHESIS — needs backtest |
+
+**Priority next research:** Validate all v9.0 implemented signals against full 1990–2024 history.
+Then test the remaining HYPOTHESIS-status signals.
+
+---
 
 ## NEXT TASK: Multi-Horizon Alpha Profiling
 
@@ -577,11 +1048,70 @@ Output: an "alpha profile" per alpha showing IC at each horizon.
 ## Running the System
 
 ```bash
-python alphago_layering.py --synthetic                    # Quick test
-python alphago_layering.py --symbols AAPL,MSFT,NVDA       # Real data
+# --- v7.0 baseline ---
+python alphago_layering.py --synthetic                    # Quick test (synthetic data)
+python alphago_layering.py --symbols AAPL,MSFT,NVDA       # Real data, 3 stocks
 python alphago_layering.py --synthetic --eval-only         # Pipeline wiring test
 python alphago_layering.py --synthetic --verbose 2         # Full output
+
+# --- v8.0: Stock Selection Engine ---
+python alphago_layering.py --version v8 --skip-ablation
+# → 206-stock large-cap universe
+# → Adaptive N: trades all stocks passing quality threshold
+# → Rank-based position sizing
+
+# v8 with sector momentum boost
+python alphago_layering.py --version v8 --sector-momentum-gate --skip-ablation
+
+# v8 with mid-cap extension
+python alphago_layering.py --version v8 --include-midcap --skip-ablation
+
+# v8 with tighter quality gate
+python alphago_layering.py --version v8 --min-score-pct 0.75 --skip-ablation
+
+# v8 override: fixed top-20 instead of adaptive N
+python alphago_layering.py --version v8 --no-adaptive-n --top-n 20 --skip-ablation
+
+# --- v9.0: Full Stack (all features on by default) ---
+python alphago_layering.py --version v9 --skip-ablation
+# → 206 large-cap + ~70 mid-cap universe
+# → RRG sector rotation + breadth confirmation
+# → Volume accumulation (10%) + 52w high proximity (5%) factors
+# → Adaptive N: all qualifying stocks
+
+# v9 with custom weights
+python alphago_layering.py --version v9 --volume-acc-weight 0.15 --high52w-weight 0.10 --skip-ablation
+
+# v9 with stricter quality threshold
+python alphago_layering.py --version v9 --min-score-pct 0.70 --skip-ablation
+
+# --- Comparison mode (v7 baseline, all 4 columns in comparison table) ---
+# Run WITHOUT --version v8/v9; the comparison table always includes a v8.0 (Sizing) column
+python alphago_layering.py --symbols AAPL,MSFT,NVDA,GOOGL
 ```
+
+## Key CLI Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--version` | v7 | Strategy version: v7, v8, v9 |
+| `--adaptive-n` | False | Tier 2: select all stocks passing quality threshold |
+| `--no-adaptive-n` | False | Override v8/v9 default: revert to fixed `--top-n` cap |
+| `--top-n` | 15 | Fixed cap (only active when `--no-adaptive-n` passed) |
+| `--min-score-pct` | 0.50 | Adaptive N threshold: stocks within 50% of top score |
+| `--sector-momentum-gate` | False | Tier 3: sector momentum boost to composite score |
+| `--sector-momentum-weight` | 0.10 | Tier 3: max additive boost magnitude |
+| `--volume-acc-weight` | 0.0 | v9 Tier 4: institutional accumulation factor weight |
+| `--high52w-weight` | 0.0 | v9 Tier 5: 52-week high proximity factor weight |
+| `--rrg-rotation` | False | v9: use RRG ETF quadrant scores for sector rotation |
+| `--rrg-fast` | 50 | v9 RRG: fast EMA period in bars (~10 weeks) |
+| `--rrg-slow` | 200 | v9 RRG: slow EMA period in bars (~40 weeks) |
+| `--sector-breadth-gate` | False | v9: require >50% of sector stocks above 50d SMA |
+| `--include-midcap` | False | v9: add mid-cap Rising Stars to universe |
+| `--min-dollar-volume` | 0.0 | v9: minimum avg daily dollar volume ($) |
+| `--skip-ablation` | False | Skip ablation study (saves ~10 min in v8/v9) |
+| `--verbose` | 0 | Verbosity: 0=quiet, 1=info, 2=debug |
+| `--synthetic` | False | Use synthetic price data (fast, no Norgate needed) |
 
 ## Key Config Defaults (ArchitectureConfig in alphago_architecture.py)
 
@@ -634,5 +1164,5 @@ cash_yield_bps_annual = 400.0          # Risk-free rate on idle cash
 bars_per_year = 252                    # Daily bars
 ```
 
-IGNORE - 
+IGNORE -
   - "Feature count discipline: no more than sqrt(n_observations) features without strong priors or dimensionality reduction."
