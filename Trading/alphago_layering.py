@@ -2399,10 +2399,11 @@ Examples:
     # v8.0 Stock Selection
     g = p.add_argument_group("v8.0 Stock Selection")
     g.add_argument("--version", type=str, default="v7",
-                   choices=["v7", "v8", "v9", "letf"],
+                   choices=["v7", "v8", "v9", "letf", "waverider"],
                    help="Strategy version: v7=baseline, v8=stock selection engine, "
                         "v9=full stack (v8 + RRG rotation + volume/breakout factors + sector breadth) | "
-                        "letf=S7 Dynamic 3x Sector Rotation (momentum-ranked XLK/XLE/XLF/QQQ/IWM/XLV -> TECL/ERX/FAS/TQQQ/TNA/CURE, bear gate SPY<SMA200->Cash)")
+                        "letf=S7 Dynamic 3x Sector Rotation (momentum-ranked XLK/XLE/XLF/QQQ/IWM/XLV -> TECL/ERX/FAS/TQQQ/TNA/CURE, bear gate SPY<SMA200->Cash) | "
+                        "waverider=WR T5 MS BearVol2x (top-5 momentum rotation, 6-factor meme filter, vol-target 2x leverage, bear gate 0.5x)")
     g.add_argument("--top-n", type=int, default=15,
                    help="v8.0: fallback fixed-N cap used only when --no-adaptive-n is passed (default: 15). "
                         "In v8 mode adaptive selection is ON by default — all stocks passing the threshold are traded.")
@@ -2653,6 +2654,204 @@ def resolve_symbols(args):
                 tprint(f"  [Mid-Cap] Discovery failed: {e}", "warn")
         return base
     return DEFAULT_SYMBOLS[:args.n_symbols]
+
+
+# ============================================================================
+# WAVE RIDER T5 MS BearVol2x  (--version waverider)
+#   Top-5 concentrated momentum rotation, survivorship-bias-free universe
+#   6-factor meme score filter (vol/parabolic/stretch/mom-conc/vol-accel/tenure)
+#   BearVol2x: vol-target 20%, max 2x leverage, bear gate 0.5x (SPY<SMA200)
+#   Monthly rebalance with hysteresis band (enter top-5, exit below top-12)
+# ============================================================================
+
+def _run_waverider_strategy(args):
+    """
+    Wave Rider T5 MS BearVol2x  (--version waverider)
+
+    Cross-sectional momentum rotation: rank top-100 by dollar volume,
+    pick top-5 by multi-timeframe risk-adjusted momentum, filter meme stocks
+    with a 6-factor score, apply BearVol2x leverage overlay.
+    """
+    from waverider import (
+        WaveRiderStrategy, WaveRiderConfig, load_universe, load_spy,
+        load_risk_free, clean_uid, compute_nav_metrics,
+    )
+    import pandas as _pd
+
+    ALLOCATION = max(float(getattr(args, 'capital', 50_000)), 50_000)
+
+    print_section("", reset=True)
+    print_box(
+        "WAVE RIDER T5 MS BearVol2x — Concentrated Momentum Rotation",
+        f"Top-5 stocks | 6-factor meme filter | BearVol2x leverage | "
+        f"Monthly rebalance with hysteresis | Capital: ${ALLOCATION:,.0f}",
+    )
+
+    # ── 1. Load data ────────────────────────────────────────────────────
+    print_section("DATA LOADING")
+    tprint("Loading universe prices + rankings...", "info")
+    prices, rankings = load_universe()
+    spy_price = load_spy()
+    tprint(f"Universe: {prices.shape[1]} UIDs, {len(prices)} trading days", "ok")
+    tprint(f"Date range: {prices.index[0].strftime('%Y-%m-%d')} to "
+           f"{prices.index[-1].strftime('%Y-%m-%d')}", "ok")
+
+    # ── 2. Run backtest ─────────────────────────────────────────────────
+    print_section("BACKTEST")
+    cfg = WaveRiderConfig()
+    strategy = WaveRiderStrategy(cfg)
+    tprint("Running full historical backtest...", "info")
+    result = strategy.backtest(prices, spy_price, rankings)
+    tprint("Backtest complete.", "ok")
+
+    dates = result.dates
+    n_years = (dates[-1] - dates[0]).days / 365.25
+
+    # ── 3. Compute metrics ──────────────────────────────────────────────
+    print_section("RISK & RETURN SUMMARY")
+    m_lev = compute_nav_metrics(result.nav_leveraged)
+    m_unlev = compute_nav_metrics(result.nav_unlevered)
+
+    spy_start = spy_price.asof(dates[0])
+    spy_end = spy_price.asof(dates[-1])
+    spy_cagr = ((spy_end / spy_start) ** (1 / n_years) - 1) if (
+        _pd.notna(spy_start) and spy_start > 0
+    ) else 0.106
+    spy_nav = spy_price.reindex(dates).ffill().bfill()
+    spy_nav = spy_nav / spy_nav.iloc[0]
+    spy_dd = float(((spy_nav - spy_nav.cummax()) / spy_nav.cummax()).min()) * 100
+    spy_rets = spy_nav.pct_change().dropna()
+    spy_sharpe = float(spy_rets.mean() / spy_rets.std() * np.sqrt(252)) if spy_rets.std() > 0 else 0
+
+    print(f"\n    {'Strategy':<20s} {'CAGR':>7s} {'Sharpe':>7s} {'Sortino':>8s} "
+          f"{'MaxDD':>8s} {'AvgLev':>7s} {'${:,.0f}->'.format(int(ALLOCATION)):>14s}")
+    print(f"    {'─'*20} {'─'*7} {'─'*7} {'─'*8} {'─'*8} {'─'*7} {'─'*14}")
+
+    for _lbl, _m, _lev_str in [
+        ("WR T5 BearVol2x", m_lev, f"{result.leverage_series.mean():.2f}x"),
+        ("WR T5 Unlevered", m_unlev, "1.00x"),
+    ]:
+        _final = ALLOCATION * (1 + _m['total_return'])
+        _cc = C.GREEN if _m['cagr']*100 > 20 else C.YELLOW if _m['cagr']*100 > 10 else C.RED
+        _dc = C.RED if _m['max_dd']*100 < -60 else C.YELLOW if _m['max_dd']*100 < -40 else C.GREEN
+        print(f"    {_lbl:<20s} {_cc}{_m['cagr']*100:>+6.1f}%{C.RESET} "
+              f"{_m['sharpe']:>7.2f} "
+              f"{_m['sortino']:>7.2f}  "
+              f"{_dc}{_m['max_dd']*100:>7.1f}%{C.RESET} "
+              f"{_lev_str:>7s} "
+              f"${_final:>12,.0f}")
+
+    # SPY benchmark
+    _spy_final = ALLOCATION * float(spy_nav.iloc[-1])
+    _scc = C.GREEN if spy_cagr*100 > 20 else C.YELLOW if spy_cagr*100 > 10 else C.RED
+    _sdc = C.RED if spy_dd < -60 else C.YELLOW if spy_dd < -40 else C.GREEN
+    print(f"    {'SPY B&H':<20s} {_scc}{spy_cagr*100:>+6.1f}%{C.RESET} "
+          f"{spy_sharpe:>7.2f} "
+          f"{'':>8s} "
+          f"{_sdc}{spy_dd:>7.1f}%{C.RESET} "
+          f"{'1.00x':>7s} "
+          f"${_spy_final:>12,.0f}")
+
+    print(f"\n    Beat SPY: {m_lev['cagr']/spy_cagr:.1f}x SPY CAGR  |  "
+          f"Period: {dates[0].strftime('%Y-%m-%d')} to {dates[-1].strftime('%Y-%m-%d')} "
+          f"({n_years:.1f} years)")
+
+    # ── 4. Year-by-year breakdown ───────────────────────────────────────
+    print_section("YEAR-BY-YEAR PERFORMANCE")
+    print(f"\n    {'Year':<6s} {'WR 2x':>8s} {'WR 1x':>8s} {'SPY':>8s} {'vs SPY':>8s} "
+          f"{'AvgLev':>7s} {'Trades':>7s}")
+    print(f"    {'─'*6} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*7} {'─'*7}")
+
+    years = sorted(set(d.year for d in dates))
+    beat_count = 0
+    total_with_spy = 0
+
+    for year in years:
+        yr_dates = dates[dates.year == year]
+        if len(yr_dates) < 20:
+            continue
+
+        yr_ret_l = (result.nav_leveraged.loc[yr_dates[-1]] /
+                    result.nav_leveraged.loc[yr_dates[0]] - 1) * 100
+        yr_ret_u = (result.nav_unlevered.loc[yr_dates[-1]] /
+                    result.nav_unlevered.loc[yr_dates[0]] - 1) * 100
+
+        spy_yr = spy_price[spy_price.index.year == year]
+        spy_ret = (spy_yr.iloc[-1] / spy_yr.iloc[0] - 1) * 100 if len(spy_yr) > 20 else np.nan
+        vs_spy = yr_ret_l - spy_ret if not _pd.isna(spy_ret) else np.nan
+
+        if not _pd.isna(vs_spy):
+            total_with_spy += 1
+            if vs_spy > 0:
+                beat_count += 1
+
+        avg_lev = result.leverage_series.loc[yr_dates].mean()
+        yr_rebal = [rd for rd in result.rebalance_dates if rd.year == year]
+        yr_trades = sum(result.trades_log.get(rd, 0) for rd in yr_rebal)
+
+        spy_str = f"{spy_ret:>+7.1f}%" if not _pd.isna(spy_ret) else "     n/a"
+        vs_str = f"{vs_spy:>+7.1f}%" if not _pd.isna(vs_spy) else "     n/a"
+        _yc = C.GREEN if yr_ret_l > 0 else C.RED
+        print(f"    {year:<6d} {_yc}{yr_ret_l:>+7.1f}%{C.RESET} {yr_ret_u:>+7.1f}% "
+              f"{spy_str} {vs_str} {avg_lev:>6.2f}x {yr_trades:>5d}")
+
+    if total_with_spy > 0:
+        print(f"\n    Beat SPY: {beat_count}/{total_with_spy} years "
+              f"({beat_count/total_with_spy*100:.0f}%)")
+
+    # ── 5. Current signal (live portfolio) ──────────────────────────────
+    print_section("CURRENT PORTFOLIO SIGNAL")
+    signal = strategy.current_portfolio(prices, spy_price, rankings)
+
+    n = len(signal.holdings_clean)
+    weight_pct = 100.0 / n if n > 0 else 0
+    tprint(f"Signal date: {signal.date.strftime('%Y-%m-%d')}", "ok")
+    print(f"\n    Portfolio ({n} stocks, equal weight {weight_pct:.0f}% each):")
+    for i, sym in enumerate(signal.holdings_clean, 1):
+        ms = signal.meme_scores.get(sym, 0)
+        print(f"      {i}. {sym:<8s}  MemeScore: {ms:.0f}")
+
+    bear_str = f"{C.RED}ON (SPY < SMA200) -> 0.5x cap{C.RESET}" if signal.bear_regime else \
+               f"{C.GREEN}OFF (SPY > SMA200){C.RESET}"
+    print(f"\n    Leverage: {signal.leverage:.2f}x  |  "
+          f"Vol(21d): {signal.realized_vol:.2f}  |  Bear gate: {bear_str}")
+
+    if signal.buys or signal.sells:
+        print(f"\n    Trades this month:")
+        for sym in signal.buys:
+            print(f"      {C.GREEN}BUY:  {sym}{C.RESET}")
+        for sym in signal.sells:
+            print(f"      {C.RED}SELL: {sym}{C.RESET}")
+    else:
+        print(f"\n    No trades this month.")
+
+    # ── 6. Interactive chart ────────────────────────────────────────────
+    print_section("EQUITY CURVE")
+
+    nav_lev_pct = (result.nav_leveraged / result.nav_leveraged.iloc[0] - 1) * 100
+    nav_unlev_pct = (result.nav_unlevered / result.nav_unlevered.iloc[0] - 1) * 100
+    spy_pct = (spy_nav / spy_nav.iloc[0] - 1) * 100
+
+    dates_str = [d.strftime('%Y-%m-%d') for d in dates]
+    plotly_chart(
+        [
+            (f"WR T5 BearVol2x (CAGR {m_lev['cagr']*100:+.1f}%)", nav_lev_pct.values),
+            (f"WR T5 Unlevered (CAGR {m_unlev['cagr']*100:+.1f}%)", nav_unlev_pct.values),
+            (f"SPY B&H (CAGR {spy_cagr*100:+.1f}%)", spy_pct.values),
+        ],
+        dates_str,
+        title=f"Wave Rider T5 MS BearVol2x — Equity Curve",
+        fmt="%",
+        out_dir=os.path.dirname(__file__),
+    )
+
+    # ── Done ────────────────────────────────────────────────────────────
+    print_box(
+        "DONE — Wave Rider T5 MS BearVol2x",
+        f"CAGR: {m_lev['cagr']*100:+.1f}% | Sharpe: {m_lev['sharpe']:.2f} | "
+        f"MaxDD: {m_lev['max_dd']*100:.1f}% | AvgLev: {result.leverage_series.mean():.2f}x | "
+        f"Holding: {', '.join(signal.holdings_clean)}",
+    )
 
 
 # ============================================================================
@@ -3006,9 +3205,12 @@ def _run_letf_strategy(args):
 def main():
     args = parse_args()
 
-    # --- S2 LETF: standalone, no RL/pipeline needed — exit early ----------
+    # --- Standalone strategies: no RL/pipeline needed — exit early --------
     if args.version == "letf":
         _run_letf_strategy(args)
+        return
+    if args.version == "waverider":
+        _run_waverider_strategy(args)
         return
 
     # --- v9.0: auto-enable all v9.0 features when --version v9 ---
