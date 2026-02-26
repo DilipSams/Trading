@@ -326,7 +326,6 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
                 break
 
         step_count = 0
-        prev_close = None
         episode_audit = []
         sym_bar_returns_gross = []   # Per-bar returns for this symbol
         sym_bar_returns_net = []
@@ -338,30 +337,47 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
         trade_log = []               # collect for writer; applied in main thread
         info = {}
 
-        while not done:
-            bar_idx = env.cs
-            # Phase 1: Extract OHLC data for Tier 1 alphas
-            opens   = env.prices[:bar_idx + 1, 0] if env.prices.shape[1] > 0 else None
-            highs   = env.prices[:bar_idx + 1, 1] if env.prices.shape[1] > 1 else None
-            lows    = env.prices[:bar_idx + 1, 2] if env.prices.shape[1] > 2 else None
-            closes  = env.prices[:bar_idx + 1, 3]
-            volumes = env.prices[:bar_idx + 1, 4] if env.prices.shape[1] > 4 else None
+        # PERF FIX: Pre-compute bar log-returns and 20-bar rolling vol for the
+        # entire test period ONCE before the bar loop.  Inside the loop we do a
+        # single O(1) array lookup instead of O(20) np.diff/np.log/np.std calls.
+        _all_closes   = d.prices_test[:, 3]
+        _n_test_bars  = len(_all_closes)
+        _log_rets_all = np.empty(_n_test_bars, dtype=np.float64)
+        _log_rets_all[0] = 0.0
+        if _n_test_bars > 1:
+            _log_rets_all[1:] = np.diff(np.log(np.maximum(_all_closes, 1e-12)))
+        # Pre-compute 20-bar rolling std (annualised realized vol) for each bar
+        _rvol_all = np.full(_n_test_bars, 0.15, dtype=np.float64)
+        for _bi in range(21, _n_test_bars):
+            _rvol_all[_bi] = float(np.std(_log_rets_all[_bi - 19: _bi + 1])) * 15.8745  # √252
 
-            # Bar return
-            bar_ret = 0.0
-            if prev_close is not None and closes[-1] > 0:
-                bar_ret = math.log(closes[-1] / (prev_close + 1e-12))
-            prev_close = float(closes[-1])
+        # PERF FIX: All alphas use closes[-N:] relative indexing.
+        # Maximum lookback across all alphas: 252 bars (12-month RS).
+        # Truncating the growing slice to MAX_LOOKBACK bars converts
+        # O(n²) total work → O(n × MAX_LOOKBACK), saving ~3-5× on long histories.
+        _MAX_LOOKBACK = 260  # 252 bars needed + 8 bar buffer for off-by-one patterns
+        _prices_full  = env.prices           # reference only — no copy
+        _n_cols       = _prices_full.shape[1]
+
+        while not done:
+            bar_idx  = env.cs
+            _lb      = max(0, bar_idx - _MAX_LOOKBACK + 1)  # rolling window start
+
+            # Phase 1: Extract OHLC data for Tier 1 alphas (fixed-size window)
+            closes  = _prices_full[_lb:bar_idx + 1, 3]
+            opens   = _prices_full[_lb:bar_idx + 1, 0] if _n_cols > 0 else None
+            highs   = _prices_full[_lb:bar_idx + 1, 1] if _n_cols > 1 else None
+            lows    = _prices_full[_lb:bar_idx + 1, 2] if _n_cols > 2 else None
+            volumes = _prices_full[_lb:bar_idx + 1, 4] if _n_cols > 4 else None
+
+            # Bar return — O(1) lookup into pre-computed array
+            bar_ret = float(_log_rets_all[bar_idx]) if bar_idx > 0 else 0.0
 
             # Capture portfolio value BEFORE this step for actual return computation
             pv_before = env._portfolio_value()
 
-            # Realized vol (for L4 no-trade region)
-            if len(closes) > 20:
-                _lr = np.diff(np.log(closes[-20:] + 1e-12))
-                realized_vol = float(np.std(_lr)) * np.sqrt(252)
-            else:
-                realized_vol = 0.15
+            # Realized vol — O(1) lookup into pre-computed array
+            realized_vol = float(_rvol_all[bar_idx])
 
             # -- SET L3 COST MODEL CONTEXT (canonical cost model) --
             mid_price = float(closes[-1])
@@ -524,10 +540,10 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
 
     # ---------- thread pool with pipeline pool ----------
     # Each worker draws a pipeline copy from the queue; returns it when done.
-    # Cap at 8 workers: NumPy GIL release gives real CPU overlap, but memory
-    # pressure from >8 live pipeline copies outweighs the speedup.
+    # Use all available logical CPU cores — NumPy releases the GIL so threads
+    # achieve real CPU overlap. Cap at dataset count to avoid idle workers.
     from queue import Queue as _Queue
-    n_workers = max(1, min(len(datasets), 16))
+    n_workers = max(1, min(len(datasets), multiprocessing.cpu_count()))
     _pl_pool = _Queue()
     for _ in range(n_workers):
         _pl_pool.put(deepcopy(pipeline))
