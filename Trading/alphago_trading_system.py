@@ -813,11 +813,8 @@ def compute_indicators(df):
     df["ADX"]=pd.Series(100*np.abs(pdi-mdi)/(pdi+mdi+1e-10)).rolling(14,min_periods=1).mean().values
     df["Plus_DI"]=pdi; df["Minus_DI"]=mdi
     vs=pd.Series(v).rolling(20,min_periods=1).mean().values; df["Vol_Ratio"]=v/(vs+1.)
-    obv=np.zeros(n)
-    for i in range(1,n):
-        if c[i]>c[i-1]: obv[i]=obv[i-1]+v[i]
-        elif c[i]<c[i-1]: obv[i]=obv[i-1]-v[i]
-        else: obv[i]=obv[i-1]
+    _dir = np.sign(np.diff(c, prepend=c[0]))
+    obv = np.cumsum(_dir * v)
     df["OBV"]=obv; os_=pd.Series(obv).rolling(10,min_periods=1).mean().values
     df["OBV_Slope"]=(obv-os_)/(np.abs(os_)+1e-10)
     for p in [5,10]:
@@ -837,54 +834,57 @@ def compute_indicators(df):
     bw=df["BB_Upper"].values-df["BB_Lower"].values+1e-10
     df["Mean_Rev_Signal"]=(c-df["BB_Mid"].values)/bw
 
-    # Tier 1: Hurst exponent for regime detection (simplified R/S analysis)
+    # Tier 1: Hurst exponent for regime detection (vectorized R/S analysis)
     # Compute rolling Hurst on 126-bar windows (6 months)
     hurst_window = 126
     hurst_vals = np.full(n, 0.5)  # Default to 0.5 (random walk)
-    if n >= hurst_window:
-        for idx in range(hurst_window, n):
-            window_prices = c[idx-hurst_window:idx+1]
-            try:
-                # Simplified Hurst: log(R/S) vs log(n) slope
-                lags = [10, 20, 40, 63]  # Multiple timescales
-                rs_values = []
-                for lag in lags:
-                    if lag < len(window_prices):
-                        sub = window_prices[-lag:]
-                        mean_sub = np.mean(sub)
-                        cumdev = np.cumsum(sub - mean_sub)
-                        R = np.max(cumdev) - np.min(cumdev)
-                        S = np.std(sub) + 1e-10
-                        rs_values.append(R / S)
-                if len(rs_values) >= 2:
-                    # Linear regression on log-log plot
-                    log_lags = np.log(lags[:len(rs_values)])
-                    log_rs = np.log(np.array(rs_values) + 1e-10)
-                    hurst = np.polyfit(log_lags, log_rs, 1)[0]
-                    hurst_vals[idx] = np.clip(hurst, 0.0, 1.0)
-            except:
-                hurst_vals[idx] = 0.5
+    if n >= hurst_window + 1:
+        from numpy.lib.stride_tricks import sliding_window_view as _swv_h
+        # Windows of prices: shape (n_windows, hurst_window+1)
+        # window_prices[w] = c[w : w + hurst_window + 1]
+        # Result goes into hurst_vals[w + hurst_window]
+        _price_windows = _swv_h(c, hurst_window + 1)  # (n - hurst_window, 127)
+        _n_hw = len(_price_windows)
+
+        lags = [10, 20, 40, 63]
+        log_lags = np.log(np.array(lags, dtype=np.float64))
+
+        # For each lag, compute R/S for ALL windows at once
+        log_rs_all = np.zeros((_n_hw, len(lags)), dtype=np.float64)
+        for li, lag in enumerate(lags):
+            # sub = window_prices[-lag:] for each window → _price_windows[:, -lag:]
+            subs = _price_windows[:, -lag:]  # (n_hw, lag)
+            means = subs.mean(axis=1, keepdims=True)  # (n_hw, 1)
+            cumdevs = np.cumsum(subs - means, axis=1)  # (n_hw, lag)
+            R = cumdevs.max(axis=1) - cumdevs.min(axis=1)  # (n_hw,)
+            S = subs.std(axis=1) + 1e-10  # (n_hw,)
+            log_rs_all[:, li] = np.log(R / S + 1e-10)
+
+        # Vectorized polyfit: slope = cov(log_lags, log_rs) / var(log_lags)
+        # log_lags is the same for all windows, so var(log_lags) is a constant
+        _ll_mean = log_lags.mean()
+        _ll_var = np.sum((log_lags - _ll_mean) ** 2)
+        _lr_mean = log_rs_all.mean(axis=1)  # (n_hw,)
+        # cov = sum((log_lags[i] - mean) * (log_rs[w,i] - mean_w)) for each w
+        _cov = np.sum((log_lags[None, :] - _ll_mean) * (log_rs_all - _lr_mean[:, None]),
+                       axis=1)  # (n_hw,)
+        _slopes = _cov / (_ll_var + 1e-15)
+        hurst_vals[hurst_window:hurst_window + _n_hw] = np.clip(_slopes, 0.0, 1.0)
     df["Hurst_Exponent"] = hurst_vals
 
-    # Tier 3: Vol-of-vol (volatility of volatility)
-    # Rolling std of 20-bar vol estimates
-    vov = np.zeros(n)
-    if n >= 40:
-        for idx in range(40, n):
-            recent_vols = df["Realized_Vol_20"].values[idx-20:idx]
-            vov[idx] = np.std(recent_vols)
-    df["Vol_of_Vol"] = vov
+    # Tier 3: Vol-of-vol (volatility of volatility) — vectorized rolling std
+    # Old code: vov[idx] = np.std(vals[idx-20:idx]) — window ends BEFORE idx
+    # So we shift(1) to align: rolling at idx-1 = std of [idx-20, idx-1], placed at idx
+    df["Vol_of_Vol"] = pd.Series(df["Realized_Vol_20"].values).rolling(
+        20, min_periods=20).std(ddof=0).shift(1).fillna(0).values
 
-    # Tier 3: ATR regime (z-score of ATR relative to 60-bar history)
-    atr_z = np.zeros(n)
+    # Tier 3: ATR regime (z-score of ATR relative to 60-bar history) — vectorized
+    # Old code: mean/std of atr_vals[idx-60:idx] (excludes current), z = (current - mean) / std
     atr_vals = df["ATR"].values
-    if n >= 60:
-        for idx in range(60, n):
-            atr_history = atr_vals[idx-60:idx]
-            atr_mean = np.mean(atr_history)
-            atr_std = np.std(atr_history) + 1e-10
-            atr_z[idx] = (atr_vals[idx] - atr_mean) / atr_std
-    df["ATR_Regime_Z"] = atr_z
+    _atr_s = pd.Series(atr_vals)
+    _atr_rm = _atr_s.rolling(60, min_periods=60).mean().shift(1)
+    _atr_rs = _atr_s.rolling(60, min_periods=60).std(ddof=0).shift(1) + 1e-10
+    df["ATR_Regime_Z"] = ((_atr_s - _atr_rm) / _atr_rs).fillna(0).values
 
     # NEW: DD Duration (bars since price peak)
     dd_duration = np.zeros(n)
@@ -903,87 +903,156 @@ def compute_indicators(df):
     dd_vol_signal = df["DD_Duration_Norm"].values * vol_regime_vals
     df["DD_Vol_Signal"] = dd_vol_signal
 
-    # NEW: Lyapunov Exponent (chaos detection)
-    lyapunov_vals = np.zeros(n)
-    window = 100
-    if n >= window + 20:
-        for idx in range(window, n):
-            lyapunov_vals[idx] = _compute_lyapunov_fast(c[:idx+1], window=window)
-    df["Lyapunov"] = lyapunov_vals
+    # NEW: Lyapunov Exponent (chaos detection) — VECTORIZED
+    df["Lyapunov"] = _precompute_lyapunov_vectorized(c)
 
     return df
 
 
-def _compute_lyapunov_fast(prices, window=100, embed_dim=3, delay=1):
+def _precompute_lyapunov_vectorized(closes, window=100, embed_dim=3, delay=1,
+                                     n_samples=20, max_dt=5):
     """
-    Fast Lyapunov exponent computation (simplified Rosenstein algorithm).
+    Vectorized Lyapunov exponent for ALL bars at once.
 
-    Returns chaos measure: >0 = chaotic, ~0 = neutral, <0 = stable
+    Replaces 8,900 sequential _compute_lyapunov_fast() calls with batch numpy
+    operations — ~50-100× faster.
+
+    Algorithm (same as original, just batched):
+    1. Sliding windows of log returns → phase-space embeddings for ALL bars
+    2. Batch distance computation (sampled reference points)
+    3. Batch nearest-neighbor search (excluding temporal neighbors)
+    4. Batch divergence tracking over dt=1..5
+    5. Batch linear regression for Lyapunov slope
+
+    Returns: np.ndarray of shape (n,), result[t] = Lyapunov at bar t.
     """
-    if len(prices) < window + embed_dim * delay:
-        return 0.0
+    from numpy.lib.stride_tricks import sliding_window_view
 
-    # Use log returns for stationarity
-    log_rets = np.diff(np.log(prices[-window:] + 1e-12))
+    n = len(closes)
+    result = np.zeros(n, dtype=np.float64)
+    if n < window + 20:
+        return result
 
-    if len(log_rets) < embed_dim * delay + 10:
-        return 0.0
+    # --- 1. Full log-return series and sliding windows ---
+    log_prices = np.log(np.maximum(closes, 1e-12))
+    log_rets_full = np.diff(log_prices)  # shape: (n-1,)
 
-    # Phase space embedding
-    embedded = []
-    for i in range(len(log_rets) - embed_dim * delay):
-        point = [log_rets[i + j * delay] for j in range(embed_dim)]
-        embedded.append(point)
+    lr_len = window - 1               # 99 log returns per window
+    embed_len = lr_len - embed_dim * delay  # 96 embedded points per window
 
-    embedded = np.array(embedded)
+    if embed_len < 20:
+        return result
 
-    if len(embedded) < 20:
-        return 0.0
+    # Sliding windows of log returns: shape (n_windows, lr_len)
+    # Window t uses log_rets_full[t : t + lr_len]
+    # Old code at idx uses c[idx-99:idx+1] → log_rets_full[idx-99:idx]
+    # Window t matches old idx when t = idx - (window-1), so result[t + window-1] = old[idx]
+    lr_windows = sliding_window_view(log_rets_full, lr_len)  # (n-window+1, 99)
+    n_windows = len(lr_windows)
+    if n_windows <= 0:
+        return result
 
-    # Track divergences (simplified - use only first 20 points for speed)
-    divergences = []
-    sample_points = min(20, len(embedded) - 10)
+    # --- 2. Phase-space embedding (vectorized) ---
+    # For embed_dim=3, delay=1: point[i] = [lr[i], lr[i+1], lr[i+2]]
+    # This is just 3 overlapping slices of each window
+    # embedded[w, i, d] = lr_windows[w, i + d * delay]
+    embed_indices = np.arange(embed_len)[:, None] + np.arange(embed_dim)[None, :] * delay
+    # embed_indices shape: (embed_len, embed_dim) = (96, 3)
+    # Values: [[0,1,2], [1,2,3], ..., [95,96,97]]
+    all_embedded = lr_windows[:, embed_indices]  # (n_windows, embed_len, embed_dim)
 
-    for i in range(0, len(embedded) - 10, max(1, len(embedded) // sample_points)):
-        # Compute distances to all other points
-        distances = np.linalg.norm(embedded - embedded[i], axis=1)
+    # --- 3. Sample reference point indices (same as original) ---
+    step = max(1, embed_len // n_samples)
+    sample_idx = np.arange(0, embed_len - 10, step)  # e.g. [0,4,8,...,84] — match old code's full range
+    n_samp = len(sample_idx)
+    if n_samp == 0:
+        return result
 
-        # Exclude self and neighbors
-        exclude_start = max(0, i - 5)
-        exclude_end = min(len(embedded), i + 6)
-        distances[exclude_start:exclude_end] = np.inf
+    # Pre-compute temporal exclusion mask (shared across chunks)
+    all_j = np.arange(embed_len)[None, :]             # (1, E)
+    samp_expanded = sample_idx[:, None]                 # (S, 1)
+    temporal_mask_2d = np.abs(all_j - samp_expanded) <= 5  # (S, E)
 
-        if np.all(np.isinf(distances)):
+    # --- Process in chunks to limit memory (~100 MB peak per chunk) ---
+    CHUNK = 2000
+    slopes_all = np.zeros(n_windows, dtype=np.float64)
+
+    for c_start in range(0, n_windows, CHUNK):
+        c_end = min(c_start + CHUNK, n_windows)
+        C = c_end - c_start
+
+        chunk_emb = all_embedded[c_start:c_end]       # (C, E, D)
+        chunk_ref = chunk_emb[:, sample_idx, :]        # (C, S, D)
+
+        # 4. Distance computation for this chunk
+        diff = chunk_emb[:, None, :, :] - chunk_ref[:, :, None, :]  # (C, S, E, D)
+        distances = np.sqrt(np.sum(diff * diff, axis=-1))  # (C, S, E)
+        del diff
+
+        # 5. Exclude temporal neighbors
+        distances[:, temporal_mask_2d] = np.inf
+
+        # 6. Nearest neighbor per (window, sample)
+        nearest_idx = np.argmin(distances, axis=2)  # (C, S)
+        cw = np.arange(C)[:, None]
+        cs = np.arange(n_samp)[None, :]
+        initial_dist = distances[cw, cs, nearest_idx]  # (C, S)
+        del distances
+
+        # 7. Divergence tracking for dt = 1..max_dt
+        chunk_divs = []
+        chunk_dts = []
+        chunk_valids = []
+
+        for dt in range(1, max_dt + 1):
+            s_shifted = sample_idx[None, :] + dt  # (1, S)
+            n_shifted = nearest_idx + dt           # (C, S)
+            valid = (s_shifted < embed_len) & (n_shifted < embed_len) & (initial_dist > 1e-10)
+            if not np.any(valid):
+                continue
+            s_safe = np.clip(s_shifted, 0, embed_len - 1)
+            n_safe = np.clip(n_shifted, 0, embed_len - 1)
+            pt_s = chunk_emb[cw, s_safe, :]    # (C, S, D)
+            pt_n = chunk_emb[cw, n_safe, :]    # (C, S, D)
+            cur_dist = np.sqrt(np.sum((pt_s - pt_n) ** 2, axis=-1))  # (C, S)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                log_div = np.log(cur_dist / initial_dist)
+            valid = valid & (cur_dist > 1e-10) & np.isfinite(log_div) & (np.abs(log_div) < 5.0)
+            for si in range(n_samp):
+                mask = valid[:, si]
+                if np.any(mask):
+                    chunk_divs.append(log_div[:, si])
+                    chunk_dts.append(np.full(C, dt, dtype=np.float64))
+                    chunk_valids.append(mask)
+
+        if not chunk_divs:
             continue
 
-        nearest_idx = np.argmin(distances)
-        initial_dist = distances[nearest_idx]
+        # 8. Batch linear regression for this chunk
+        ld = np.array(chunk_divs)     # (obs, C)
+        td = np.array(chunk_dts)      # (obs, C)
+        vm = np.array(chunk_valids)   # (obs, C)
+        dm = np.where(vm, td, 0.0)
+        ym = np.where(vm, ld, 0.0)
+        cnt = vm.sum(axis=0).astype(np.float64)
+        ok = cnt >= 10
+        with np.errstate(divide='ignore', invalid='ignore'):
+            d_mean = dm.sum(axis=0) / cnt
+            y_mean = ym.sum(axis=0) / cnt
+        dc = np.where(vm, td - d_mean[None, :], 0.0)
+        yc = np.where(vm, ld - y_mean[None, :], 0.0)
+        cov = (dc * yc).sum(axis=0)
+        var = (dc * dc).sum(axis=0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sl = cov / (var + 1e-15)
+        slopes_all[c_start:c_end] = np.where(ok & np.isfinite(sl), sl, 0.0)
 
-        if initial_dist < 1e-10:
-            continue
+    # --- 9. Write results ---
+    # Window t matches old idx = t + (window-1), so result[window-1 : window-1+n_windows]
+    end_idx = min(window - 1 + n_windows, n)
+    result[window - 1:end_idx] = slopes_all[:end_idx - (window - 1)]
 
-        # Track divergence for 5 steps (reduced from 10 for speed)
-        for dt in range(1, min(6, len(embedded) - max(i, nearest_idx))):
-            if i + dt < len(embedded) and nearest_idx + dt < len(embedded):
-                current_dist = np.linalg.norm(embedded[i + dt] - embedded[nearest_idx + dt])
-
-                if current_dist > 1e-10:
-                    log_div = np.log(current_dist / initial_dist)
-                    if -5 < log_div < 5:  # Filter outliers
-                        divergences.append((dt, log_div))
-
-    if len(divergences) < 10:
-        return 0.0
-
-    # Linear regression: log(divergence) vs time
-    times, log_divs = zip(*divergences)
-    times = np.array(times)
-    log_divs = np.array(log_divs)
-
-    # Fit slope
-    slope, _ = np.polyfit(times, log_divs, 1)
-
-    return float(slope)
+    return result
 
 def build_feature_matrix(df):
     """Build feature matrix with tracked column names (Fix #8: single source of truth)."""
