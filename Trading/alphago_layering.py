@@ -199,6 +199,81 @@ def print_subsection(title):
 
 
 # ============================================================================
+# INTERACTIVE PLOTLY CHARTS
+# ============================================================================
+
+# Color palette: distinct, colorblind-friendly, dark-background optimized
+_PLOTLY_COLORS = [
+    "#00cc96",  # green  (primary strategy)
+    "#636efa",  # blue   (secondary / baseline)
+    "#ffa15a",  # orange (benchmark)
+    "#ef553b",  # red    (benchmark 2)
+    "#ab63fa",  # purple (extra series)
+    "#19d3f3",  # cyan   (extra series)
+]
+
+def plotly_chart(series_list, dates, title="", fmt="%", out_dir="Trading"):
+    """
+    Render an interactive Plotly HTML chart and open it in the browser.
+
+    Parameters
+    ----------
+    series_list : list of (label: str, values: array-like)
+        Each entry is a named series to plot.
+    dates : list of str
+        Date strings for the x-axis (YYYY-MM-DD).
+    title : str
+        Chart title.
+    fmt : str
+        '%' or '$' — controls y-axis label.
+    out_dir : str
+        Directory to save the HTML file.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        tprint("plotly not installed — falling back to terminal chart (pip install plotly)", "warn")
+        return False
+
+    fig = go.Figure()
+    for i, (label, values) in enumerate(series_list):
+        vals = list(values) if not isinstance(values, list) else values
+        # Align lengths: truncate to min(len(dates), len(vals))
+        n = min(len(dates), len(vals))
+        color = _PLOTLY_COLORS[i % len(_PLOTLY_COLORS)]
+        width = 2.8 if i == 0 else 2.0
+        fig.add_trace(go.Scatter(
+            x=dates[:n], y=vals[:n], mode='lines', name=label,
+            line=dict(color=color, width=width),
+        ))
+
+    y_label = "Return %" if fmt == "%" else "Value ($)"
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=18)),
+        xaxis_title="Date",
+        yaxis_title=y_label,
+        template="plotly_dark",
+        hovermode="x unified",
+        legend=dict(x=0.02, y=0.98, font=dict(size=13)),
+        xaxis=dict(rangeslider=dict(visible=True, thickness=0.05)),
+        font=dict(size=13),
+        height=700,
+        width=1200,
+    )
+
+    # Save and open
+    import webbrowser
+    _fname = title.split("—")[0].strip().replace(" ", "_").replace("/", "_")[:50]
+    _fname = "".join(c for c in _fname if c.isalnum() or c in ("_", "-"))
+    _path = os.path.join(out_dir, f"{_fname or 'chart'}.html")
+    _path = os.path.abspath(_path)
+    fig.write_html(_path)
+    webbrowser.open("file:///" + _path.replace(os.sep, "/"))
+    tprint(f"Interactive chart: {_path}", "ok")
+    return True
+
+
+# ============================================================================
 # PIPELINE-BASED EVALUATION — Module-level worker (picklable for ProcessPoolExecutor)
 # ============================================================================
 
@@ -2716,16 +2791,18 @@ def _run_letf_strategy(args):
     # ── 5. Equity curve chart ─────────────────────────────────────────────
     print_section("EQUITY CURVE")
     dates_str = [str(d)[:10] for d in common_idx]
+    _s7_series = [
+        ("S7 Rotation", (nav_s7   - 1.0) * 100),
+        ("TQQQ B&H",   (nav_tqqq - 1.0) * 100),
+        ("QQQ B&H",    (nav_qqq  - 1.0) * 100),
+        ("SPY B&H",    (nav_spy  - 1.0) * 100),
+    ]
+    _s7_title = f"S7 Sector Rotation vs Benchmarks — Cumulative Return (${ALLOCATION:,.0f})"
     multi_line_chart(
-        [
-            ("S7 Rotation", (nav_s7   - 1.0) * 100),
-            ("TQQQ B&H",   (nav_tqqq - 1.0) * 100),
-            ("QQQ B&H",    (nav_qqq  - 1.0) * 100),
-            ("SPY B&H",    (nav_spy  - 1.0) * 100),
-        ],
-        width=70, height=14, fmt="%", dates=dates_str,
-        title=f"S7 Sector Rotation vs Benchmarks — Cumulative Return (${ALLOCATION:,.0f})",
+        _s7_series, width=70, height=14, fmt="%", dates=dates_str,
+        title=_s7_title,
     )
+    plotly_chart(_s7_series, dates_str, title=_s7_title)
     print()
     for _lbl, _nav in [
         ("S7 Rotation", nav_s7), ("TQQQ B&H", nav_tqqq), ("SPY B&H", nav_spy)
@@ -4695,11 +4772,13 @@ def main():
                 _chart_series.append(("SPY", _spy_cum_pct))
 
             _n_label = f"{_n_syms} syms × ${cfg.starting_capital/1e3:.0f}k"
+            _chart_title = f"Cumulative Return: All Strategies vs SPY ({_n_label})"
             multi_line_chart(
                 _chart_series, width=70, height=14, fmt="%",
                 dates=_dates_sorted,
-                title=f"Cumulative Return: All Strategies vs SPY ({_n_label})",
+                title=_chart_title,
             )
+            plotly_chart(_chart_series, _dates_sorted, title=_chart_title)
 
             # ── Legend lines ───────────────────────────────────────────────
             # Shows: return % on committed capital, dollar P&L, and avg
