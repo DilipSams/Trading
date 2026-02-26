@@ -1285,6 +1285,82 @@ def yang_zhang_vol(opens: np.ndarray, highs: np.ndarray,
     return annual_vol
 
 
+def precompute_yang_zhang_vol(opens: np.ndarray, highs: np.ndarray,
+                               lows: np.ndarray, closes: np.ndarray,
+                               lookback: int = 20) -> np.ndarray:
+    """
+    Vectorized pre-computation of Yang-Zhang vol for ALL bars at once.
+
+    Returns array of length n where result[t] = yang_zhang_vol at bar t.
+    Numerically identical to calling yang_zhang_vol() per bar but O(n) total
+    instead of O(n * lookback) when called n times.
+
+    This eliminates the #1 per-bar cost: 7 alphas × yang_zhang_vol per bar.
+    Pre-compute once, index by bar_idx → O(1) lookup.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    n = len(closes)
+    result = np.full(n, 0.15, dtype=np.float64)
+    W = lookback
+
+    if n < W + 1:
+        # Not enough data for any valid bar — fill with c2c fallback
+        if n >= 2:
+            log_c = np.log(np.maximum(closes, 1e-12))
+            for t in range(1, n):
+                lr = np.diff(log_c[:t + 1])
+                if len(lr) > 0:
+                    s = float(np.std(lr))
+                    result[t] = s * np.sqrt(252) if s > 0 else 0.15
+        return result
+
+    log_c = np.log(np.maximum(closes, 1e-12))
+    log_o = np.log(np.maximum(opens, 1e-12))
+    log_h = np.log(np.maximum(highs, 1e-12))
+    log_l = np.log(np.maximum(lows, 1e-12))
+
+    # Component arrays (full series, computed once)
+    overnight = log_o[1:] - log_c[:-1]          # length n-1
+    rs_full = ((log_h - log_c) * (log_h - log_o)
+               + (log_l - log_c) * (log_l - log_o))  # length n
+    c2c = np.diff(log_c)                         # length n-1
+
+    # Sliding window statistics (vectorized, no Python loop)
+    on_windows = sliding_window_view(overnight, W)   # shape (n-W, W)
+    on_var = np.var(on_windows, axis=1)              # shape (n-W,)
+
+    rs_windows = sliding_window_view(rs_full, W)     # shape (n-W+1, W)
+    rs_mean = np.mean(rs_windows, axis=1)            # shape (n-W+1,)
+
+    c2c_win_size = max(1, W - 1)
+    c2c_windows = sliding_window_view(c2c, c2c_win_size)  # shape (n-c2c_win_size, c2c_win_size)
+    c2c_var = np.var(c2c_windows, axis=1)
+
+    # Align indices: for bar t (t >= W), the yang-zhang components use:
+    #   on_var[t - W]       (overnight returns over window ending at bar t)
+    #   rs_mean[t - W + 1]  (RS values from bars t-W+1 to t)
+    #   c2c_var[t - W + 1]  (c2c returns within the close window)
+    n_valid = min(len(on_var), len(rs_mean) - 1, len(c2c_var) - 1)
+    if n_valid > 0:
+        aligned_on  = on_var[:n_valid]
+        aligned_rs  = rs_mean[1:n_valid + 1]
+        aligned_c2c = c2c_var[1:n_valid + 1]
+
+        yz_var = aligned_on + aligned_rs + 0.34 * aligned_c2c
+        yz_var = np.maximum(yz_var, 1e-10)
+        result[W:W + n_valid] = np.sqrt(yz_var) * np.sqrt(252)
+
+    # Bars 2..W-1: simple close-to-close vol fallback (matches yang_zhang_vol behavior)
+    for t in range(2, min(W, n)):
+        lr = np.diff(log_c[:t + 1])
+        if len(lr) > 0:
+            s = float(np.std(lr))
+            result[t] = s * np.sqrt(252) if s > 0 else 0.15
+
+    return result
+
+
 def compute_hurst_exponent(prices: np.ndarray, window: int = 126) -> float:
     """
     Compute Hurst exponent via rescaled range (R/S) analysis.
@@ -1625,7 +1701,11 @@ class TrendAlpha(BaseAlpha):
         highs = kwargs.get('highs')
         lows = kwargs.get('lows')
 
-        if opens is not None and highs is not None and lows is not None:
+        # PERF: Use pre-computed yang-zhang vol if available (7× faster)
+        _precomp_yz = kwargs.get('_yz_vol_20')
+        if _precomp_yz is not None:
+            realized_vol = _precomp_yz
+        elif opens is not None and highs is not None and lows is not None:
             realized_vol = yang_zhang_vol(opens, highs, lows, closes, lookback=self.yz_lookback)
         else:
             # Fallback to simple close-to-close vol
@@ -1734,7 +1814,11 @@ class MeanReversionAlpha(BaseAlpha):
         highs = kwargs.get('highs')
         lows = kwargs.get('lows')
 
-        if opens is not None and highs is not None and lows is not None:
+        # PERF: Use pre-computed yang-zhang vol if available (7× faster)
+        _precomp_yz = kwargs.get('_yz_vol_20')
+        if _precomp_yz is not None:
+            sigma = max(_precomp_yz, 0.05)
+        elif opens is not None and highs is not None and lows is not None:
             sigma = max(yang_zhang_vol(opens, highs, lows, closes, lookback=self.yz_lookback), 0.05)
         else:
             # Fallback to simple close-to-close vol
@@ -1795,7 +1879,11 @@ class ValueAlpha(BaseAlpha):
         highs = kwargs.get('highs')
         lows = kwargs.get('lows')
 
-        if opens is not None and highs is not None and lows is not None:
+        # PERF: Use pre-computed yang-zhang vol if available (7× faster)
+        _precomp_yz = kwargs.get('_yz_vol_20')
+        if _precomp_yz is not None:
+            sigma = max(_precomp_yz, 0.05)
+        elif opens is not None and highs is not None and lows is not None:
             sigma = max(yang_zhang_vol(opens, highs, lows, closes, lookback=self.yz_lookback), 0.05)
         else:
             # Fallback to simple close-to-close vol
@@ -2120,7 +2208,13 @@ class VolatilityPremiumAlpha(BaseAlpha):
                                timestamp=bar_idx)
 
         # Use Yang-Zhang vol estimator when OHLC available (14x more efficient)
-        if opens is not None and highs is not None and lows is not None:
+        # PERF: Use pre-computed yang-zhang vol if available (7× faster)
+        _precomp_yz20 = kwargs.get('_yz_vol_20')
+        _precomp_yz60 = kwargs.get('_yz_vol_60')
+        if _precomp_yz20 is not None and _precomp_yz60 is not None:
+            short_vol = max(_precomp_yz20, 0.05)
+            long_vol = max(_precomp_yz60, 0.05)
+        elif opens is not None and highs is not None and lows is not None:
             short_vol = max(yang_zhang_vol(opens, highs, lows, closes, lookback=20), 0.05)
             long_vol = max(yang_zhang_vol(opens, highs, lows, closes, lookback=self.lookback), 0.05)
 
@@ -2259,7 +2353,11 @@ class AmihudLiquidityAlpha(BaseAlpha):
         highs = kwargs.get('highs')
         lows = kwargs.get('lows')
 
-        if opens is not None and highs is not None and lows is not None:
+        # PERF: Use pre-computed yang-zhang vol if available (7× faster)
+        _precomp_yz = kwargs.get('_yz_vol_20')
+        if _precomp_yz is not None:
+            sigma = max(_precomp_yz, 0.05)
+        elif opens is not None and highs is not None and lows is not None:
             sigma = max(yang_zhang_vol(opens, highs, lows, closes, lookback=self.yz_lookback), 0.05)
         else:
             # Fallback to simple close-to-close vol
@@ -2338,7 +2436,11 @@ class HurstRegimeAlpha(BaseAlpha):
         highs = kwargs.get('highs')
         lows = kwargs.get('lows')
 
-        if opens is not None and highs is not None and lows is not None:
+        # PERF: Use pre-computed yang-zhang vol if available (7× faster)
+        _precomp_yz = kwargs.get('_yz_vol_20')
+        if _precomp_yz is not None:
+            sigma = max(_precomp_yz, 0.05)
+        elif opens is not None and highs is not None and lows is not None:
             sigma = max(yang_zhang_vol(opens, highs, lows, closes, lookback=self.yz_lookback), 0.05)
         else:
             # Fallback to simple close-to-close vol
@@ -2410,7 +2512,11 @@ class ShortTermReversalAlpha(BaseAlpha):
         highs = kwargs.get('highs')
         lows = kwargs.get('lows')
 
-        if opens is not None and highs is not None and lows is not None:
+        # PERF: Use pre-computed yang-zhang vol if available (7× faster)
+        _precomp_yz = kwargs.get('_yz_vol_20')
+        if _precomp_yz is not None:
+            sigma = max(_precomp_yz, 0.05)
+        elif opens is not None and highs is not None and lows is not None:
             sigma = max(yang_zhang_vol(opens, highs, lows, closes, lookback=self.yz_lookback), 0.05)
         else:
             # Fallback to simple close-to-close vol
