@@ -417,7 +417,8 @@ def _eval_symbol_worker(d):
     if _n_test_bars > 21:
         from numpy.lib.stride_tricks import sliding_window_view as _swv
         _rvol_windows = _swv(_log_rets_all, 20)
-        _rvol_all[20:20 + len(_rvol_windows)] = np.std(_rvol_windows, axis=1) * 15.8745
+        # Window k covers bars [k, k+19], so its std belongs at bar k+19
+        _rvol_all[19:19 + len(_rvol_windows)] = np.std(_rvol_windows, axis=1) * 15.8745
 
     # Pre-compute Yang-Zhang vol arrays (eliminates 7 per-bar recomputations)
     _full_opens  = d.prices_test[:, 0]
