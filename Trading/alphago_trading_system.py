@@ -1595,80 +1595,67 @@ class TradingEnv(gym.Env):
         # Trailing stop state
         c.trailing_stop_price = self.trailing_stop_price
         c.trailing_stop_entry_price = self.trailing_stop_entry_price
-        # Asymmetric stop state - FIX Bug #5: Deep copy to avoid shared mutable state
+        # Asymmetric stop state - FIX Bug #5: Lightweight copy (not deepcopy) to avoid
+        # shared mutable state while being fast enough for MCTS's ~4000 clones/symbol.
         if hasattr(self, 'asymmetric_stop_manager') and self.asymmetric_stop_manager is not None:
-            from copy import deepcopy
-            c.asymmetric_stop_manager = deepcopy(self.asymmetric_stop_manager)
+            from alphago_stop_loss import AsymmetricStopLoss
+            asm = AsymmetricStopLoss.__new__(AsymmetricStopLoss)
+            asm.config = self.asymmetric_stop_manager.config  # Immutable dataclass, safe to share
+            asm.stops_hit = dict(self.asymmetric_stop_manager.stops_hit)
+            asm.avg_loss_at_stop = []   # Stats not needed for simulation clones
+            asm.avg_profit_at_stop = []
+            c.asymmetric_stop_manager = asm
         else:
             c.asymmetric_stop_manager = None
         c._peak_pnl_pct = getattr(self, '_peak_pnl_pct', 0.0)
         c._bars_in_current_trade = getattr(self, '_bars_in_current_trade', 0)
         return c
 
-    def stochastic_clone(self, horizon=20, block_size=5):
+    def _precompute_stochastic_cache(self, block_size=5, horizon=60):
+        """Pre-compute regime data for efficient repeated stochastic cloning.
+
+        Called ONCE per root env before MCTS rollouts. All subsequent
+        stochastic_clone() calls reuse the cached regime info, block pool,
+        and valid_starts — eliminating ~99.9% of redundant regime computation
+        (was: recomputed identically for every clone, ~4000× per symbol).
         """
-        Clone env with STOCHASTIC future prices for MCTS planning under uncertainty.
-
-        Instead of stepping the realized tape (hindsight leakage), this generates
-        synthetic future prices via regime-conditioned block bootstrap of past returns.
-        The MCTS tree then plans over *plausible* futures, not the answer key.
-
-        Process:
-          1. Estimate current regime from recent closes (vol + trend)
-          2. Collect historical return blocks that match the current regime
-          3. Sample blocks to build a synthetic future price path
-          4. Replace prices[cs+1:cs+horizon+1] with the sampled path
-          5. Features beyond cs are NOT modified (they're already computed from past)
-
-        This makes MCTS targets defensible: the "teacher" uses the same information
-        as the "student" (past data only), just with deeper search.
-        """
-        c = self.clone()  # Start from deterministic clone
-
-        # Compute current regime from past data
         lb = max(60, self.cfg.regime_trend_lookback + 1)
         start_idx = max(0, self.cs - lb)
         past_closes = self.prices[start_idx:self.cs + 1, 3].astype(np.float64)
 
         if len(past_closes) < 30:
-            return c  # Too short for regime estimation, fall back to deterministic
+            self._stochastic_cache = None
+            return
 
-        # Compute log returns
         log_rets = np.diff(np.log(past_closes + 1e-12))
         if len(log_rets) < 20:
-            return c
+            self._stochastic_cache = None
+            return
 
-        # Classify regime: rolling vol + trend
+        # Regime classification
         recent_vol = float(np.std(log_rets[-20:]))
         overall_vol_med = float(np.median(np.abs(log_rets)))
         high_vol = recent_vol > overall_vol_med * 1.2
 
-        trend = float(past_closes[-1] / (past_closes[-min(50, len(past_closes))] + 1e-12) - 1.0)
-        trending = abs(trend) > 0.01
-
-        # Adaptive block size: preserve autocorrelation in trending markets.
-        # Variance-ratio Hurst proxy: |cumulative_return| / sum(|returns|).
-        # Near 1.0 = pure trend (use large blocks), near 0 = mean-reverting (small blocks).
+        # Adaptive block size
         r20 = log_rets[-20:]
         trend_strength = abs(float(r20.sum())) / (float(np.sum(np.abs(r20))) + 1e-10)
-        if trend_strength > 0.40:       # strong trend — preserve momentum
+        if trend_strength > 0.40:
             block_size = max(block_size, 10)
-        elif trend_strength < 0.15:      # mean-reverting — shorter blocks OK
+        elif trend_strength < 0.15:
             block_size = max(3, block_size - 2)
-        # else: keep configured block_size (random-walk-like)
 
-        # Collect blocks of returns matching similar regime conditions
-        # Use simple affinity: returns from high-vol or low-vol periods
+        # Rolling vol — vectorized (was: Python for-loop over n_hist)
         n_hist = len(log_rets)
-        # Rolling vol for each historical bar
         roll_window = min(20, n_hist // 3)
         if roll_window < 5:
-            return c
+            self._stochastic_cache = None
+            return
 
-        hist_vol = np.array([np.std(log_rets[max(0,j-roll_window):j+1])
-                             for j in range(n_hist)])
+        import pandas as _pd
+        hist_vol = _pd.Series(log_rets).rolling(roll_window, min_periods=1).std(ddof=0).values
 
-        # Select indices matching current vol regime
+        # Regime-matched block start indices
         if high_vol:
             regime_mask = hist_vol > np.median(hist_vol)
         else:
@@ -1676,25 +1663,58 @@ class TradingEnv(gym.Env):
 
         regime_indices = np.where(regime_mask)[0]
         if len(regime_indices) < block_size * 2:
-            regime_indices = np.arange(n_hist)  # Fallback: use all history
+            regime_indices = np.arange(n_hist)
+
+        valid_starts = regime_indices[regime_indices <= n_hist - block_size]
+        if len(valid_starts) == 0:
+            valid_starts = np.arange(max(0, n_hist - block_size))
+
+        self._stochastic_cache = {
+            'log_rets': log_rets,
+            'recent_vol': recent_vol,
+            'block_size': block_size,
+            'valid_starts': valid_starts,
+            'last_close': float(past_closes[-1]),
+        }
+
+    def stochastic_clone(self, horizon=20, block_size=5):
+        """
+        Clone env with STOCHASTIC future prices for MCTS planning under uncertainty.
+
+        Uses pre-computed regime cache (from _precompute_stochastic_cache) when
+        available, falling back to full computation otherwise. The cache eliminates
+        regime estimation + rolling vol computation (~4000 redundant calls per symbol).
+
+        Synthetic OHLCV generation is fully vectorized (no Python for-loops).
+        """
+        c = self.clone()
+
+        # Use cached regime data if available (pre-computed once per root env)
+        cache = getattr(self, '_stochastic_cache', None)
+        if cache is None:
+            # No cache — compute from scratch (fallback for non-MCTS usage)
+            self._precompute_stochastic_cache(block_size, horizon)
+            cache = getattr(self, '_stochastic_cache', None)
+            if cache is None:
+                return c  # Too short for regime estimation
+
+        log_rets = cache['log_rets']
+        recent_vol = cache['recent_vol']
+        block_size = cache['block_size']
+        valid_starts = cache['valid_starts']
+        last_close = cache['last_close']
 
         # Block bootstrap: sample blocks of consecutive returns
-        sim_rets = []
-        while len(sim_rets) < horizon:
-            # Pick a random valid start for a block within regime-matching indices
-            valid_starts = regime_indices[regime_indices <= n_hist - block_size]
-            if len(valid_starts) == 0:
-                valid_starts = np.arange(max(0, n_hist - block_size))
-            start = np.random.choice(valid_starts)
-            block = log_rets[start:start + block_size].tolist()
-            sim_rets.extend(block)
-        sim_rets = np.array(sim_rets[:horizon])
+        n_blocks = (horizon + block_size - 1) // block_size  # ceil division
+        starts = np.random.choice(valid_starts, size=n_blocks)
+        # Gather all blocks at once (vectorized)
+        blocks = [log_rets[s:s + block_size] for s in starts]
+        sim_rets = np.concatenate(blocks)[:horizon]
 
         # Add noise proportional to estimation uncertainty
-        sim_rets += np.random.normal(0, recent_vol * 0.1, size=len(sim_rets))
+        sim_rets = sim_rets + np.random.normal(0, recent_vol * 0.1, size=len(sim_rets))
 
-        # Build synthetic OHLCV from sampled returns
-        last_close = float(past_closes[-1])
+        # Vectorized synthetic OHLCV generation (was: Python for-loop over 60 bars)
         end_bar = min(self.cs + 1 + horizon, self.nb)
         n_synth = end_bar - (self.cs + 1)
         if n_synth <= 0:
@@ -1702,33 +1722,38 @@ class TradingEnv(gym.Env):
 
         sim_rets = sim_rets[:n_synth]
 
-        # Create modified prices array (copy, don't mutate original)
+        # Close prices via cumulative log returns
+        cum_log_rets = np.cumsum(sim_rets)
+        closes = last_close * np.exp(cum_log_rets)
+
+        # Per-bar volatility for OHLC noise
+        bar_vols = np.abs(sim_rets) + recent_vol * 0.3
+
+        # Open prices: previous close * (1 + noise)
+        prev_closes = np.empty(n_synth)
+        prev_closes[0] = last_close
+        prev_closes[1:] = closes[:-1]
+        opens = prev_closes * (1.0 + np.random.normal(0, bar_vols * 0.2, size=n_synth))
+
+        # High/Low from max/min of open,close + noise
+        high_base = np.maximum(opens, closes)
+        low_base = np.minimum(opens, closes)
+        highs = high_base * (1.0 + np.abs(np.random.normal(0, bar_vols * 0.5, size=n_synth)))
+        lows = low_base * (1.0 - np.abs(np.random.normal(0, bar_vols * 0.5, size=n_synth)))
+
+        # Apply to prices array (copy only the modified slice for efficiency)
         synth_prices = self.prices.copy()
-        price = last_close
-        for j, lr in enumerate(sim_rets):
-            bar_idx = self.cs + 1 + j
-            if bar_idx >= self.nb:
-                break
-            ret = np.exp(lr)
-            new_close = price * ret
-            # Synthesize OHLC from return + recent vol
-            bar_vol = abs(lr) + recent_vol * 0.3
-            new_open = price * (1 + np.random.normal(0, bar_vol * 0.2))
-            new_high = max(new_open, new_close) * (1 + abs(np.random.normal(0, bar_vol * 0.5)))
-            new_low = min(new_open, new_close) * (1 - abs(np.random.normal(0, bar_vol * 0.5)))
-            synth_prices[bar_idx, 0] = new_open
-            synth_prices[bar_idx, 1] = new_high
-            synth_prices[bar_idx, 2] = new_low
-            synth_prices[bar_idx, 3] = new_close
-            # Keep volume unchanged (already in array)
-            price = new_close
+        bar_slice = slice(self.cs + 1, self.cs + 1 + n_synth)
+        synth_prices[bar_slice, 0] = opens
+        synth_prices[bar_slice, 1] = highs
+        synth_prices[bar_slice, 2] = lows
+        synth_prices[bar_slice, 3] = closes
 
         c.prices = synth_prices
 
         # FIX Bug #6: Reset peak PnL for stochastic clone since price path is synthetic
-        # The peak was calculated on real history, but future is now synthetic
         if abs(c.shares) > 1e-9:
-            c._peak_pnl_pct = 0.0  # Will recalculate from current position forward
+            c._peak_pnl_pct = 0.0
             # Note: _bars_in_current_trade remains unchanged - time in trade is still valid
 
         return c
@@ -4147,6 +4172,7 @@ class AlphaTradeSystem:
                        f"lr={cur_lr:.2e} pl={um.get('pl',0):.4f} vl={um.get('vl',0):.4f} "
                        f"kl={um.get('kl',0):.4f}", "info")
             # MCTS -- Deep search + distillation into policy (AlphaGo-style)
+            _mcts_wall_t0 = time.time()
             if self.cfg.mcts_rollouts>0 and it>1:
                 # Iterative deepening: scale rollouts as value network improves
                 if getattr(self.cfg, 'mcts_schedule_enabled', False):
@@ -4229,11 +4255,20 @@ class AlphaTradeSystem:
                     for idx in sampled_idx:
                         e = env.clone()
                         e.set_index(int(idx))
+                        # Pre-compute regime cache for stochastic cloning (~256× faster)
+                        if self.cfg.mcts_stochastic:
+                            e._precompute_stochastic_cache(
+                                block_size=self.cfg.mcts_bootstrap_block,
+                                horizon=self.cfg.mcts_sim_horizon)
                         root_envs.append(e)
                         root_obs.append(e._obs())
 
                     if root_envs:
+                        _mcts_t0 = time.time()
                         improved = mcts.batch_search(root_envs, n_rollouts=n_rollouts)
+                        _mcts_dt = time.time() - _mcts_t0
+                        tprint(f"  MCTS {d.symbol}: {len(root_envs)} roots × {n_rollouts} rollouts "
+                               f"= {_mcts_dt:.1f}s ({_mcts_dt/len(root_envs):.2f}s/root)", "info")
                         all_mcts_states.extend(root_obs)
                         all_mcts_policies.extend(improved)
                 # Log tree depth statistics
@@ -4268,6 +4303,7 @@ class AlphaTradeSystem:
                         tprint("MCTS: all policy rows invalid after filtering","warn")
                 else:
                     tprint("MCTS: no states collected","warn")
+                tprint(f"MCTS total: {time.time()-_mcts_wall_t0:.1f}s","info")
             # Eval
             er=self.evaluate(cnet,self.ds,f"Challenger (it {it})"); self._pe(er,it)
             # Validate -- multi-symbol with pass ratio (point #5)

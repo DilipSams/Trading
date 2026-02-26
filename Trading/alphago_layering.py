@@ -3011,8 +3011,8 @@ def main():
         return
 
     # --- v9.0: auto-enable all v9.0 features when --version v9 ---
-    # v9 = v8 base + RRG rotation + volume accumulation + 52w high proximity
-    #      + sector breadth gate + mid-cap Rising Stars universe.
+    # v9 = v8 base + RRG rotation + volume accumulation + 52w high proximity.
+    # Mid-cap Rising Stars universe is opt-in via --include-midcap.
     # Individual flags can still be passed to override these defaults.
     if args.version == "v9":
         if not args.sector_momentum_gate:
@@ -3026,8 +3026,8 @@ def main():
             args.volume_acc_weight = 0.10             # Tier 4: institutional accumulation
         if getattr(args, 'high52w_weight', 0.0) == 0.0:
             args.high52w_weight = 0.05                # Tier 5: 52-week high proximity / breakout
-        if not getattr(args, 'include_midcap', False):
-            args.include_midcap = True                # Mid-cap Rising Stars universe extension
+        # Mid-cap is opt-in: pass --include-midcap to add ~70 mid-cap stocks to the universe.
+        # Not auto-enabled because mid-cap data may not be available in all environments.
 
     # -- Handle --sector list early (before heavy init) --
     if args.sector.strip().lower() == "list":

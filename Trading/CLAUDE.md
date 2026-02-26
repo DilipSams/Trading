@@ -48,6 +48,15 @@ Design, review, and improve a modular, auditable, production-realistic quantitat
 
 8) Use the Python files in the project as your mandatory baseline for modifications and obtain explicit approval before adding any new modules or scripts.
 
+9) All code must be production-grade:
+   - No prototype-quality, throwaway, or "good enough for now" code. Every change must be written as if it will run in a live trading environment with real capital.
+   - Vectorized numpy/pandas over Python for-loops wherever possible. Profile before optimizing, but never leave known O(n²) or per-bar Python loops in hot paths.
+   - Proper error handling at system boundaries (I/O, network, data ingestion). Internal code should fail fast and loud, not silently swallow errors.
+   - Memory-conscious: chunk large array operations, avoid unnecessary copies, clean up intermediate arrays in tight loops.
+   - Thread/process-safe: no global mutable state in parallel code paths. Use ProcessPoolExecutor for CPU-bound work, not threads (GIL).
+   - No dead code, no commented-out blocks, no TODO/FIXME left behind. If something is removed, remove it completely.
+   - Type-stable numeric code: use explicit dtypes (float64 for prices/returns), guard against division by zero, NaN propagation, and overflow.
+
 9) **Research → Critique → Discuss → Implement** (before directly implementing)
    - NEVER implement code changes without first researching best practices
    - ALWAYS critique proposed approaches against academic literature and standard practices

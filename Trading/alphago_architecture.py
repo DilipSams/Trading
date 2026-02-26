@@ -4146,6 +4146,18 @@ class AlertManager:
         # FIX Ã‚Â§5.1: min_print_level gates stdout output while always recording to log.
         # CRITICAL/FATAL always print. Set to "INFO" for full verbose output.
         self._min_print_level = self.LEVELS.index(min_print_level.upper()) if min_print_level.upper() in self.LEVELS else 0
+        self._max_log = max_log
+        self._min_print_level_str = min_print_level.upper()
+
+    def __getstate__(self):
+        """Pickle-safe: drop closure-based handlers (restored on unpickle)."""
+        state = self.__dict__.copy()
+        state.pop('_handlers', None)  # Closures can't be pickled
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._handlers = [self._default_handler]  # Restore default handler
 
     def alert(self, level: str, source: str, message: str,
               context: Dict = None):
