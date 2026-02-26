@@ -67,6 +67,11 @@ class WaveRiderConfig:
     # --- Universe ---
     universe_top_n: int = 100
 
+    # --- Deduplication (same company, multiple share classes) ---
+    dedup_map: Dict[str, str] = field(default_factory=lambda: {
+        "GOOG": "GOOGL",   # Alphabet Class C -> Class A (keep GOOGL)
+    })
+
     @property
     def exit_band(self) -> int:
         return int(self.top_n * self.exit_band_mult)
@@ -388,14 +393,42 @@ class WaveRiderStrategy:
             gz_sorted = sorted(gray, key=lambda s: scores.get(s, -999), reverse=True)
             portfolio -= set(gz_sorted[2:])
 
+        # --- Deduplication (same company, multiple share classes) ---
+        if c.dedup_map:
+            # Build canonical symbol for each UID in portfolio
+            def _canonical(uid: str) -> str:
+                base = clean_uid(uid).rstrip("*")
+                return c.dedup_map.get(base, base)
+
+            from collections import defaultdict
+            groups = defaultdict(list)
+            for s in portfolio:
+                groups[_canonical(s)].append(s)
+            for canon, members in groups.items():
+                if len(members) > 1:
+                    # Keep highest-scored, remove rest
+                    members.sort(key=lambda s: scores.get(s, -999), reverse=True)
+                    portfolio -= set(members[1:])
+
         filtered_out = list(before - portfolio)
 
-        # Refill with clean stocks
+        # Refill with clean stocks (skip dedup variants already held)
+        held_canonicals = set()
+        if c.dedup_map:
+            held_canonicals = {_canonical(s) for s in portfolio}
         for s in scores.index:
             if len(portfolio) >= c.top_n:
                 break
-            if s not in portfolio and _ms(s) <= c.meme_max2:
-                portfolio.add(s)
+            if s in portfolio:
+                continue
+            if _ms(s) > c.meme_max2:
+                continue
+            if c.dedup_map:
+                if _canonical(s) in held_canonicals:
+                    continue
+            portfolio.add(s)
+            if c.dedup_map:
+                held_canonicals.add(_canonical(s))
 
         return portfolio, filtered_out
 
