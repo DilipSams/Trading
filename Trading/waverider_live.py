@@ -194,23 +194,76 @@ def main():
               f"{c['classification']:<16s} {status}")
 
     # ===================================================================
-    # YTD performance
+    # Multi-period performance comparison table
     # ===================================================================
-    current_year = signal.date.year
-    yr_dates = result.dates[result.dates.year == current_year]
-    if len(yr_dates) > 5:
-        ytd_ret = (result.nav_leveraged.loc[yr_dates[-1]] / result.nav_leveraged.loc[yr_dates[0]] - 1) * 100
-        spy_yr = spy_price[spy_price.index.year == current_year]
-        spy_ytd = (spy_yr.iloc[-1] / spy_yr.iloc[0] - 1) * 100 if len(spy_yr) > 5 else 0
-        print(f"\n  YTD PERFORMANCE: {ytd_ret:+.1f}% (SPY: {spy_ytd:+.1f}%)")
+    end_date = result.dates[-1]
+    start_date = result.dates[0]
+    nav_l = result.nav_leveraged
+    nav_u = result.nav_unlevered
 
-    # ===================================================================
-    # Lifetime summary
-    # ===================================================================
-    print(f"\n  LIFETIME ({m_lev['n_years']:.0f} years): "
-          f"CAGR {m_lev['cagr']*100:+.1f}% | "
-          f"Sharpe {m_lev['sharpe']:.2f} | "
-          f"MaxDD {m_lev['max_dd']*100:.1f}%")
+    # Define periods: (label, start_date)
+    periods = []
+    # YTD
+    ytd_start_dates = result.dates[result.dates.year == end_date.year]
+    if len(ytd_start_dates) > 5:
+        periods.append(("YTD", ytd_start_dates[0]))
+    # 1Y, 3Y, 5Y, 10Y, 15Y, 20Y
+    for yrs in [1, 3, 5, 10, 15, 20]:
+        cutoff = end_date - pd.DateOffset(years=yrs)
+        valid = result.dates[result.dates >= cutoff]
+        if len(valid) > 20 and valid[0] < end_date - pd.Timedelta(days=yrs * 300):
+            periods.append((f"{yrs}Y", valid[0]))
+    # Full
+    periods.append(("Full", start_date))
+
+    def _fmt_ret(val: float, width: int = 9) -> str:
+        """Format return% compactly: 1234.5% -> +1,235%, 1816349% -> +1.8M%."""
+        if abs(val) >= 1_000_000:
+            return f"{val/1_000_000:>+{width-2}.1f}M%"
+        if abs(val) >= 10_000:
+            return f"{val/1_000:>+{width-2}.0f}k%"
+        if abs(val) >= 1_000:
+            return f"{val:>+{width-1},.0f}%"
+        return f"{val:>+{width-1}.1f}%"
+
+    print(f"\n  PERFORMANCE COMPARISON:")
+    print(f"    {'Period':<8s} {'WR 2x':>9s} {'WR 1x':>9s} {'SPY':>9s} {'vs SPY':>9s}  "
+          f"{'CAGR 2x':>8s} {'Sharpe':>7s} {'Sortino':>8s} {'MaxDD':>7s} {'AvgLev':>7s}")
+    print(f"    {'-' * 98}")
+
+    for label, p_start in periods:
+        mask = (result.dates >= p_start) & (result.dates <= end_date)
+        p_dates = result.dates[mask]
+        if len(p_dates) < 5:
+            continue
+
+        # Strategy returns
+        ret_l = (nav_l.loc[p_dates[-1]] / nav_l.loc[p_dates[0]] - 1) * 100
+        ret_u = (nav_u.loc[p_dates[-1]] / nav_u.loc[p_dates[0]] - 1) * 100
+
+        # SPY return
+        spy_aligned = spy_price.reindex(p_dates).ffill().bfill()
+        spy_ret = (spy_aligned.iloc[-1] / spy_aligned.iloc[0] - 1) * 100 if len(spy_aligned) > 5 else np.nan
+        vs_spy = ret_l - spy_ret if not np.isnan(spy_ret) else np.nan
+
+        # Period-specific CAGR, Sharpe, Sortino, MaxDD (from sub-NAV)
+        sub_nav = nav_l.loc[p_dates]
+        sub_nav_norm = sub_nav / sub_nav.iloc[0]  # normalize to 1.0 for metrics
+        p_years = (p_dates[-1] - p_dates[0]).days / 365.25
+        p_cagr = (sub_nav_norm.iloc[-1] ** (1 / p_years) - 1) * 100 if p_years > 0.1 else ret_l
+
+        daily_r = sub_nav_norm.pct_change().dropna()
+        p_sharpe = daily_r.mean() / daily_r.std() * np.sqrt(252) if daily_r.std() > 0 else 0
+        down = daily_r[daily_r < 0]
+        p_sortino = daily_r.mean() * 252 / (down.std() * np.sqrt(252)) if len(down) > 0 and down.std() > 0 else 0
+        p_maxdd = (sub_nav_norm / sub_nav_norm.cummax() - 1).min() * 100
+
+        avg_lev = result.leverage_series.loc[p_dates].mean()
+
+        vs_str = _fmt_ret(vs_spy) if not np.isnan(vs_spy) else "      n/a"
+        spy_str = _fmt_ret(spy_ret) if not np.isnan(spy_ret) else "      n/a"
+        print(f"    {label:<8s} {_fmt_ret(ret_l)} {_fmt_ret(ret_u)} {spy_str} {vs_str}  "
+              f"{p_cagr:>+7.1f}% {p_sharpe:>7.2f} {p_sortino:>8.2f} {p_maxdd:>6.1f}% {avg_lev:>6.2f}x")
 
     # ===================================================================
     # Backtest model note
