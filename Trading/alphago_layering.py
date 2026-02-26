@@ -52,12 +52,24 @@ import argparse
 import time
 import json
 import math
+import signal
 from copy import copy, deepcopy
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
+
+# -- Ctrl+C: immediate exit from any step (including worker pools) -----------
+_interrupted = False
+
+def _sigint_handler(signum, frame):
+    """Set flag and raise KeyboardInterrupt so executors break out."""
+    global _interrupted
+    _interrupted = True
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGINT, _sigint_handler)
 
 # -- UTF-8 stdout: required for Unicode chart characters (█ etc.) on Windows --
 if hasattr(sys.stdout, "reconfigure"):
@@ -642,19 +654,28 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
     n_workers = max(1, min(len(datasets), multiprocessing.cpu_count()))
 
     sym_results = {}
-    with ProcessPoolExecutor(
-        max_workers=n_workers,
-        initializer=_init_eval_worker,
-        initargs=(_pipeline_bytes, _net_bytes, cfg, acfg, spy_returns_lookup, verbose),
-    ) as _pool:
-        _futs = {_pool.submit(_eval_symbol_worker, d): d.symbol for d in datasets}
-        for _fut in as_completed(_futs):
-            _sym = _futs[_fut]
-            try:
-                sym_results[_sym] = _fut.result()
-            except Exception as _exc:
-                tprint(f"  [eval] {_sym} raised: {_exc}", "warn")
-                sym_results[_sym] = None
+    try:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_eval_worker,
+            initargs=(_pipeline_bytes, _net_bytes, cfg, acfg, spy_returns_lookup, verbose),
+        ) as _pool:
+            _futs = {_pool.submit(_eval_symbol_worker, d): d.symbol for d in datasets}
+            for _fut in as_completed(_futs):
+                if _interrupted:
+                    raise KeyboardInterrupt
+                _sym = _futs[_fut]
+                try:
+                    sym_results[_sym] = _fut.result()
+                except Exception as _exc:
+                    tprint(f"  [eval] {_sym} raised: {_exc}", "warn")
+                    sym_results[_sym] = None
+    except KeyboardInterrupt:
+        tprint("Ctrl+C — cancelling evaluation workers...", "warn")
+        for f in _futs:
+            f.cancel()
+        _pool.shutdown(wait=False, cancel_futures=True)
+        raise
 
     # ---------- aggregate results in original symbol order ----------
     for d in datasets:
@@ -997,12 +1018,21 @@ def run_ablation_study(datasets, pipeline, cfg, acfg,
     # Run all 8 configs in parallel; NumPy releases GIL → real CPU overlap
     n_workers = min(len(ablation_jobs), 16)  # 16-core machine — run all jobs in parallel
     abl_results = {}   # name -> (results_dict_or_None, n_selected)
-    with ThreadPoolExecutor(max_workers=n_workers) as _abl_pool:
-        _futures = {_abl_pool.submit(_run_one_ablation, job): job[0]
-                    for job in ablation_jobs}
-        for _fut in as_completed(_futures):
-            _n, _res, _n_sel = _fut.result()
-            abl_results[_n] = (_res, _n_sel)
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as _abl_pool:
+            _futures = {_abl_pool.submit(_run_one_ablation, job): job[0]
+                        for job in ablation_jobs}
+            for _fut in as_completed(_futures):
+                if _interrupted:
+                    raise KeyboardInterrupt
+                _n, _res, _n_sel = _fut.result()
+                abl_results[_n] = (_res, _n_sel)
+    except KeyboardInterrupt:
+        tprint("Ctrl+C — cancelling ablation workers...", "warn")
+        for f in _futures:
+            f.cancel()
+        _abl_pool.shutdown(wait=False, cancel_futures=True)
+        raise
 
     # Print in original order (threads finished out-of-order)
     for name, _ in tests:
@@ -1533,7 +1563,8 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
     if verbose >= 1:
         tprint(f"Parallelizing walk-forward validation across {n_workers} workers ({len(datasets)} datasets)", "info")
 
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+    try:
+      with ProcessPoolExecutor(max_workers=n_workers) as executor:
         # Submit all dataset processing tasks
         # Pack args as tuple to avoid pickle issues with pipeline/net objects
         task_args = [(d, acfg, alpha_names, verbose) for d in datasets]
@@ -1547,6 +1578,8 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
         n_completed = 0
         n_total = len(futures)
         for future in as_completed(futures):
+            if _interrupted:
+                raise KeyboardInterrupt
             n_completed += 1
             if verbose >= 1 and (n_completed % 10 == 0 or n_completed == n_total):
                 progress_bar(n_completed, n_total, "WF-CV", start_time=cv_start_time)
@@ -1577,6 +1610,12 @@ def validate_alphas_walkforward(datasets, pipeline, net, cfg, acfg, verbose=1):
                         alpha_horizon_data[alpha_name][horizon]['rets'].extend(
                             result['alpha_horizon_data'][alpha_name][horizon]['rets']
                         )
+    except KeyboardInterrupt:
+        tprint("Ctrl+C — cancelling walk-forward CV workers...", "warn")
+        for f in futures:
+            f.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
 
     if verbose >= 1 and n_datasets_used > 0:
         folds_per = n_folds_total // max(n_datasets_used, 1)
