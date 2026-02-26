@@ -2801,27 +2801,123 @@ def _run_waverider_strategy(args):
 
     # ── 5. Current signal (live portfolio) ──────────────────────────────
     print_section("CURRENT PORTFOLIO SIGNAL")
+    import math as _math
     signal = strategy.current_portfolio(prices, spy_price, rankings)
+
+    def _get_price(uid):
+        if uid in prices.columns:
+            return float(prices[uid].dropna().iloc[-1])
+        return 0.0
+
+    def _get_price_on(uid, dt):
+        if uid in prices.columns:
+            val = prices[uid].asof(dt)
+            if _pd.notna(val):
+                return float(val)
+        return 0.0
+
+    def _find_entry(uid):
+        for rd in reversed(result.rebalance_dates):
+            if uid in result.holdings_log.get(rd, []):
+                entry = rd
+            else:
+                break
+        else:
+            entry = result.rebalance_dates[0] if result.rebalance_dates else None
+        return entry
+
+    # Build UID lookup and entry info
+    uid_map = {clean_uid(uid): uid for uid in signal.holdings}
+    entry_info = {}
+    for uid in signal.holdings:
+        sym = clean_uid(uid)
+        ed = _find_entry(uid)
+        ep = _get_price_on(uid, ed) if ed else 0.0
+        entry_info[sym] = (ed, ep)
 
     n = len(signal.holdings_clean)
     weight_pct = 100.0 / n if n > 0 else 0
-    tprint(f"Signal date: {signal.date.strftime('%Y-%m-%d')}", "ok")
-    print(f"\n    Portfolio ({n} stocks, equal weight {weight_pct:.0f}% each):")
-    for i, sym in enumerate(signal.holdings_clean, 1):
-        ms = signal.meme_scores.get(sym, 0)
-        print(f"      {i}. {sym:<8s}  MemeScore: {ms:.0f}")
+    effective_capital = ALLOCATION * signal.leverage
+    per_stock = effective_capital / n if n > 0 else 0
+
+    tprint(f"Signal date: {signal.date.strftime('%Y-%m-%d')}  |  "
+           f"Capital: ${ALLOCATION:,.0f}  |  "
+           f"Effective: ${effective_capital:,.0f} ({signal.leverage:.2f}x)", "ok")
 
     bear_str = f"{C.RED}ON (SPY < SMA200) -> 0.5x cap{C.RESET}" if signal.bear_regime else \
                f"{C.GREEN}OFF (SPY > SMA200){C.RESET}"
     print(f"\n    Leverage: {signal.leverage:.2f}x  |  "
           f"Vol(21d): {signal.realized_vol:.2f}  |  Bear gate: {bear_str}")
 
+    # ── Portfolio table with entry dates, prices, P&L ──
+    print(f"\n    Portfolio ({n} stocks, equal weight {weight_pct:.0f}% each, "
+          f"${per_stock:,.0f}/stock):")
+    print(f"      {'#':<3s} {'Symbol':<7s} {'CurPrice':>9s} {'Shares':>7s} {'Alloc':>10s}  "
+          f"{'EntryDate':>10s} {'EntryPx':>8s} {'$P&L':>9s} {'%P&L':>7s}  {'Meme':>5s}")
+    print(f"      {'-' * 95}")
+
+    def _classify(score):
+        if score <= cfg.meme_max2: return "Clean"
+        elif score <= cfg.meme_max1: return "Gray"
+        elif score <= cfg.meme_exclude: return "MemeAdj"
+        return "Meme"
+
+    total_alloc = 0.0
+    total_pnl = 0.0
+    for i, sym in enumerate(signal.holdings_clean, 1):
+        uid = uid_map.get(sym, sym)
+        price = _get_price(uid)
+        shares = _math.floor(per_stock / price) if price > 0 else 0
+        alloc = shares * price
+        total_alloc += alloc
+        ms = signal.meme_scores.get(sym, 0)
+        ed, ep = entry_info.get(sym, (None, 0))
+        ed_str = ed.strftime('%Y-%m-%d') if ed else "n/a"
+        ep_str = f"${ep:.2f}" if ep > 0 else "n/a"
+        if ep > 0:
+            pnl_pct = (price / ep - 1) * 100
+            pnl_dollar = shares * (price - ep)
+            total_pnl += pnl_dollar
+            pnl_d_str = f"${pnl_dollar:>+8,.0f}"
+            pnl_p_str = f"{pnl_pct:>+6.1f}%"
+            _pc = C.GREEN if pnl_pct >= 0 else C.RED
+        else:
+            pnl_d_str = f"{'n/a':>9s}"
+            pnl_p_str = f"{'n/a':>7s}"
+            _pc = ""
+        print(f"      {i:<3d} {sym:<7s} ${price:>8.2f} {shares:>6d}   ${alloc:>8,.0f}  "
+              f"{ed_str:>10s} {ep_str:>8s} {_pc}{pnl_d_str}{C.RESET} {_pc}{pnl_p_str}{C.RESET}  "
+              f"{ms:>5.0f}")
+
+    cash = effective_capital - total_alloc
+    print(f"      {'':3s} {'CASH':<7s} {'':>9s} {'':>7s}   ${cash:>8,.0f}")
+    print(f"      {'-' * 95}")
+    _tc = C.GREEN if total_pnl >= 0 else C.RED
+    print(f"      {'':3s} {'TOTAL':<7s} {'':>9s} {'':>7s}   ${effective_capital:>8,.0f}  "
+          f"{'':>10s} {'':>8s} {_tc}${total_pnl:>+8,.0f}{C.RESET}")
+
+    # ── Trades with quantities and recommendation date ──
+    rebal_str = signal.date.strftime('%Y-%m-%d')
     if signal.buys or signal.sells:
-        print(f"\n    Trades this month:")
+        print(f"\n    Trades this month (rec. {rebal_str}):")
         for sym in signal.buys:
-            print(f"      {C.GREEN}BUY:  {sym}{C.RESET}")
+            uid = uid_map.get(sym, sym)
+            price = _get_price(uid)
+            shares = _math.floor(per_stock / price) if price > 0 else 0
+            alloc = shares * price
+            print(f"      {C.GREEN}BUY:  {sym:<8s} {shares:>5d} shares @ ${price:.2f} "
+                  f"= ${alloc:,.0f}{C.RESET}")
         for sym in signal.sells:
-            print(f"      {C.RED}SELL: {sym}{C.RESET}")
+            print(f"      {C.RED}SELL: {sym:<8s} (exit entire position){C.RESET}")
+        holds = [s for s in signal.holdings_clean if s not in signal.buys]
+        if holds:
+            hd = []
+            for s in holds:
+                uid = uid_map.get(s, s)
+                p = _get_price(uid)
+                sh = _math.floor(per_stock / p) if p > 0 else 0
+                hd.append(f"{s}({sh}sh)")
+            print(f"      HOLD: {', '.join(hd)}")
     else:
         print(f"\n    No trades this month.")
 
@@ -2844,6 +2940,120 @@ def _run_waverider_strategy(args):
         fmt="%",
         out_dir=os.path.dirname(__file__),
     )
+
+    # ── 7. Multi-period performance comparison ──────────────────────────
+    print_section("PERFORMANCE COMPARISON")
+    end_date = dates[-1]
+    nav_l = result.nav_leveraged
+    nav_u = result.nav_unlevered
+
+    def _fmt_ret(val, w=9):
+        if abs(val) >= 1_000_000: return f"{val/1e6:>+{w-2}.1f}M%"
+        if abs(val) >= 10_000:    return f"{val/1e3:>+{w-2}.0f}k%"
+        if abs(val) >= 1_000:     return f"{val:>+{w-1},.0f}%"
+        return f"{val:>+{w-1}.1f}%"
+
+    _periods = []
+    _ytd_dates = dates[dates.year == end_date.year]
+    if len(_ytd_dates) > 5:
+        _periods.append(("YTD", _ytd_dates[0]))
+    for _yrs in [1, 3, 5, 10, 15, 20]:
+        _cutoff = end_date - _pd.DateOffset(years=_yrs)
+        _valid = dates[dates >= _cutoff]
+        if len(_valid) > 20 and _valid[0] < end_date - _pd.Timedelta(days=_yrs * 300):
+            _periods.append((f"{_yrs}Y", _valid[0]))
+    _periods.append(("Full", dates[0]))
+
+    print(f"\n    {'Period':<8s} {'WR 2x':>9s} {'WR 1x':>9s} {'SPY':>9s} {'vs SPY':>9s}  "
+          f"{'CAGR 2x':>8s} {'Sharpe':>7s} {'Sortino':>8s} {'MaxDD':>7s} {'AvgLev':>7s}")
+    print(f"    {'─'*98}")
+
+    for _lbl, _ps in _periods:
+        _mask = (dates >= _ps) & (dates <= end_date)
+        _pd_ = dates[_mask]
+        if len(_pd_) < 5:
+            continue
+        _rl = (nav_l.loc[_pd_[-1]] / nav_l.loc[_pd_[0]] - 1) * 100
+        _ru = (nav_u.loc[_pd_[-1]] / nav_u.loc[_pd_[0]] - 1) * 100
+        _sa = spy_price.reindex(_pd_).ffill().bfill()
+        _sr = (float(_sa.iloc[-1]) / float(_sa.iloc[0]) - 1) * 100 if len(_sa) > 5 else np.nan
+        _vs = _rl - _sr if not np.isnan(_sr) else np.nan
+
+        _sn = nav_l.loc[_pd_]
+        _snn = _sn / _sn.iloc[0]
+        _py = (_pd_[-1] - _pd_[0]).days / 365.25
+        _pc = (_snn.iloc[-1] ** (1 / _py) - 1) * 100 if _py > 0.1 else _rl
+        _dr = _snn.pct_change().dropna()
+        _sh = float(_dr.mean() / _dr.std() * np.sqrt(252)) if _dr.std() > 0 else 0
+        _dn = _dr[_dr < 0]
+        _so = float(_dr.mean() * 252 / (_dn.std() * np.sqrt(252))) if len(_dn) > 0 and _dn.std() > 0 else 0
+        _md = float((_snn / _snn.cummax() - 1).min() * 100)
+        _al = float(result.leverage_series.loc[_pd_].mean())
+
+        _vs_s = _fmt_ret(_vs) if not np.isnan(_vs) else "      n/a"
+        _sr_s = _fmt_ret(_sr) if not np.isnan(_sr) else "      n/a"
+        print(f"    {_lbl:<8s} {_fmt_ret(_rl)} {_fmt_ret(_ru)} {_sr_s} {_vs_s}  "
+              f"{_pc:>+7.1f}% {_sh:>7.2f} {_so:>8.2f} {_md:>6.1f}% {_al:>6.2f}x")
+
+    # ── 8. Winner capture rate ────────────────────────────────────────
+    print_section("WINNER CAPTURE RATE")
+    _membership = strategy.build_membership(prices, rankings)
+    _strat_hold = {d: set(h) for d, h in result.holdings_log.items()}
+    _top_k = 10
+    _horizons = [1, 3, 5, 10]
+
+    print(f"\n    Did we hold the top-{_top_k} performers?")
+    print(f"    {'Year':<6s}  " + "  ".join(f"{'%dY Cap' % h:>8s}" for h in _horizons)
+          + f"  {'Held':>6s}")
+    print(f"    {'─' * (8 + 10 * len(_horizons) + 8)}")
+
+    _ret_h = {}
+    for _h in _horizons:
+        _td = _h * 252
+        if len(prices) > _td:
+            _ret_h[_h] = prices.pct_change(_td)
+
+    _snap_years = sorted(set(d.year for d in dates))
+    _yc = {h: [] for h in _horizons}
+    for _sy in _snap_years:
+        _yd = prices.index[prices.index.year == _sy]
+        if len(_yd) < 20:
+            continue
+        _sd = _yd[-1]
+        _yh = set()
+        for rd in result.rebalance_dates:
+            if rd.year == _sy:
+                _yh |= _strat_hold.get(rd, set())
+        _rs = []
+        for _h in _horizons:
+            if _h not in _ret_h or _sd not in _ret_h[_h].index:
+                _rs.append(f"{'n/a':>8s}")
+                continue
+            _rets = _ret_h[_h].loc[_sd].dropna()
+            _iu = [u for u in _rets.index
+                   if u in _membership.columns and _sd in _membership.index
+                   and _membership.loc[_sd, u] == 1]
+            if not _iu:
+                _iu = list(_rets.index)
+            _top = _rets.reindex(_iu).dropna().nlargest(_top_k)
+            if len(_top) < 3:
+                _rs.append(f"{'n/a':>8s}")
+                continue
+            _cap = sum(1 for u in _top.index if u in _yh)
+            _pct = _cap / len(_top) * 100
+            _rs.append(f"{_cap}/{len(_top)}={_pct:2.0f}%")
+            _yc[_h].append(_pct)
+        print(f"    {_sy:<6d}  " + "  ".join(f"{s:>8s}" for s in _rs)
+              + f"  {len(_yh):>5d}")
+
+    print(f"    {'─' * (8 + 10 * len(_horizons) + 8)}")
+    _avg_s = []
+    for _h in _horizons:
+        if _yc[_h]:
+            _avg_s.append(f"avg {np.mean(_yc[_h]):2.0f}%")
+        else:
+            _avg_s.append("n/a")
+    print(f"    {'Avg':<6s}  " + "  ".join(f"{s:>8s}" for s in _avg_s))
 
     # ── Done ────────────────────────────────────────────────────────────
     print_box(
