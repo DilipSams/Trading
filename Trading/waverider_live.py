@@ -266,6 +266,82 @@ def main():
               f"{p_cagr:>+7.1f}% {p_sharpe:>7.2f} {p_sortino:>8.2f} {p_maxdd:>6.1f}% {avg_lev:>6.2f}x")
 
     # ===================================================================
+    # Winner capture rate table
+    # ===================================================================
+    membership = strategy.build_membership(prices, rankings)
+    strategy_holdings = {d: set(h) for d, h in result.holdings_log.items()}
+    rebal_dates = result.rebalance_dates
+
+    capture_horizons = [1, 3, 5, 10]  # years
+    top_k = 10  # top performers to check
+
+    print(f"\n  WINNER CAPTURE RATE (did we hold the top-{top_k} performers?):")
+    header_periods = "  ".join(f"{h}Y" for h in capture_horizons)
+    print(f"    {'Year':<6s}  " + "  ".join(f"{'%dY Cap' % h:>8s}" for h in capture_horizons)
+          + f"  {'Stocks Held':>11s}")
+    print(f"    {'-' * (8 + 10 * len(capture_horizons) + 13)}")
+
+    # Precompute return series for each horizon
+    ret_by_horizon = {}
+    for h in capture_horizons:
+        trading_days = h * 252
+        if len(prices) > trading_days:
+            ret_by_horizon[h] = prices.pct_change(trading_days)
+
+    # Show for each year that has enough data
+    snap_years = sorted(set(d.year for d in result.dates))
+    yearly_captures = {h: [] for h in capture_horizons}
+
+    for snap_year in snap_years:
+        year_dates = prices.index[prices.index.year == snap_year]
+        if len(year_dates) < 20:
+            continue
+        snap_date = year_dates[-1]
+
+        # Stocks held this year across all rebalances
+        year_held = set()
+        for rd in rebal_dates:
+            if rd.year == snap_year:
+                year_held |= strategy_holdings.get(rd, set())
+        n_held = len(year_held)
+
+        rate_strs = []
+        for h in capture_horizons:
+            if h not in ret_by_horizon or snap_date not in ret_by_horizon[h].index:
+                rate_strs.append(f"{'n/a':>8s}")
+                continue
+            rets = ret_by_horizon[h].loc[snap_date].dropna()
+            # Filter to stocks in our universe at snapshot time
+            in_univ = [u for u in rets.index
+                       if u in membership.columns
+                       and snap_date in membership.index
+                       and membership.loc[snap_date, u] == 1]
+            if not in_univ:
+                in_univ = list(rets.index)
+            top = rets.reindex(in_univ).dropna().nlargest(top_k)
+            if len(top) < 3:  # not enough data for meaningful capture rate
+                rate_strs.append(f"{'n/a':>8s}")
+                continue
+            captured = sum(1 for u in top.index if u in year_held)
+            pct = captured / len(top) * 100
+            rate_strs.append(f"{captured}/{len(top)}={pct:2.0f}%")
+            yearly_captures[h].append(pct)
+
+        print(f"    {snap_year:<6d}  " + "  ".join(f"{s:>8s}" for s in rate_strs)
+              + f"  {n_held:>7d}")
+
+    # Average capture rates
+    print(f"    {'-' * (8 + 10 * len(capture_horizons) + 13)}")
+    avg_strs = []
+    for h in capture_horizons:
+        if yearly_captures[h]:
+            avg = np.mean(yearly_captures[h])
+            avg_strs.append(f"avg {avg:2.0f}%")
+        else:
+            avg_strs.append("n/a")
+    print(f"    {'Avg':<6s}  " + "  ".join(f"{s:>8s}" for s in avg_strs))
+
+    # ===================================================================
     # Backtest model note
     # ===================================================================
     print(f"\n  NOTE: Backtest uses fixed-dollar equal-weight allocation.")
