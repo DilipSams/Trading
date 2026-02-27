@@ -4139,25 +4139,33 @@ class AlertManager:
         'FATAL': 50,     # logging.CRITICAL (highest)
     }
 
-    def __init__(self, handlers=None, max_log: int = 5000, min_print_level: str = "WARNING"):
+    def __init__(self, handlers=None, max_log: int = 5000, min_print_level: str = "WARNING",
+                 log_file: str = None):
         self._handlers = handlers or [self._default_handler]
         self._alert_log = deque(maxlen=max_log)
         self._counts = {level: 0 for level in self.LEVELS}
-        # FIX Ã‚Â§5.1: min_print_level gates stdout output while always recording to log.
+        # FIX §5.1: min_print_level gates stdout output while always recording to log.
         # CRITICAL/FATAL always print. Set to "INFO" for full verbose output.
         self._min_print_level = self.LEVELS.index(min_print_level.upper()) if min_print_level.upper() in self.LEVELS else 0
         self._max_log = max_log
         self._min_print_level_str = min_print_level.upper()
+        # Deduplication: track (level, source, message) → count.
+        # First occurrence prints to terminal; repeats go to log file only.
+        self._seen_messages: Dict[tuple, int] = {}
+        self._log_file = log_file
+        self._log_fh = None
 
     def __getstate__(self):
-        """Pickle-safe: drop closure-based handlers (restored on unpickle)."""
+        """Pickle-safe: drop closure-based handlers and file handles."""
         state = self.__dict__.copy()
         state.pop('_handlers', None)  # Closures can't be pickled
+        state.pop('_log_fh', None)    # Open file handles can't be pickled
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._handlers = [self._default_handler]  # Restore default handler
+        self._log_fh = None  # Reopen lazily on next write
 
     def alert(self, level: str, source: str, message: str,
               context: Dict = None):
@@ -4177,14 +4185,28 @@ class AlertManager:
         self._alert_log.append(entry)
         self._counts[level] = self._counts.get(level, 0) + 1
 
-        # FIX Ã‚Â§5.1: Always record in log, but only call handlers if level >= min_print_level
+        # Dedup: only print a given (level, source, message) to terminal ONCE.
+        # Subsequent identical alerts are written to log file only.
+        dedup_key = (level, source, message)
+        repeat_count = self._seen_messages.get(dedup_key, 0)
+        self._seen_messages[dedup_key] = repeat_count + 1
+
+        # FIX §5.1: Always record in log, but only call handlers if level >= min_print_level
         level_idx = self.LEVELS.index(level) if level in self.LEVELS else 0
         if level_idx >= self._min_print_level:
-            for handler in self._handlers:
-                try:
-                    handler(entry)
-                except Exception:
-                    pass  # Alerting must not crash the pipeline
+            if repeat_count == 0:
+                # First occurrence — print to terminal
+                for handler in self._handlers:
+                    try:
+                        handler(entry)
+                    except Exception:
+                        pass  # Alerting must not crash the pipeline
+            else:
+                # Repeated alert — write to log file only (not terminal)
+                if repeat_count == 1:  # First suppression — tell user where to find it
+                    log_path = self._log_file or "alphago_alerts.log"
+                    print(f"  [... repeated {level} alerts suppressed — see {log_path}]")
+                self._write_to_log_file(entry)
 
     def _default_handler(self, entry: Dict):
         """Print alert to stdout with severity prefix (dev/debug mode)."""
@@ -4194,6 +4216,30 @@ class AlertManager:
         }
         print(f"  {prefix.get(entry['level'], '?')} [{entry['level']}] "
               f"{entry['source']}: {entry['message']}")
+
+    def _write_to_log_file(self, entry: Dict):
+        """Write repeated/suppressed alerts to log file instead of terminal."""
+        try:
+            if self._log_fh is None:
+                if self._log_file is None:
+                    import os, tempfile
+                    self._log_file = os.path.join(
+                        tempfile.gettempdir(), "alphago_alerts.log"
+                    )
+                self._log_fh = open(self._log_file, "a", encoding="utf-8")
+            prefix = {'INFO': '[i]', 'WARNING': '[!]',
+                      'CRITICAL': '[!!!]', 'FATAL': '[XXX]'}
+            self._log_fh.write(
+                f"{entry.get('timestamp', '')} {prefix.get(entry['level'], '?')} "
+                f"[{entry['level']}] {entry['source']}: {entry['message']}"
+            )
+            ctx = entry.get('context')
+            if ctx:
+                self._log_fh.write(f" | {ctx}")
+            self._log_fh.write("\n")
+            self._log_fh.flush()
+        except Exception:
+            pass  # Logging must not crash the pipeline
 
     @classmethod
     def make_logging_handler(cls, logger_name: str = "alphago.alerts"):
