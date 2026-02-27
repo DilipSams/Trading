@@ -853,10 +853,12 @@ def evaluate_with_pipeline(net, datasets, pipeline, cfg, acfg, label="eval",
 
     # ---------- ProcessPoolExecutor with pipeline + net serialization ----------
     # PERF: True CPU parallelism — each worker process has its own Python
-    # interpreter, bypassing the GIL entirely.  Net is kept on CPU for
+    # interpreter, bypassing the GIL entirely.  Net is moved to CPU for
     # pickle compatibility; pre-computed YZ vol eliminates the GPU need.
     import pickle
     _unwrapped_net = unwrap_net(net) if HAS_TORCH else net
+    if HAS_TORCH and _unwrapped_net is not None:
+        _unwrapped_net = _unwrapped_net.cpu()
 
     # Serialize pipeline and net ONCE — each worker deserializes its own copy
     _pipeline_bytes = pickle.dumps(pipeline)
