@@ -5585,7 +5585,10 @@ def main():
                 dates=_dates_sorted,
                 title=_chart_title,
             )
-            plotly_chart(_chart_series, _dates_sorted, title=_chart_title)
+            try:
+                plotly_chart(_chart_series, _dates_sorted, title=_chart_title)
+            except Exception as _chart_err:
+                tprint(f"Chart save failed (non-fatal): {_chart_err}", "warn")
 
             # ── Legend lines ───────────────────────────────────────────────
             # Shows: return % on committed capital, dollar P&L, and avg
