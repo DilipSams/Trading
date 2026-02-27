@@ -1186,3 +1186,284 @@ bars_per_year = 252                    # Daily bars
 
 IGNORE -
   - "Feature count discipline: no more than sqrt(n_observations) features without strong priors or dimensionality reduction."
+
+---
+
+# PART 3: WAVERIDER STRATEGY SYSTEM
+
+## Overview
+
+**WaveRider T5 MS BearVol2x** is a cross-sectional momentum rotation strategy independent of the AlphaGo L0–L4 pipeline. It operates on a completely separate codebase within the same repo.
+
+**Name breakdown:**
+- **T5** = Top-5 portfolio size
+- **MS** = Meme Score (6-factor speculative filtering)
+- **BearVol2x** = Leverage overlay: vol-target to 20% annualized (max 2x), reduced to 0.5x when SPY < SMA200
+
+**Verified backtest (1991–2026):** CAGR +33.0%, Sharpe 1.01, MaxDD -59.6%
+
+## Architecture
+
+```
+universe_builder.py (point-in-time rankings, survivorship-bias free)
+        ↓
+  [data_cache/universe_prices_top150.parquet]
+  [data_cache/universe_rankings_top150.parquet]
+        ↓
+waverider.py ← core strategy (source of truth for all signal computation)
+  ├─ compute_signals()      → Carhart momentum composite + vol
+  ├─ compute_meme_scores()  → 6-factor speculative filtering
+  ├─ backtest()             → full replay: NAV + holdings log + leverage
+  └─ current_portfolio()    → PortfolioSignal (live recommendation)
+        ↓
+  ┌─────┴────────┐
+  ↓              ↓
+waverider_live.py    waverider_signal_bot.py
+(CLI terminal)       (Telegram notifications)
+```
+
+## WaveRider File Map
+
+| File | Lines | Role |
+|------|-------|------|
+| `waverider.py` | ~754 | Core strategy: config, scoring, backtesting, signal generation |
+| `waverider_live.py` | ~445 | CLI signal generator with dollar allocations and trade instructions |
+| `waverider_signal_bot.py` | ~549 | Automated Telegram bot: daily summaries + rebalance alerts |
+| `universe_builder.py` | ~348 | Point-in-time universe builder with survivorship-bias elimination |
+| `setup_scheduler.ps1` | ~37 | Windows Task Scheduler setup (S4U logon for headless execution) |
+
+## Key Dataclasses
+
+**WaveRiderConfig** (18 params):
+- `top_n=5` — portfolio size
+- `exit_band_mult=2.5` — hysteresis exit band (top 5×2.5 = top-12)
+- `rebalance_freq=21` — trading days between rebalances (monthly)
+- `weight_12m/6m/3m = 0.40/0.35/0.25` — Carhart momentum blend
+- `meme_exclude/max1/max2 = 70/50/30` — graduated meme score thresholds
+- `target_vol=0.20` — vol-targeting (20% annualized)
+- `target_leverage=2.0` — max leverage multiplier
+- `bear_leverage=0.5` — reduced leverage when SPY < SMA200
+- `bear_sma=200` — SMA window for bear regime
+- `universe_top_n=100` — universe construction size
+
+**PortfolioSignal** (live output):
+- `date`, `holdings` (UIDs), `holdings_clean` (symbols)
+- `weights`, `meme_scores`, `leverage`, `bear_regime`
+- `realized_vol`, `nav_lev`, `nav_unlev`
+- `buys`, `sells`, `candidates` (top-20 ranked alternatives)
+
+**BacktestResult**:
+- `nav_leveraged` / `nav_unlevered` — equity curves
+- `leverage_series`, `holdings_log`, `filtered_log`, `trades_log`
+- `rebalance_dates`, `meme_scores`
+
+## Meme Score (6-Factor Speculative Filter)
+
+Quantifies speculative/risky characteristics (0–115 raw points):
+
+| Factor | Max Pts | Threshold Tiers |
+|--------|---------|-----------------|
+| Volatility (vol_63d) | 25 | >40% → 8, >60% → 15, >80% → 20, >100% → 25 |
+| Parabolic 3m move | 25 | >50% → 8, >100% → 18, >200% → 25 |
+| Price-SMA200 stretch | 20 | >1.3x → 8, >2.0x → 15, >3.0x → 20 |
+| Momentum concentration (1m/12m) | 15 | >0.3 → 5, >0.5 → 10, >0.8 → 15 |
+| Volatility acceleration (vol_21d/vol_126d) | 15 | >1.0x → 5, >1.5x → 10, >2.5x → 15 |
+| Universe tenure | 15 | ≤2 months → 15, 3–5 months → 8 |
+
+**Classification:** Clean Growth ≤30 | Gray Zone 31–50 | Meme-Adjacent 51–70 | Pure Meme >70 (excluded)
+
+## BearVol2x Leverage Overlay
+
+```
+if SPY < SMA200:
+    leverage = bear_leverage (0.5x)  # bear gate: reduce exposure
+else:
+    realized_vol = 21d rolling annualized vol of portfolio
+    leverage = min(target_vol / realized_vol, target_leverage)
+    # Example: 20% target / 15% realized = 1.33x
+    # Example: 20% target / 8% realized  = 2.0x (capped)
+```
+
+## Universe Builder
+
+`universe_builder.py` builds a point-in-time, survivorship-bias-free universe:
+- Scans ALL Norgate US Equities (active + delisted, ~8,000+ symbols)
+- At each month-end, ranks alive stocks by trailing 63-day average dollar volume
+- Filters out: warrants, units, rights, preferred shares, ETFs, leveraged ETFs
+- Outputs top-150 as cached parquets (first run ~60-90s, subsequent <1s)
+- Cache location: `Trading/data_cache/` (gitignored)
+
+**Norgate data paths:**
+- Active equities: `D:\Experiments\norgate_data\US_Equities\`
+- Delisted equities: `D:\Experiments\norgate_data\US_Equities_Delisted\`
+- Economic data: `D:\Experiments\norgate_data\Economic\` (includes 3-month T-bill %3MTCM)
+
+## Slippage Analysis (Feb 2026)
+
+Measured close-to-open slippage across 1,157 historical trades:
+- **Buy cost:** +9.3 bps mean (slight gap-up overnight)
+- **Sell benefit:** -26.9 bps mean (stocks being sold tend to gap up — mean-reversion overnight effect)
+- **Net annual impact:** -56 bps/year (FAVORABLE — net benefit from overnight effects)
+- **Conclusion:** Using close prices for signals and executing at next-day open is slightly beneficial, not harmful
+
+---
+
+# PART 4: DEPLOYMENT & OPERATIONS
+
+## Telegram Signal Bot
+
+**File:** `waverider_signal_bot.py`
+
+**Setup:**
+```bash
+python waverider_signal_bot.py --setup    # Interactive first-time setup
+```
+Walks through: BotFather bot creation → token entry → auto chat_id detection → .env save → test message
+
+**Daily operation:**
+```bash
+python waverider_signal_bot.py                    # run + send via Telegram
+python waverider_signal_bot.py --capital 250000   # custom capital
+python waverider_signal_bot.py --dry-run          # print only, don't send
+```
+
+**Message formats:**
+- **Hold days:** Portfolio table with entry dates, P&L, leverage, next rebalance estimate
+- **Rebalance days:** Full trade instructions (BUY/SELL with share counts and dollar amounts)
+- **Format:** HTML with emoji icons, monospace `<pre>` tables, `<b>` bold headers
+
+**Configuration:** `Trading/.env` (gitignored via root `**/.env` rule)
+```
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+CAPITAL=100000
+```
+
+**Error handling:**
+- Signal generation failure → error alert sent via Telegram + logged
+- Telegram send failure → retry once, then log locally
+- All exceptions logged to `Trading/signal_log.txt`
+
+## Windows Task Scheduler
+
+**File:** `setup_scheduler.ps1` (run as Administrator)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup_scheduler.ps1
+```
+
+**Configuration:**
+- Task name: `WaveRider-DailySignal`
+- Schedule: Mon–Fri at 4:30 PM (local time, ~30 min after market close for Norgate data update)
+- Logon type: S4U (Service for User — runs even when computer is locked, no stored password)
+- Settings: `AllowStartIfOnBatteries`, `StartWhenAvailable` (runs on next boot if missed)
+
+**Limitations:**
+- Will NOT run if computer is powered off (but `StartWhenAvailable` catches up on next boot)
+- For guaranteed delivery, consider cloud VM (AWS/Azure) or GitHub Actions
+
+## Security Practices
+
+- `.env` files are gitignored via root `**/.env` pattern — never committed
+- Telegram bot tokens and chat IDs stored only in `.env`
+- `signal_log.txt` is gitignored (contains portfolio positions)
+- No API keys or credentials in any tracked Python file
+
+---
+
+# PART 5: LESSONS LEARNED & COMMON BUGS
+
+## Python Scoping Bug Pattern
+
+**NORGATE_DIR UnboundLocalError** (fixed Feb 2026, commit `d8b490c`):
+- `from module import X` inside a function causes Python to treat `X` as local throughout the ENTIRE function
+- If `X` is referenced BEFORE the import line within the same function, Python raises `UnboundLocalError`
+- Fix: Remove redundant local imports when names are already imported at module level
+- **Location:** `alphago_layering.py` line 5634 had `from alphago_trading_system import load_from_norgate, NORGATE_DIR` inside `main()`, but `NORGATE_DIR` was used at line 3710
+
+## Windows/Shell Gotchas
+
+- **Git Bash mangles schtasks arguments:** `/create`, `/tn` etc. are interpreted as Unix paths. Workaround: wrap in `powershell.exe -Command "schtasks ..."`
+- **Windows cp1252 terminal can't render emoji:** Wrap `print(emoji_text)` in try/except UnicodeEncodeError with UTF-8 fallback
+- **schtasks `/change` for "run whether logged on or not"** requires interactive password prompt. Use PowerShell `New-ScheduledTaskPrincipal -LogonType S4U` instead (no password needed)
+
+## Telegram Bot Tips
+
+- Use `parse_mode="HTML"` (not Markdown) for reliable formatting — Markdown V2 requires escaping many characters
+- Always include a plain-text fallback: if HTML parse fails, retry without `parse_mode`
+- `<pre>` blocks work well for monospace tables in Telegram
+- Max message length: 4096 characters — split if needed
+
+---
+
+# PART 6: COMPLETE FILE MAP (UPDATED)
+
+## Core Strategy Files
+
+| File | Lines | Role |
+|------|-------|------|
+| `alphago_trading_system.py` | ~5,100 | v3.0 core: Config, TradingEnv, PPO, MCTS, features, discover_midcap_symbols() |
+| `alphago_architecture.py` | ~5,200 | v6–v9 pipeline: L1–L4 classes + SelectionConfig, StockSelector, SectorRotationDetector |
+| `alphago_layering.py` | ~4,300 | Launcher: v7/v8/v9 wiring, walk-forward, evaluation, charts, sector output |
+| `alphago_cost_model.py` | ~153 | Shared cost model: half-spread + sqrt-impact + fees |
+| `alphago_mcts_parallel.py` | — | Parallel MCTS implementation |
+| `alphago_new_alphas.py` | — | Additional alpha factories |
+| `alphago_stop_loss.py` | — | Stop-loss logic |
+| `waverider.py` | ~754 | WaveRider core: config, scoring, backtesting, signal generation |
+| `waverider_live.py` | ~445 | WaveRider CLI signal generator |
+| `waverider_signal_bot.py` | ~549 | WaveRider Telegram bot (daily automated alerts) |
+| `universe_builder.py` | ~348 | Point-in-time universe builder (survivorship-bias free) |
+
+## Infrastructure & Validation
+
+| File | Lines | Role |
+|------|-------|------|
+| `data_quality.py` | ~1,220 | L0: quality scoring, missing data, schema validation |
+| `validation_engine.py` | ~990 | Anti-overfitting: purged walk-forward CV, deflated Sharpe |
+| `backtest_report.py` | ~550 | Reporting: metrics, equity curves, attribution |
+| `run_artifacts.py` | ~250 | Reproducibility: saves configs, checkpoints, data snapshots |
+| `table_formatter.py` | — | Table formatting utilities |
+
+## Diagnostic & Research Tools
+
+| File | Role |
+|------|------|
+| `_compare_all_strategies.py` | Cross-strategy performance comparison |
+| `_cross_check_strategy.py` | Strategy cross-validation checks |
+| `_diagnose_momentum.py` | Why momentum misses steady compounders |
+| `_forensic_analysis.py` | Concentrated momentum forensics (meme damage, rank traces) |
+| `_show_holdings.py` | Yearly holdings dump for concentrated momentum |
+| `_show_taw_holdings.py` | Tactical All-Weather monthly allocations viewer |
+| `_show_waverider_holdings.py` | WaveRider holdings viewer |
+| `_verify_standalone.py` | Standalone strategy verification |
+| `strategy_research.py` | General strategy research |
+| `sector_compare.py` | Sector performance comparison |
+| `sector_v7v8.py` | v7 vs v8 sector analysis |
+
+## LETF Research Series
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `letf_research_comprehensive.py` | ~349 | Comprehensive LETF analysis |
+| `letf_research_v2.py` | ~212 | LETF research iteration 2 |
+| `letf_research_v3.py` | ~76 | LETF research iteration 3 |
+| `letf_research_v4.py` | ~263 | LETF research iteration 4 |
+| `letf_research_v5.py` | ~409 | LETF research iteration 5 |
+| `letf_research_v6.py` | ~464 | LETF research iteration 6 |
+| `letf_research_v7.py` | ~356 | LETF research iteration 7 |
+| `letf_rotation_backtest.py` | ~189 | LETF rotation backtest |
+
+## Deployment
+
+| File | Role |
+|------|------|
+| `setup_scheduler.ps1` | Windows Task Scheduler setup (S4U logon, Mon-Fri 4:30 PM) |
+| `.env` | Telegram credentials (GITIGNORED — never committed) |
+| `.gitignore` | Excludes: data_cache, __pycache__, logs, HTML charts, .env, bootstrap scripts |
+
+## Excluded / Archived
+
+| File | Status |
+|------|--------|
+| `alphago_enhancements.py` | **EXCLUDED — do not modify or import** |
+| `_backup/` | Archived versions, old docs, investigation scripts |
