@@ -115,6 +115,8 @@ def _compute_monthly_rankings(
     if len(month_ends) == 0:
         return pd.DataFrame()
 
+    _n_turnover_errs = [0]  # mutable counter for error suppression
+
     # Pre-index catalog by date ranges for fast alive-stock lookup
     cat_first = catalog["first_date"].values.astype("datetime64[ns]")
     cat_last = catalog["last_date"].values.astype("datetime64[ns]")
@@ -162,7 +164,10 @@ def _compute_monthly_rankings(
                         df = pd.read_parquet(fpath, columns=["Turnover"])
                         df.index = pd.to_datetime(df.index)
                         turnover_cache[uid] = df["Turnover"]
-                    except Exception:
+                    except Exception as e:
+                        if _n_turnover_errs[0] < 5:
+                            print(f"    WARNING: {uid}: {type(e).__name__}: {e}")
+                        _n_turnover_errs[0] += 1
                         turnover_cache[uid] = pd.Series(dtype=float)
                 else:
                     turnover_cache[uid] = pd.Series(dtype=float)
@@ -231,6 +236,7 @@ def _build_price_matrix(
 
     price_dict = {}
     loaded = 0
+    n_errs = 0
     for uid in unique_uids:
         fpath = uid_to_path.get(uid)
         if fpath and os.path.exists(fpath):
@@ -239,9 +245,13 @@ def _build_price_matrix(
                 df.index = pd.to_datetime(df.index)
                 price_dict[uid] = df["Close"]
                 loaded += 1
-            except Exception:
-                pass
+            except Exception as e:
+                if n_errs < 5:
+                    print(f"    WARNING: {uid}: {type(e).__name__}: {e}")
+                n_errs += 1
 
+    if n_errs:
+        print(f"    WARNING: {n_errs} price files failed to load")
     print(f"    Loaded {loaded} price series")
     prices = pd.DataFrame(price_dict)
     prices = prices.sort_index()

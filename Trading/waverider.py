@@ -651,12 +651,13 @@ class WaveRiderStrategy:
         holdings = result.holdings_log[last_rebal]
         holdings_clean = [clean_uid(uid) for uid in holdings]
 
-        # Meme scores for current holdings
+        # Meme scores for current holdings (keyed by UID to avoid
+        # base-ticker collisions, e.g. BAC-199809 vs BAC)
         ms_today = result.meme_scores.loc[last_rebal]
         ms_dict = {}
         for uid in holdings:
             v = ms_today.get(uid, 0)
-            ms_dict[clean_uid(uid)] = float(v) if pd.notna(v) else 0.0
+            ms_dict[uid] = float(v) if pd.notna(v) else 0.0
 
         # Current leverage
         lev_today = float(result.leverage_series.iloc[-1])
@@ -707,7 +708,7 @@ class WaveRiderStrategy:
             date=last_rebal,
             holdings=holdings,
             holdings_clean=holdings_clean,
-            weights={clean_uid(uid): 1.0 / len(holdings) for uid in holdings} if holdings else {},
+            weights={uid: 1.0 / len(holdings) for uid in holdings} if holdings else {},
             meme_scores=ms_dict,
             leverage=lev_today,
             bear_regime=bear_regime,

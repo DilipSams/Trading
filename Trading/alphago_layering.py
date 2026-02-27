@@ -701,7 +701,6 @@ def _build_portfolio_nav(per_symbol_date_returns: dict,
 
         # Build rebalance-period masks
         mask = pd.DataFrame(True, index=ret_df.index, columns=ret_df.columns)
-        prev_eligible = set()
         rebal_dates = universe._rebal_dates
         for i, rebal in enumerate(rebal_dates):
             eligible = universe._date_to_uids.get(rebal, set())

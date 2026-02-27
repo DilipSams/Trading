@@ -5336,6 +5336,7 @@ def load_from_norgate(norgate_dir=NORGATE_DIR, databases=None, symbols=None, mb=
     total_files = 0
     total_loaded = 0
     total_skipped = 0
+    skip_errors = []
 
     for db_name in databases:
         db_dir = base / db_name
@@ -5386,13 +5387,30 @@ def load_from_norgate(norgate_dir=NORGATE_DIR, databases=None, symbols=None, mb=
                     key = f"{sym}_{db_name}_1d"
                 data[key] = df
                 db_loaded += 1
-            except Exception:
+            except Exception as e:
                 total_skipped += 1
+                skip_errors.append(f"{sym} ({type(e).__name__}: {e})")
 
         total_loaded += db_loaded
         tprint(f"  {db_name + ':':.<30s} {db_loaded:>5} symbols loaded ({len(files)} files)", "info")
 
     elapsed = time.time() - st
+
+    # Report skip breakdown
+    if skip_errors:
+        tprint(f"  Skipped with errors ({len(skip_errors)}): "
+               f"{', '.join(skip_errors[:5])}"
+               f"{'...' if len(skip_errors) > 5 else ''}", "warn")
+
+    # Verify all requested symbols were found
+    if sym_filter:
+        loaded_uids = {k.rsplit('_', 1)[0] for k in data}
+        missing = sym_filter - loaded_uids
+        if missing:
+            tprint(f"  WARNING: {len(missing)}/{len(sym_filter)} requested symbols "
+                   f"not loaded: {', '.join(sorted(missing)[:10])}"
+                   f"{'...' if len(missing) > 10 else ''}", "warn")
+
     tprint(f"Norgate: {total_loaded} symbols from {len(databases)} databases "
            f"({total_skipped} skipped, {elapsed:.1f}s)", "ok")
     return data
