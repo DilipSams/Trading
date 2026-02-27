@@ -145,6 +145,7 @@ Goal: provide clean, versioned, auditable data to all downstream layers. Data pr
 Requirements:
   - Point-in-time (PIT) database: no retroactive corrections visible to backtests. Every query returns what was known at that moment.
   - Survivorship bias handling: include delisted, dead, and merged assets in all historical universes.
+    At any past date T, the backtest universe must contain EXACTLY the stocks that existed and were tradeable on date T — including stocks that later went bankrupt, were acquired, or delisted. Conversely, stocks that are top performers TODAY but did not exist or were illiquid at date T must NOT appear in the universe at date T. Testing only on today's survivors inflates returns by ~2-4% CAGR and hides the real cost of picking losers that disappeared.
   - Corporate actions adjustment pipeline: splits, dividends, mergers, spinoffs — applied consistently and auditably.
   - Data quality scoring: per field, per asset, per timestamp. Downstream layers receive quality flags and can condition on them.
   - Missing data policy: explicit and documented (forward-fill, interpolate, mask, or exclude). No silent NaN propagation.
@@ -353,6 +354,7 @@ Cross-Validation Protocol:
 ## BACKTESTING & EVALUATION REQUIREMENTS
 
 - Always use walk-forward evaluation with purging and embargo; no leakage.
+- **Point-in-time universe is mandatory.** Never backtest on a fixed list of today's symbols. The universe at each historical date must contain only stocks that existed and were tradeable on that date — including stocks that later went bankrupt, were acquired, or delisted. Stocks that are leaders today but didn't exist or were illiquid in the past must not appear in the historical universe. Use `universe_builder.build_universe_cache()` or equivalent time-stamped reconstruction.
 - Use realistic rebalance rules, market calendars from L0, and actual trading day schedules.
 - Include costs/slippage/constraints per the explicit cost model.
 - Report (both gross and net of costs, and vs. benchmark):
@@ -1372,6 +1374,20 @@ powershell -ExecutionPolicy Bypass -File setup_scheduler.ps1
 ---
 
 # PART 5: LESSONS LEARNED & COMMON BUGS
+
+## Survivorship Bias — The Silent Backtest Killer
+
+**The problem:** If you backtest a momentum strategy using only today's stock universe (e.g., current S&P 500 members), you are implicitly selecting winners. The stocks in today's index are there BECAUSE they survived and grew. Stocks that went bankrupt (Enron, Lehman), were acquired (Sun Microsystems, Compaq), or simply faded (BlackBerry, Sears) vanish from your universe — but a real trader in 2005 would have seen them, ranked them, and potentially held them.
+
+**Two-sided bias:**
+1. **Dead stocks disappear:** You never see the losers that would have dragged your returns down. A momentum strategy in 2000 would have ranked Enron, WorldCom, and Tyco highly — then lost 100% when they imploded. Backtesting on survivors hides this.
+2. **Future stars are invisible:** Today's leaders (NVDA, APP, CRDO) were small-caps or didn't exist 10 years ago. A backtest on today's universe pretends they were always available, front-running their entire growth arc. A real trader couldn't have bought NVDA at $5 in a large-cap momentum strategy — it wasn't in the universe yet.
+
+**Impact:** Survivorship bias inflates backtested CAGR by ~2-4% and understates max drawdown. Momentum strategies are especially vulnerable because they chase winners — the exact stocks that survive.
+
+**Our solution:** `universe_builder.py` uses Norgate's full database (active + delisted, ~8,000+ symbols) to reconstruct the point-in-time universe at each month-end. At date T, only stocks alive and liquid on date T appear. This is why the WaveRider backtest (CAGR +33%, MaxDD -59.6%) is credible — it includes every stock that existed, including the ones that later vanished.
+
+**Rule:** NEVER backtest on a fixed list of today's symbols. Always use point-in-time universe construction. Any new strategy or research script must use `universe_builder.build_universe_cache()` or equivalent time-stamped filtering.
 
 ## Python Scoping Bug Pattern
 
