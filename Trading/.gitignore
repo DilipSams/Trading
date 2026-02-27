@@ -12,6 +12,16 @@ __pycache__/
 run_output/
 runs/
 *.log
+signal_log.txt
+strategy_research_output.txt
+
+# Generated HTML charts
+*.html
+
+# Throwaway bootstrap/writer scripts
+_bootstrap*.py
+_build_v*.py
+_gen*.py
 
 # IDE
 .vscode/
