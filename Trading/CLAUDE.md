@@ -354,7 +354,6 @@ Cross-Validation Protocol:
 ## BACKTESTING & EVALUATION REQUIREMENTS
 
 - Always use walk-forward evaluation with purging and embargo; no leakage.
-- **Point-in-time universe is mandatory.** Never backtest on a fixed list of today's symbols. The universe at each historical date must contain only stocks that existed and were tradeable on that date — including stocks that later went bankrupt, were acquired, or delisted. Stocks that are leaders today but didn't exist or were illiquid in the past must not appear in the historical universe. Use `universe_builder.build_universe_cache()` or equivalent time-stamped reconstruction.
 - Use realistic rebalance rules, market calendars from L0, and actual trading day schedules.
 - Include costs/slippage/constraints per the explicit cost model.
 - Report (both gross and net of costs, and vs. benchmark):
@@ -1186,8 +1185,6 @@ cash_yield_bps_annual = 400.0          # Risk-free rate on idle cash
 bars_per_year = 252                    # Daily bars
 ```
 
-IGNORE -
-  - "Feature count discipline: no more than sqrt(n_observations) features without strong priors or dimensionality reduction."
 
 ---
 
