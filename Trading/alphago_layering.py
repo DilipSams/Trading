@@ -726,8 +726,23 @@ def _build_portfolio_nav(per_symbol_date_returns: dict,
         # Apply mask: set non-eligible returns to NaN
         ret_df = ret_df.where(mask)
 
-    # Equal-weight portfolio return = mean of per-symbol returns each day
-    port_ret = ret_df.mean(axis=1).fillna(0.0).sort_index()
+    # Equal-weight portfolio return = mean of per-symbol returns each day.
+    # Days where ALL symbols are NaN (no active positions) stay NaN — these
+    # will show as "-" in the year-by-year table instead of a misleading +0.0%.
+    # Days where at least one symbol is active but others are NaN use the
+    # available symbols' mean (nanmean via skipna=True, which is the default).
+    port_ret = ret_df.mean(axis=1).sort_index()
+
+    # Drop leading/trailing NaN stretches (years before first trade, after last)
+    first_valid = port_ret.first_valid_index()
+    last_valid = port_ret.last_valid_index()
+    if first_valid is None:
+        return pd.Series(dtype=np.float64)
+    port_ret = port_ret.loc[first_valid:last_valid]
+
+    # Within the active period, fill internal NaN gaps with 0 (cash days)
+    port_ret = port_ret.fillna(0.0)
+
     # Cumulative NAV
     nav = (1 + port_ret).cumprod()
     nav.name = "portfolio_nav"
