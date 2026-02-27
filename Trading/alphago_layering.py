@@ -225,7 +225,7 @@ _PLOTLY_COLORS = [
     "#19d3f3",  # cyan   (extra series)
 ]
 
-def plotly_chart(series_list, dates, title="", fmt="%", out_dir="Trading"):
+def plotly_chart(series_list, dates, title="", fmt="%", out_dir=None):
     """
     Render an interactive Plotly HTML chart and open it in the browser.
 
@@ -239,9 +239,11 @@ def plotly_chart(series_list, dates, title="", fmt="%", out_dir="Trading"):
         Chart title.
     fmt : str
         '%' or '$' — controls y-axis label.
-    out_dir : str
-        Directory to save the HTML file.
+    out_dir : str or None
+        Directory to save the HTML file. Defaults to the script's directory.
     """
+    if out_dir is None:
+        out_dir = os.path.dirname(os.path.abspath(__file__))
     try:
         import plotly.graph_objects as go
     except ImportError:
