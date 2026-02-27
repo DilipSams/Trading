@@ -26,6 +26,8 @@ from waverider import (
 
 def fmt_ret(val, width=9):
     """Format return % compactly."""
+    if not np.isfinite(val):
+        return f"{'n/a':>{width}s}"
     if abs(val) >= 1_000_000:
         return f"{val/1e6:>+{width-2}.1f}M%"
     if abs(val) >= 10_000:
@@ -41,7 +43,12 @@ def nav_metrics(nav, label=""):
     if len(nav) < 20:
         return None
     n_years = (nav.index[-1] - nav.index[0]).days / 365.25
+    if n_years <= 0 or nav.iloc[0] <= 0:
+        return None
     total_return = nav.iloc[-1] / nav.iloc[0] - 1
+    if total_return <= -1:
+        # NAV went to zero or negative
+        return None
     cagr = (1 + total_return) ** (1 / max(n_years, 0.01)) - 1
     daily_r = nav.pct_change().dropna()
     sharpe = float(daily_r.mean() / daily_r.std() * np.sqrt(252)) if daily_r.std() > 0 else 0
@@ -98,6 +105,9 @@ results = OrderedDict()  # name -> metrics dict
 
 def add_result(name, nav, label=None):
     """Add a strategy result to the comparison."""
+    if nav is None or (hasattr(nav, '__len__') and len(nav) == 0):
+        print(f"    {name:<40s} SKIPPED (no NAV data)", flush=True)
+        return
     m = nav_metrics(nav, label or name)
     if m is not None:
         results[name] = m
@@ -174,6 +184,10 @@ print(f"\n  {len(results)} strategies computed.\n")
 
 # ── 3. Summary table ─────────────────────────────────────────────────
 # Find common end date for period returns
+if not results:
+    print("\n  No strategies produced valid results. Exiting.")
+    sys.exit(0)
+
 all_ends = [m["end"] for m in results.values()]
 end_date = min(all_ends)  # use earliest end so periods are comparable
 

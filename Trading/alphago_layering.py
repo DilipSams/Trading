@@ -2807,7 +2807,9 @@ def _run_waverider_strategy(args):
 
     def _get_price(uid):
         if uid in prices.columns:
-            return float(prices[uid].dropna().iloc[-1])
+            s = prices[uid].dropna()
+            if len(s) > 0:
+                return float(s.iloc[-1])
         return 0.0
 
     def _get_price_on(uid, dt):
@@ -2818,13 +2820,14 @@ def _run_waverider_strategy(args):
         return 0.0
 
     def _find_entry(uid):
+        entry = None
         for rd in reversed(result.rebalance_dates):
             if uid in result.holdings_log.get(rd, []):
                 entry = rd
             else:
                 break
-        else:
-            entry = result.rebalance_dates[0] if result.rebalance_dates else None
+        if entry is None and result.rebalance_dates:
+            entry = result.rebalance_dates[0]
         return entry
 
     # Build UID lookup and entry info
@@ -2949,6 +2952,7 @@ def _run_waverider_strategy(args):
     nav_u = result.nav_unlevered
 
     def _fmt_ret(val, w=9):
+        if not np.isfinite(val):  return f"{'n/a':>{w}s}"
         if abs(val) >= 1_000_000: return f"{val/1e6:>+{w-2}.1f}M%"
         if abs(val) >= 10_000:    return f"{val/1e3:>+{w-2}.0f}k%"
         if abs(val) >= 1_000:     return f"{val:>+{w-1},.0f}%"
@@ -5673,7 +5677,7 @@ def main():
         _pip_steps = max((d.get('step_count', 0) for d in _pip_per_sym.values()), default=0)
         _pip_yrs = _pip_steps / 252 if _pip_steps > 0 else 1
         _pip_rr = 1 + _pip_total_pnl / _pip_peak if _pip_peak > 0 else 1
-        _pip_cagr = (_pip_rr ** (1 / max(_pip_yrs, 0.01)) - 1) if _pip_rr > 0 else 0
+        _pip_cagr = (_pip_rr ** (1 / max(_pip_yrs, 0.01)) - 1) if _pip_rr > 0 else -1.0
 
         # v8 CAGR
         _v8_cagr = 0
@@ -5683,7 +5687,7 @@ def main():
             _v8_st = max((d.get('step_count', 0) for d in _vc_per_sym.values()), default=0)
             _v8_yr = _v8_st / 252 if _v8_st > 0 else 1
             _v8_rr = 1 + _v8_pnl / _v8_pk if _v8_pk > 0 else 1
-            _v8_cagr = (_v8_rr ** (1 / max(_v8_yr, 0.01)) - 1) if _v8_rr > 0 else 0
+            _v8_cagr = (_v8_rr ** (1 / max(_v8_yr, 0.01)) - 1) if _v8_rr > 0 else -1.0
 
         # v9 CAGR
         _v9_cagr = 0
@@ -5693,7 +5697,7 @@ def main():
             _x9_st = max((d.get('step_count', 0) for d in _xc_per_sym.values()), default=0)
             _x9_yr = _x9_st / 252 if _x9_st > 0 else 1
             _x9_rr = 1 + _x9_pnl / _x9_pk if _x9_pk > 0 else 1
-            _v9_cagr = (_x9_rr ** (1 / max(_x9_yr, 0.01)) - 1) if _x9_rr > 0 else 0
+            _v9_cagr = (_x9_rr ** (1 / max(_x9_yr, 0.01)) - 1) if _x9_rr > 0 else -1.0
 
         # Print unified table
         print(f"\n    {'Strategy':<35s} {'CAGR':>8s} {'Sharpe':>7s} {'Sortino':>8s} {'MaxDD':>7s} {'Period':>12s}")

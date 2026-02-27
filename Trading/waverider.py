@@ -43,7 +43,7 @@ SECTOR_MAP = {
                       "BE","SMCI","AXON","FSLR","COIN","EBAY","SOUN",
                       # Historical/delisted tech
                       "YHOO","AABA","JAVA","CPQ","NOVL","NXTL","DIGI","ASND",
-                      "SUNW","PALM","MOT","RIMM","BB","DNA","NOK","DELL",
+                      "SUNW","PALM","MOT","RIMM","BB","DNA","NOK",
                       "EMC","TWC","SNPX","XYZ","TWX","USRX"],
     "Financials":    ["JPM","V","MA","BAC","GS","MS","WFC","C","AXP","BLK",
                       "SPGI","SCHW","CB","MMC","FI","BX","KKR","CME","ICE",
@@ -513,12 +513,8 @@ class WaveRiderStrategy:
         trades_log: Dict[pd.Timestamp, int] = {}
 
         # Pre-compute EOM rebalance set if needed
+        _eom_set = set()
         if c.rebalance_eom:
-            _eom_set = set()
-            for _d in dates:
-                _eom_set.add(_d)          # keep updating — last one per month wins
-            # Actually need last trading day per (year, month)
-            _eom_set = set()
             _by_month: Dict[tuple, pd.Timestamp] = {}
             for _d in dates:
                 _by_month[(_d.year, _d.month)] = _d  # overwrites, so last day wins
@@ -728,7 +724,19 @@ def compute_nav_metrics(nav: pd.Series, label: str = "") -> Dict:
     n_years = (nav.index[-1] - nav.index[0]).days / 365.25
     if n_years <= 0 or nav.iloc[0] <= 0:
         return {}
-    cagr = (nav.iloc[-1] / nav.iloc[0]) ** (1 / n_years) - 1
+    final_ratio = nav.iloc[-1] / nav.iloc[0]
+    if final_ratio <= 0:
+        # NAV went negative — return worst-case metrics
+        return {
+            "label": label,
+            "cagr": -1.0,
+            "sharpe": 0,
+            "sortino": 0,
+            "max_dd": (nav / nav.cummax() - 1).min(),
+            "total_return": final_ratio - 1,
+            "n_years": n_years,
+        }
+    cagr = final_ratio ** (1 / n_years) - 1
     daily_r = nav.pct_change().dropna()
     sharpe = (daily_r.mean() / daily_r.std() * np.sqrt(252)) if daily_r.std() > 0 else 0
     down = daily_r[daily_r < 0].std() * np.sqrt(252)

@@ -33,7 +33,9 @@ def classify(score: float, cfg: WaveRiderConfig) -> str:
 def get_current_price(prices: pd.DataFrame, uid: str) -> float:
     """Get last available price for a UID."""
     if uid in prices.columns:
-        return float(prices[uid].dropna().iloc[-1])
+        s = prices[uid].dropna()
+        if len(s) > 0:
+            return float(s.iloc[-1])
     return 0.0
 
 
@@ -197,6 +199,9 @@ def main():
     # ===================================================================
     # Multi-period performance comparison table
     # ===================================================================
+    if len(result.dates) == 0:
+        print("\n  No backtest dates available — skipping performance tables.")
+        return
     end_date = result.dates[-1]
     start_date = result.dates[0]
     nav_l = result.nav_leveraged
@@ -219,6 +224,8 @@ def main():
 
     def _fmt_ret(val: float, width: int = 9) -> str:
         """Format return% compactly: 1234.5% -> +1,235%, 1816349% -> +1.8M%."""
+        if not np.isfinite(val):
+            return f"{'n/a':>{width}s}"
         if abs(val) >= 1_000_000:
             return f"{val/1_000_000:>+{width-2}.1f}M%"
         if abs(val) >= 10_000:
@@ -243,8 +250,8 @@ def main():
         ret_u = (nav_u.loc[p_dates[-1]] / nav_u.loc[p_dates[0]] - 1) * 100
 
         # SPY return
-        spy_aligned = spy_price.reindex(p_dates).ffill().bfill()
-        spy_ret = (spy_aligned.iloc[-1] / spy_aligned.iloc[0] - 1) * 100 if len(spy_aligned) > 5 else np.nan
+        spy_aligned = spy_price.reindex(p_dates).ffill().bfill().dropna()
+        spy_ret = (spy_aligned.iloc[-1] / spy_aligned.iloc[0] - 1) * 100 if len(spy_aligned) > 5 and spy_aligned.iloc[0] > 0 else np.nan
         vs_spy = ret_l - spy_ret if not np.isnan(spy_ret) else np.nan
 
         # Period-specific CAGR, Sharpe, Sortino, MaxDD (from sub-NAV)
