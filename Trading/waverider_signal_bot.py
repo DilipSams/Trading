@@ -61,9 +61,8 @@ def get_config(env: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def send_telegram(text: str, bot_token: str, chat_id: str) -> bool:
-    """Send a message via Telegram Bot API. Returns True on success."""
+    """Send a message via Telegram Bot API (HTML mode). Returns True on success."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    # Telegram message limit is 4096 chars; truncate if needed
     if len(text) > 4000:
         text = text[:3990] + "\n...(truncated)"
     for attempt in range(2):
@@ -71,16 +70,18 @@ def send_telegram(text: str, bot_token: str, chat_id: str) -> bool:
             resp = requests.post(url, json={
                 "chat_id": chat_id,
                 "text": text,
-                "parse_mode": "Markdown",
+                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }, timeout=15)
             if resp.status_code == 200 and resp.json().get("ok"):
                 return True
-            # Markdown parse error — retry without formatting
+            # HTML parse error — retry without formatting
             if attempt == 0 and "can't parse" in resp.text.lower():
+                import re
+                plain = re.sub(r"<[^>]+>", "", text)
                 resp = requests.post(url, json={
                     "chat_id": chat_id,
-                    "text": text,
+                    "text": plain,
                     "disable_web_page_preview": True,
                 }, timeout=15)
                 return resp.status_code == 200 and resp.json().get("ok")
@@ -93,7 +94,8 @@ def send_telegram(text: str, bot_token: str, chat_id: str) -> bool:
 def send_error_alert(msg: str, bot_token: str, chat_id: str):
     """Best-effort error alert via Telegram."""
     try:
-        send_telegram(f"WaveRider ERROR:\n{msg}", bot_token, chat_id)
+        safe_msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        send_telegram(f"\u26A0\uFE0F <b>WaveRider ERROR</b>\n<pre>{safe_msg}</pre>", bot_token, chat_id)
     except Exception:
         pass
 
@@ -110,7 +112,96 @@ def get_current_price(prices: pd.DataFrame, uid: str) -> float:
     return 0.0
 
 
-def format_rebalance_message(signal, prices, uid_map, capital, result) -> str:
+def get_price_on_date(prices: pd.DataFrame, uid: str, date) -> float:
+    if uid in prices.columns:
+        val = prices[uid].asof(date)
+        if pd.notna(val):
+            return float(val)
+    return 0.0
+
+
+def find_entry_date(uid: str, holdings_log: dict, rebalance_dates: list):
+    """Walk backwards to find when this UID first entered (continuous streak)."""
+    entry = None
+    for rd in reversed(rebalance_dates):
+        if uid in holdings_log.get(rd, []):
+            entry = rd
+        else:
+            break
+    return entry
+
+
+def build_entry_info(signal, result, prices, uid_map):
+    """Build entry date + entry price for each current holding."""
+    info = {}  # clean_sym -> (entry_date, entry_price)
+    for uid in signal.holdings:
+        sym = signal.holdings_clean[signal.holdings.index(uid)] if uid in signal.holdings else uid
+        # Use clean_uid to get base symbol
+        from waverider import clean_uid
+        sym = clean_uid(uid)
+        entry_date = find_entry_date(uid, result.holdings_log, result.rebalance_dates)
+        entry_price = get_price_on_date(prices, uid, entry_date) if entry_date else 0.0
+        info[sym] = (entry_date, entry_price)
+    return info
+
+
+def format_portfolio_table(signal, prices, uid_map, capital, entry_info) -> str:
+    """Format a detailed portfolio table with entry dates and P&L."""
+    n = len(signal.holdings_clean)
+    effective = capital * signal.leverage
+    per_stock = effective / n if n > 0 else 0
+
+    # Build rows with P&L for sorting
+    rows = []
+    total_value = 0
+    total_pnl = 0
+
+    for sym in signal.holdings_clean:
+        uid = uid_map.get(sym, sym)
+        cur_price = get_current_price(prices, uid)
+        shares = math.floor(per_stock / cur_price) if cur_price > 0 else 0
+        value = shares * cur_price
+        total_value += value
+
+        ed, ep = entry_info.get(sym, (None, 0))
+        ed_str = ed.strftime("%b %d") if ed else "n/a"
+
+        if ep > 0:
+            pnl_pct = (cur_price / ep - 1) * 100
+            pnl_dollar = shares * (cur_price - ep)
+            total_pnl += pnl_dollar
+        else:
+            pnl_pct = 0.0
+            pnl_dollar = 0.0
+
+        rows.append((sym, cur_price, shares, value, ed_str, ep, pnl_pct, pnl_dollar))
+
+    # Sort by P&L% descending (best first)
+    rows.sort(key=lambda r: r[6], reverse=True)
+
+    lines = []
+    lines.append(f"\U0001F4BC <b>PORTFOLIO</b> ({n} stocks, {100/n:.0f}% each, ${per_stock:,.0f}/pos)")
+    lines.append("")
+    lines.append("<pre>")
+
+    for sym, cur_price, shares, value, ed_str, ep, pnl_pct, pnl_dollar in rows:
+        icon = "\u2705" if pnl_pct >= 0 else "\u274C"
+        lines.append(
+            f"{icon} {sym:<6s} ${cur_price:>7.2f} x{shares:>4d}sh "
+            f"${value:>7,.0f}  {ed_str:>6s}  {pnl_pct:>+6.1f}% ${pnl_dollar:>+7,.0f}"
+        )
+
+    cash = effective - total_value
+    pnl_icon = "\U0001F4B0" if total_pnl >= 0 else "\U0001F534"
+    lines.append(f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+    lines.append(f"\U0001F4B5 CASH {' ':>24s}${cash:>7,.0f}")
+    lines.append(f"{pnl_icon} TOTAL{' ':>24s}${effective:>7,.0f}  P&L: ${total_pnl:>+7,.0f}")
+    lines.append("</pre>")
+
+    return "\n".join(lines)
+
+
+def format_rebalance_message(signal, prices, uid_map, capital, result, entry_info) -> str:
     """Full rebalance message with trade instructions."""
     from waverider import compute_nav_metrics
 
@@ -120,52 +211,41 @@ def format_rebalance_message(signal, prices, uid_map, capital, result) -> str:
     m = compute_nav_metrics(result.nav_leveraged)
 
     lines = []
-    lines.append("REBALANCE | " + signal.date.strftime("%Y-%m-%d"))
+    lines.append(f"\U0001F514 <b>REBALANCE</b> | {signal.date.strftime('%Y-%m-%d')}")
     lines.append("")
 
     # Trades
     if signal.buys or signal.sells:
-        lines.append("TRADES:")
+        lines.append("\U0001F4CB <b>TRADES:</b>")
         for sym in signal.buys:
             uid = uid_map.get(sym, sym)
             price = get_current_price(prices, uid)
             shares = math.floor(per_stock / price) if price > 0 else 0
             alloc = shares * price
-            lines.append(f"  BUY  {sym:<7s} {shares} sh @ ${price:.2f} = ${alloc:,.0f}")
+            lines.append(f"  \U0001F7E2 BUY  <b>{sym}</b>  {shares} sh @ ${price:.2f} = ${alloc:,.0f}")
         for sym in signal.sells:
-            lines.append(f"  SELL {sym:<7s} (exit entire position)")
+            lines.append(f"  \U0001F534 SELL <b>{sym}</b>  (exit entire position)")
         lines.append("")
 
-    # Portfolio
-    weight_pct = 100.0 / n if n > 0 else 0
-    lines.append(f"PORTFOLIO ({n} stocks, {weight_pct:.0f}% each):")
-    total_alloc = 0
-    for sym in signal.holdings_clean:
-        uid = uid_map.get(sym, sym)
-        price = get_current_price(prices, uid)
-        shares = math.floor(per_stock / price) if price > 0 else 0
-        alloc = shares * price
-        total_alloc += alloc
-        lines.append(f"  {sym:<7s} {shares:>5d} sh @ ${price:>8.2f}  ${alloc:>8,.0f}")
-    cash = effective - total_alloc
-    lines.append(f"  Cash remainder: ${cash:,.0f}")
+    # Detailed portfolio table
+    lines.append(format_portfolio_table(signal, prices, uid_map, capital, entry_info))
     lines.append("")
 
     # Summary
-    bear_str = "ON (SPY < SMA200)" if signal.bear_regime else "OFF"
-    lines.append(f"Leverage: {signal.leverage:.2f}x | Exposure: ${effective:,.0f}")
-    lines.append(f"Bear gate: {bear_str}")
-    lines.append(f"Vol (21d): {signal.realized_vol:.2f} ann.")
-    lines.append(f"CAGR: {m['cagr']*100:+.1f}% | Sharpe: {m['sharpe']:.2f}")
+    bear_icon = "\U0001F6A8" if signal.bear_regime else "\U0001F6E1"
+    bear_str = "ON (SPY &lt; SMA200)" if signal.bear_regime else "OFF"
+    lines.append(f"\u26A1 Leverage: <b>{signal.leverage:.2f}x</b> | Exposure: ${effective:,.0f}")
+    lines.append(f"{bear_icon} Bear gate: {bear_str}")
+    lines.append(f"\U0001F4CA Vol (21d): {signal.realized_vol:.2f} ann.")
+    lines.append(f"\U0001F3AF CAGR: <b>{m['cagr']*100:+.1f}%</b> | Sharpe: {m['sharpe']:.2f}")
 
     return "\n".join(lines)
 
 
-def format_daily_summary(signal, prices, uid_map, capital, result) -> str:
-    """Brief daily status message."""
+def format_daily_summary(signal, prices, uid_map, capital, result, entry_info) -> str:
+    """Daily status message with portfolio details."""
     from waverider import compute_nav_metrics
 
-    effective = capital * signal.leverage
     m = compute_nav_metrics(result.nav_leveraged)
 
     # Estimate next rebalance: ~21 trading days from last signal date
@@ -176,22 +256,46 @@ def format_daily_summary(signal, prices, uid_map, capital, result) -> str:
     nav = result.nav_leveraged
     if len(nav) >= 2:
         daily_pnl = (nav.iloc[-1] / nav.iloc[-2] - 1) * 100
+        daily_icon = "\U0001F7E2" if daily_pnl >= 0 else "\U0001F534"
         daily_str = f"{daily_pnl:+.2f}%"
     else:
+        daily_icon = "\u2796"
         daily_str = "n/a"
 
-    holdings_str = ", ".join(signal.holdings_clean)
+    bear_icon = "\U0001F6A8" if signal.bear_regime else "\U0001F6E1"
     bear_str = "ON" if signal.bear_regime else "OFF"
+    effective = capital * signal.leverage
 
     lines = []
-    lines.append("WaveRider Daily | " + datetime.now().strftime("%Y-%m-%d"))
+    lines.append(f"\U0001F4CA <b>WaveRider Daily</b> | {datetime.now().strftime('%Y-%m-%d')}")
     lines.append("")
-    lines.append(f"Portfolio: {holdings_str}")
-    lines.append(f"Leverage: {signal.leverage:.2f}x | Bear gate: {bear_str}")
-    lines.append(f"Exposure: ${effective:,.0f} (${capital:,.0f} x {signal.leverage:.2f}x)")
-    lines.append(f"Today: {daily_str}")
-    lines.append(f"CAGR: {m['cagr']*100:+.1f}% | Sharpe: {m['sharpe']:.2f}")
-    lines.append(f"Next rebalance: ~{est_next.strftime('%b %d')}")
+
+    # Detailed portfolio table
+    lines.append(format_portfolio_table(signal, prices, uid_map, capital, entry_info))
+    lines.append("")
+
+    # Last signal summary
+    lines.append(f"\U0001F4E1 <b>Last signal:</b> {signal.date.strftime('%Y-%m-%d')}")
+    if signal.buys or signal.sells:
+        n = len(signal.holdings_clean)
+        per_stock = effective / n if n > 0 else 0
+        for sym in signal.buys:
+            uid = uid_map.get(sym, sym)
+            price = get_price_on_date(prices, uid, signal.date)
+            shares = math.floor(per_stock / price) if price > 0 else 0
+            lines.append(f"  \U0001F7E2 BUY  <b>{sym}</b>  {shares} sh @ ${price:.2f} = ${shares*price:,.0f}")
+        for sym in signal.sells:
+            uid = uid_map.get(sym, sym)
+            price = get_price_on_date(prices, uid, signal.date)
+            lines.append(f"  \U0001F534 SELL <b>{sym}</b>  @ ${price:.2f}")
+    else:
+        lines.append("  \u2696 No trades (hold)")
+    lines.append("")
+
+    lines.append(f"\u26A1 Leverage: <b>{signal.leverage:.2f}x</b> | Exposure: ${effective:,.0f}")
+    lines.append(f"{bear_icon} Bear gate: {bear_str} | {daily_icon} Today: <b>{daily_str}</b>")
+    lines.append(f"\U0001F3AF CAGR: <b>{m['cagr']*100:+.1f}%</b> | Sharpe: {m['sharpe']:.2f}")
+    lines.append(f"\U0001F4C5 Next rebalance: ~{est_next.strftime('%b %d')}")
 
     return "\n".join(lines)
 
@@ -388,10 +492,11 @@ def main():
         result = strategy.backtest(prices, spy, rankings)
         print(" done.")
 
-        # Build UID lookup
+        # Build UID lookup + entry info
         uid_map = {}
         for uid in signal.holdings:
             uid_map[clean_uid(uid)] = uid
+        entry_info = build_entry_info(signal, result, prices, uid_map)
 
         # 3. Determine if today is a rebalance day with trades
         today = pd.Timestamp(datetime.now().date())
@@ -399,16 +504,20 @@ def main():
 
         # 4. Format message
         if is_rebalance:
-            msg = format_rebalance_message(signal, prices, uid_map, capital, result)
+            msg = format_rebalance_message(signal, prices, uid_map, capital, result, entry_info)
         else:
-            msg = format_daily_summary(signal, prices, uid_map, capital, result)
+            msg = format_daily_summary(signal, prices, uid_map, capital, result, entry_info)
 
         # 5. Send or print
         if args.dry_run:
             print("\n" + "=" * 50)
             print("  DRY RUN — message that would be sent:")
             print("=" * 50)
-            print(msg)
+            # Windows terminal may not support emoji — encode safely
+            try:
+                print(msg)
+            except UnicodeEncodeError:
+                print(msg.encode("utf-8", errors="replace").decode("utf-8"))
             print("=" * 50)
             sent_ok = True
         else:
