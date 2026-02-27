@@ -5601,6 +5601,146 @@ def main():
     if HAS_TORCH and torch.cuda.is_available():
         tprint(f"Peak GPU: {torch.cuda.max_memory_allocated()/1024**3:.2f}GB", "gpu")
 
+    # ── Cross-Strategy Summary: WaveRider + LETF alongside pipeline ──
+    print_section("CROSS-STRATEGY SUMMARY")
+    tprint("Running WaveRider + LETF backtests for comparison...", "info")
+    try:
+        from waverider import (
+            WaveRiderStrategy as _WRS, WaveRiderConfig as _WRC,
+            load_universe as _load_u, load_spy as _load_s,
+            compute_nav_metrics as _cnm,
+        )
+        import pandas as _xpd
+
+        _wr_prices, _wr_rankings = _load_u()
+        _wr_spy = _load_s()
+
+        _wr_strat = _WRS(_WRC())
+        _wr_res = _wr_strat.backtest(_wr_prices, _wr_spy, _wr_rankings)
+        _wr_m = _cnm(_wr_res.nav_leveraged)
+        _wr_u = _cnm(_wr_res.nav_unlevered)
+
+        # LETF backtest (reuse _run_letf_strategy internals)
+        _letf_results = []
+        try:
+            _letf_sectors = {
+                'XLK': 'TECL', 'XLE': 'ERX', 'XLF': 'FAS',
+                'QQQ': 'TQQQ', 'IWM': 'TNA', 'XLV': 'CURE',
+            }
+            from alphago_trading_system import load_from_norgate, NORGATE_DIR
+            _letf_spy = load_from_norgate("SPY", NORGATE_DIR, "US_Equities")
+            _letf_signal_data = {}
+            for sig in _letf_sectors:
+                s = load_from_norgate(sig, NORGATE_DIR, "US_Equities")
+                if s is not None and len(s) > 200:
+                    _letf_signal_data[sig] = s['Close']
+            _letf_spy_close = _letf_spy['Close']
+            _letf_sma200 = _letf_spy_close.rolling(200).mean()
+
+            # Simple monthly rotation backtest
+            _letf_dates = _letf_spy_close.index[252:]
+            _letf_nav = [1.0]
+            for _i in range(1, len(_letf_dates)):
+                _d = _letf_dates[_i]
+                _dp = _letf_dates[_i-1]
+                if _xpd.notna(_letf_sma200.get(_dp)) and _letf_spy_close.get(_dp, 0) < _letf_sma200.get(_dp):
+                    _letf_nav.append(_letf_nav[-1])  # cash
+                    continue
+                # Pick top sector by 63d momentum
+                _mom = {}
+                for sig, pr in _letf_signal_data.items():
+                    if _dp in pr.index and pr.index.get_loc(_dp) >= 63:
+                        _loc = pr.index.get_loc(_dp)
+                        _mom[sig] = pr.iloc[_loc] / pr.iloc[_loc - 63] - 1
+                if _mom:
+                    _best = max(_mom, key=_mom.get)
+                    _sig_pr = _letf_signal_data[_best]
+                    if _d in _sig_pr.index and _dp in _sig_pr.index:
+                        _ret = _sig_pr.loc[_d] / _sig_pr.loc[_dp] - 1
+                        _letf_nav.append(_letf_nav[-1] * (1 + _ret * 3))  # 3x leverage
+                    else:
+                        _letf_nav.append(_letf_nav[-1])
+                else:
+                    _letf_nav.append(_letf_nav[-1])
+            _letf_nav_s = _xpd.Series(_letf_nav, index=_letf_dates)
+            _letf_m = _cnm(_letf_nav_s)
+        except Exception:
+            _letf_m = None
+
+        # Pipeline aggregate CAGR (from v7/v8/v9 results already computed)
+        _pip_total_pnl = pipeline_results.get('total_pnl', 0)
+        _pip_peak = sum(d.get('peak_notional', 0) for d in _pip_per_sym.values()) if _pip_per_sym else 0
+        _pip_steps = max((d.get('step_count', 0) for d in _pip_per_sym.values()), default=0)
+        _pip_yrs = _pip_steps / 252 if _pip_steps > 0 else 1
+        _pip_rr = 1 + _pip_total_pnl / _pip_peak if _pip_peak > 0 else 1
+        _pip_cagr = (_pip_rr ** (1 / max(_pip_yrs, 0.01)) - 1) if _pip_rr > 0 else 0
+
+        # v8 CAGR
+        _v8_cagr = 0
+        if _has_v8 and _vc_results:
+            _v8_pnl = _vc_results.get('total_pnl', 0)
+            _v8_pk = sum(d.get('peak_notional', 0) for d in _vc_per_sym.values()) if _vc_per_sym else 0
+            _v8_st = max((d.get('step_count', 0) for d in _vc_per_sym.values()), default=0)
+            _v8_yr = _v8_st / 252 if _v8_st > 0 else 1
+            _v8_rr = 1 + _v8_pnl / _v8_pk if _v8_pk > 0 else 1
+            _v8_cagr = (_v8_rr ** (1 / max(_v8_yr, 0.01)) - 1) if _v8_rr > 0 else 0
+
+        # v9 CAGR
+        _v9_cagr = 0
+        if _has_v9_col and _xc_results:
+            _x9_pnl = _xc_results.get('total_pnl', 0)
+            _x9_pk = sum(d.get('peak_notional', 0) for d in _xc_per_sym.values()) if _xc_per_sym else 0
+            _x9_st = max((d.get('step_count', 0) for d in _xc_per_sym.values()), default=0)
+            _x9_yr = _x9_st / 252 if _x9_st > 0 else 1
+            _x9_rr = 1 + _x9_pnl / _x9_pk if _x9_pk > 0 else 1
+            _v9_cagr = (_x9_rr ** (1 / max(_x9_yr, 0.01)) - 1) if _x9_rr > 0 else 0
+
+        # Print unified table
+        print(f"\n    {'Strategy':<35s} {'CAGR':>8s} {'Sharpe':>7s} {'Sortino':>8s} {'MaxDD':>7s} {'Period':>12s}")
+        print(f"    {'─'*35} {'─'*8} {'─'*7} {'─'*8} {'─'*7} {'─'*12}")
+
+        # Pipeline strategies (short test period)
+        _pip_sh = pipeline_results.get('avg_sh', 0)
+        _pip_dd = pipeline_results.get('dd_max', 0)
+        print(f"    {'v3.0 (Base RL)':.<35s} {(base_results.get('total_pnl', 0) / max(_pip_peak, 1) / max(_pip_yrs, 0.01)):>+7.1%}  "
+              f"{base_results.get('avg_sh', 0):>7.2f} {'':>8s} {base_results.get('dd_max', 0):>6.1f}% "
+              f"{'~' + str(int(_pip_yrs)) + 'y test':>12s}") if _has_base else None
+        print(f"    {'v7.0 (Pipeline)':.<35s} {_pip_cagr:>+7.1%}  {_pip_sh:>7.2f} {'':>8s} {_pip_dd:>6.1f}% "
+              f"{'~' + str(int(_pip_yrs)) + 'y test':>12s}")
+        if _has_v8:
+            _v8_sh = _vc_results.get('avg_sh', 0)
+            _v8_dd = _vc_results.get('dd_max', 0)
+            print(f"    {'v8.0 (Stock Select)':.<35s} {_v8_cagr:>+7.1%}  {_v8_sh:>7.2f} {'':>8s} {_v8_dd:>6.1f}% "
+                  f"{'~' + str(int(_pip_yrs)) + 'y test':>12s}")
+        if _has_v9_col:
+            _x9_sh = _xc_results.get('avg_sh', 0)
+            _x9_dd = _xc_results.get('dd_max', 0)
+            print(f"    {'v9.0 (Full Stack)':.<35s} {_v9_cagr:>+7.1%}  {_x9_sh:>7.2f} {'':>8s} {_x9_dd:>6.1f}% "
+                  f"{'~' + str(int(_pip_yrs)) + 'y test':>12s}")
+
+        # Full-history strategies
+        print(f"    {'─'*35} {'─'*8} {'─'*7} {'─'*8} {'─'*7} {'─'*12}")
+        print(f"    {'WaveRider T5 BearVol2x':<35s} {_wr_m['cagr']:>+7.1%}  {_wr_m['sharpe']:>7.2f} "
+              f"{_wr_m['sortino']:>8.2f} {_wr_m['max_dd']*100:>6.1f}% {_wr_m['n_years']:>10.0f}y full")
+        print(f"    {'WaveRider T5 Unlevered':<35s} {_wr_u['cagr']:>+7.1%}  {_wr_u['sharpe']:>7.2f} "
+              f"{_wr_u['sortino']:>8.2f} {_wr_u['max_dd']*100:>6.1f}% {_wr_u['n_years']:>10.0f}y full")
+        if _letf_m:
+            print(f"    {'LETF 3x Sector Rotation':<35s} {_letf_m['cagr']:>+7.1%}  {_letf_m['sharpe']:>7.2f} "
+                  f"{_letf_m['sortino']:>8.2f} {_letf_m['max_dd']*100:>6.1f}% {_letf_m['n_years']:>10.0f}y full")
+
+        # SPY benchmark
+        _spy_cagr_f = ((float(_wr_spy.iloc[-1]) / float(_wr_spy.iloc[0])) ** (1 / _wr_m['n_years']) - 1)
+        _spy_nav_f = _wr_spy / _wr_spy.iloc[0]
+        _spy_r = _spy_nav_f.pct_change().dropna()
+        _spy_sh_f = float(_spy_r.mean() / _spy_r.std() * np.sqrt(252)) if _spy_r.std() > 0 else 0
+        _spy_dd_f = float((_spy_nav_f / _spy_nav_f.cummax() - 1).min() * 100)
+        print(f"    {'SPY Buy & Hold':<35s} {_spy_cagr_f:>+7.1%}  {_spy_sh_f:>7.2f} {'':>8s} {_spy_dd_f:>6.1f}% "
+              f"{_wr_m['n_years']:>10.0f}y full")
+
+        tprint("Note: v3-v9 use short RL test windows; WaveRider/LETF use full 35-year backtests.", "info")
+    except Exception as _e:
+        tprint(f"Cross-strategy summary skipped: {_e}", "warn")
+
     _complete_ver = "v9.0" if args.version == "v9" else "v8.0" if args.version == "v8" else "v7.0"
     _complete_score = v8_results['score'] if v8_results is not None else pipeline_results['score']
     print_box(
