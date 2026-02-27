@@ -5631,7 +5631,6 @@ def main():
                 'XLK': 'TECL', 'XLE': 'ERX', 'XLF': 'FAS',
                 'QQQ': 'TQQQ', 'IWM': 'TNA', 'XLV': 'CURE',
             }
-            from alphago_trading_system import load_from_norgate, NORGATE_DIR
             _letf_spy = load_from_norgate("SPY", NORGATE_DIR, "US_Equities")
             _letf_signal_data = {}
             for sig in _letf_sectors:
