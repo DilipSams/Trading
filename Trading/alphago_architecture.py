@@ -5908,9 +5908,12 @@ class ExecutionEngine:
             self._kill_cooldown = self.acfg.kill_cooldown_bars
             return True
 
-        # Turnover spike
+        # Turnover spike — compare against average of ACTUAL trades only
+        # (exclude zero-turnover bars where no-trade filter suppressed trades,
+        #  otherwise avg ≈ 0.01 and any real trade looks like a 30× spike)
         if len(self._step_turnovers) > 10:
-            avg = np.mean(list(self._step_turnovers)[:-1])
+            nonzero = [t for t in list(self._step_turnovers)[:-1] if t > 1e-6]
+            avg = np.mean(nonzero) if len(nonzero) >= 3 else 0.0
             current = abs(target_exposure - self._current_exposure)
             if avg > 0 and current > self.acfg.kill_max_turnover_spike * avg:
                 self._kill_triggered = True

@@ -118,6 +118,7 @@ except ImportError as e:
     sys.exit(1)
 
 import numpy as np
+import pandas as pd
 
 try:
     from data_quality import DataLoadMeta, analyze_ohlcv, print_quality_table, hash_df
@@ -590,6 +591,216 @@ def _eval_symbol_worker(d):
         'sym_date_returns': sym_date_returns,
         'episode_audit': episode_audit,
         'trade_log': trade_log,
+    }
+
+
+# ============================================================================
+# CROSS-STRATEGY METRICS HELPERS
+# ============================================================================
+
+
+class TimeVaryingUniverse:
+    """Point-in-time universe that knows which symbols were eligible at each date.
+
+    Wraps universe_builder rankings to provide efficient date→symbol lookups.
+    Used by _build_portfolio_nav() to only include returns from PIT-eligible
+    symbols at each point in time, eliminating survivorship bias.
+    """
+
+    def __init__(self, rankings: pd.DataFrame, top_n: int = 150):
+        """
+        Args:
+            rankings: DataFrame with columns [date, rank, uid, base_symbol, avg_turnover_63d]
+                      from universe_builder.build_universe_cache().
+            top_n: Maximum rank to include (default: 150).
+        """
+        self.top_n = top_n
+        # Pre-build sorted list of rebalance dates and per-date symbol sets
+        filtered = rankings[rankings['rank'] <= top_n]
+        self._rebal_dates = sorted(filtered['date'].unique())
+        self._date_to_uids = {}
+        for dt in self._rebal_dates:
+            mask = (filtered['date'] == dt)
+            self._date_to_uids[dt] = set(filtered.loc[mask, 'uid'].values)
+        # Numpy array for fast bisection
+        self._rebal_arr = np.array(self._rebal_dates, dtype='datetime64[ns]')
+
+    def get_symbols_at(self, date) -> set:
+        """Return UIDs eligible at the most recent rebalance <= date."""
+        dt64 = np.datetime64(pd.Timestamp(date))
+        idx = np.searchsorted(self._rebal_arr, dt64, side='right') - 1
+        if idx < 0:
+            return set()
+        rebal = self._rebal_dates[idx]
+        return self._date_to_uids.get(rebal, set())
+
+    def get_all_unique_uids(self) -> list:
+        """Return all UIDs that ever appeared in the universe."""
+        all_uids = set()
+        for uid_set in self._date_to_uids.values():
+            all_uids.update(uid_set)
+        return sorted(all_uids)
+
+    @property
+    def date_range(self):
+        """Return (first_rebalance_date, last_rebalance_date)."""
+        if self._rebal_dates:
+            return self._rebal_dates[0], self._rebal_dates[-1]
+        return None, None
+
+    @property
+    def n_rebalances(self):
+        return len(self._rebal_dates)
+
+    @property
+    def n_unique_symbols(self):
+        return len(self.get_all_unique_uids())
+
+
+def _build_portfolio_nav(per_symbol_date_returns: dict,
+                         universe: 'TimeVaryingUniverse | None' = None) -> pd.Series:
+    """
+    Build a portfolio-level NAV series from per-symbol date-keyed returns.
+
+    Args:
+        per_symbol_date_returns: dict[symbol -> list of (date_str, net_return)]
+        universe: Optional TimeVaryingUniverse for PIT-aware filtering.
+                  When provided, only includes returns from symbols that were
+                  in the PIT universe at each date (eliminates survivorship bias).
+
+    Returns:
+        pd.Series with DatetimeIndex, values = portfolio NAV (starting at 1.0).
+        Equal-weighted across all symbols active on each date.
+    """
+    # Collect all (date, return) pairs per symbol into a DataFrame
+    frames = {}
+    for sym, date_rets in per_symbol_date_returns.items():
+        if not date_rets:
+            continue
+        dates, rets = zip(*date_rets)
+        frames[sym] = pd.Series(rets, index=pd.to_datetime(dates), dtype=np.float64, name=sym)
+
+    if not frames:
+        return pd.Series(dtype=np.float64)
+
+    # Align all symbols by date, NaN where a symbol has no return on that date
+    ret_df = pd.DataFrame(frames)
+
+    if universe is not None:
+        # PIT-aware: mask out returns for symbols NOT in the universe at each date.
+        # For each date, only symbols in the PIT universe contribute to the average.
+        # This eliminates survivorship bias — we never include returns from stocks
+        # that weren't in the top-N by dollar volume at that point in time.
+        #
+        # Vectorized: group trading days by their rebalance period (dates between
+        # two consecutive rebalances share the same eligible set) and apply masks
+        # per period, not per day.
+        col_uids = {}
+        for col in ret_df.columns:
+            col_uids[col] = col.rsplit('_', 1)[0] if '_' in col else col
+
+        # Build rebalance-period masks
+        mask = pd.DataFrame(True, index=ret_df.index, columns=ret_df.columns)
+        prev_eligible = set()
+        rebal_dates = universe._rebal_dates
+        for i, rebal in enumerate(rebal_dates):
+            eligible = universe._date_to_uids.get(rebal, set())
+            # Period: from this rebalance to just before next rebalance
+            if i + 1 < len(rebal_dates):
+                period_mask = (ret_df.index >= rebal) & (ret_df.index < rebal_dates[i + 1])
+            else:
+                period_mask = (ret_df.index >= rebal)
+            if not period_mask.any():
+                continue
+            for col, uid in col_uids.items():
+                if uid not in eligible:
+                    mask.loc[period_mask, col] = False
+
+        # Before first rebalance: mask everything out
+        if rebal_dates:
+            pre_mask = ret_df.index < rebal_dates[0]
+            if pre_mask.any():
+                mask.loc[pre_mask, :] = False
+
+        # Apply mask: set non-eligible returns to NaN
+        ret_df = ret_df.where(mask)
+
+    # Equal-weight portfolio return = mean of per-symbol returns each day
+    port_ret = ret_df.mean(axis=1).fillna(0.0).sort_index()
+    # Cumulative NAV
+    nav = (1 + port_ret).cumprod()
+    nav.name = "portfolio_nav"
+    return nav
+
+
+def _compute_strategy_metrics(nav, spy_nav, name, turnover_annual=0.0,
+                              cost_drag_bps=0.0):
+    """
+    Compute unified metrics dict for any strategy from its NAV series.
+
+    Args:
+        nav: pd.Series NAV (starting at 1.0), indexed by date.
+        spy_nav: pd.Series SPY NAV over same period (for alpha calc). Can be None.
+        name: strategy label string.
+        turnover_annual: annualized turnover ratio.
+        cost_drag_bps: annualized cost drag in basis points.
+
+    Returns:
+        dict with keys: name, cagr, sharpe, sortino, calmar, max_dd, ann_vol,
+        turnover, cost_drag, alpha_vs_spy, period_start, period_end, n_years.
+    """
+    if nav is None or len(nav) < 10:
+        return {
+            'name': name, 'cagr': 0, 'sharpe': 0, 'sortino': 0, 'calmar': 0,
+            'max_dd': 0, 'ann_vol': 0, 'turnover': 0, 'cost_drag': 0,
+            'alpha_vs_spy': 0, 'period_start': 'N/A', 'period_end': 'N/A',
+            'n_years': 0,
+        }
+
+    n_years = (nav.index[-1] - nav.index[0]).days / 365.25
+    if n_years <= 0:
+        n_years = len(nav) / 252  # fallback for non-datetime indices
+
+    final_ratio = nav.iloc[-1] / nav.iloc[0] if nav.iloc[0] > 0 else 1.0
+    cagr = (final_ratio ** (1 / max(n_years, 0.01)) - 1) if final_ratio > 0 else -1.0
+
+    daily_r = nav.pct_change().dropna()
+    sharpe = float(daily_r.mean() / daily_r.std() * np.sqrt(252)) if daily_r.std() > 1e-10 else 0
+    down = daily_r[daily_r < 0]
+    down_std = down.std() * np.sqrt(252) if len(down) > 1 else 0
+    sortino = float(daily_r.mean() * 252 / down_std) if down_std > 1e-10 else 0
+    ann_vol = float(daily_r.std() * np.sqrt(252)) if len(daily_r) > 1 else 0
+
+    dd_series = nav / nav.cummax() - 1
+    max_dd = float(dd_series.min())
+    calmar = cagr / abs(max_dd) if abs(max_dd) > 1e-10 else 0
+
+    # Alpha vs SPY
+    alpha = 0.0
+    if spy_nav is not None and len(spy_nav) > 10:
+        spy_n_years = (spy_nav.index[-1] - spy_nav.index[0]).days / 365.25
+        if spy_n_years > 0 and spy_nav.iloc[0] > 0:
+            spy_final = spy_nav.iloc[-1] / spy_nav.iloc[0]
+            spy_cagr = (spy_final ** (1 / max(spy_n_years, 0.01)) - 1) if spy_final > 0 else 0
+            alpha = cagr - spy_cagr
+
+    period_start = str(nav.index[0].date()) if hasattr(nav.index[0], 'date') else str(nav.index[0])[:10]
+    period_end = str(nav.index[-1].date()) if hasattr(nav.index[-1], 'date') else str(nav.index[-1])[:10]
+
+    return {
+        'name': name,
+        'cagr': cagr,
+        'sharpe': sharpe,
+        'sortino': sortino,
+        'calmar': calmar,
+        'max_dd': max_dd,
+        'ann_vol': ann_vol,
+        'turnover': turnover_annual,
+        'cost_drag': cost_drag_bps,
+        'alpha_vs_spy': alpha,
+        'period_start': period_start,
+        'period_end': period_end,
+        'n_years': n_years,
     }
 
 
@@ -2453,6 +2664,15 @@ Examples:
                    help="v9.0: minimum average daily volume in shares for --include-midcap discovery "
                         "(e.g. 300000 for 300K shares/day, default: 300K when --include-midcap is set). "
                         "Float proxy — rules out low-float stocks that hit dollar thresholds only on spike days.")
+    g.add_argument("--universe", type=str, default="default",
+                   choices=["default", "pit"],
+                   help="Symbol universe source: default=hardcoded DEFAULT_SYMBOLS (206 current large-caps), "
+                        "pit=point-in-time survivorship-bias-free universe from universe_builder.py "
+                        "(ranked by trailing dollar volume at each monthly rebalance). "
+                        "PIT eliminates survivorship bias (~2-4%% CAGR inflation) and extends to 1990.")
+    g.add_argument("--universe-top-n", type=int, default=150,
+                   help="PIT universe size: top N stocks by trailing 63-day avg dollar volume "
+                        "at each monthly rebalance (default: 150). Only used with --universe pit.")
     g.add_argument("--kill-loss", type=float, default=None,
                    help="Kill switch max portfolio loss fraction (default: ArchitectureConfig default=0.30)")
     g.add_argument("--skip-ablation", action="store_true",
@@ -2596,7 +2816,12 @@ def _run_self_tests():
 
 
 def resolve_symbols(args):
-    """Resolve symbol list from --sector, --symbols, or DEFAULT_SYMBOLS."""
+    """Resolve symbol list from --universe, --sector, --symbols, or DEFAULT_SYMBOLS.
+
+    When --universe pit: builds survivorship-bias-free universe from universe_builder.py.
+    Stores rankings/prices on args._pit_rankings / args._pit_prices for Phase 3.2
+    (TimeVaryingUniverse walk-forward rotation).
+    """
     # --sector list: print available sectors and exit
     if args.sector.strip().lower() == "list":
         print("Available sectors:")
@@ -2623,6 +2848,53 @@ def resolve_symbols(args):
     # --symbols only
     if args.symbols:
         return [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
+    # --universe pit: point-in-time survivorship-bias-free universe
+    universe_mode = getattr(args, 'universe', 'default')
+    if universe_mode == 'pit' and getattr(args, 'version', 'v7') in ('v8', 'v9'):
+        try:
+            from universe_builder import build_universe_cache, get_universe_at_date, uid_to_ticker
+            top_n = getattr(args, 'universe_top_n', 150)
+            tprint(f"  [PIT Universe] Building survivorship-bias-free universe "
+                   f"(top {top_n} by dollar volume)...", "info")
+            rankings, prices = build_universe_cache(top_n=top_n)
+
+            # Build TimeVaryingUniverse for walk-forward NAV construction
+            tv_universe = TimeVaryingUniverse(rankings, top_n=top_n)
+            args._pit_universe = tv_universe
+            args._pit_rankings = rankings
+            args._pit_prices = prices
+
+            # Return ALL unique UIDs that ever appeared in the PIT universe.
+            # This loads the full historical universe (~1000+ symbols including
+            # delisted) so evaluate_with_pipeline() can evaluate each over its
+            # full price history. The TimeVaryingUniverse handles per-date
+            # filtering in _build_portfolio_nav() — only returns from symbols
+            # that were in the PIT universe on each date contribute to the NAV.
+            all_uids = tv_universe.get_all_unique_uids()
+
+            # Stats
+            first_date, last_date = tv_universe.date_range
+            latest_uids = get_universe_at_date(rankings, last_date, top_n=top_n)
+            top10_tickers = [uid_to_ticker(u) for u in latest_uids[:10]]
+            tprint(f"  [PIT Universe] {len(all_uids)} unique symbols across full history", "ok")
+            tprint(f"  [PIT Universe] {len(latest_uids)} in latest snapshot "
+                   f"({last_date.strftime('%Y-%m-%d')})", "info")
+            tprint(f"  [PIT Universe] History: {first_date.strftime('%Y-%m-%d')} to "
+                   f"{last_date.strftime('%Y-%m-%d')}, "
+                   f"{tv_universe.n_rebalances} monthly rebalances", "info")
+            tprint(f"  [PIT Universe] Top 10 (current): {', '.join(top10_tickers)}", "info")
+
+            # Return UIDs directly — load_from_norgate() matches against filenames
+            # and UIDs like "LEHMQ-201203" match US_Equities_Delisted/ files correctly.
+            # The _1d key format uses rsplit("_", 1) so hyphens in UIDs are preserved.
+            return all_uids
+        except Exception as e:
+            tprint(f"  [PIT Universe] Failed: {e}", "err")
+            tprint(f"  [PIT Universe] Falling back to DEFAULT_SYMBOLS", "warn")
+            import traceback
+            traceback.print_exc()
+
     # Default: for v8.0, load full diversified universe; otherwise first n_symbols
     if getattr(args, 'version', 'v7') in ('v8', 'v9'):
         base = DEFAULT_SYMBOLS[:206]  # All 206 stocks across 11 sectors
@@ -4270,8 +4542,17 @@ def main():
 
     # Evaluate v8/v9 with rank-based sizing.
     # --version v8/v9: use selector-filtered datasets (stocks passing quality threshold).
+    # --universe pit: bypass StockSelector — use ALL PIT datasets. The TimeVaryingUniverse
+    #   handles per-date filtering in _build_portfolio_nav(). This evaluates ALL symbols
+    #   that ever appeared in the PIT universe so the walk-forward NAV is correct.
     # comparison mode (v7): use same datasets as v7 so all symbols appear; only sizing differs.
-    _v8_eval_datasets = selected_datasets if args.version in ("v8", "v9") else datasets
+    _is_pit = getattr(args, 'universe', 'default') == 'pit'
+    if _is_pit and args.version in ("v8", "v9"):
+        _v8_eval_datasets = datasets
+        tprint(f"  [PIT] Evaluating all {len(datasets)} PIT universe symbols "
+               f"(StockSelector bypassed — universe defines eligibility)", "info")
+    else:
+        _v8_eval_datasets = selected_datasets if args.version in ("v8", "v9") else datasets
     pipeline.use_sma = True
     pipeline.use_v8_sizing = True
     pipeline._v8_rank = _v8_rank
@@ -4327,15 +4608,21 @@ def main():
             min_dollar_volume=getattr(args, 'min_dollar_volume', 0.0),
         )
         _v8b_selector = StockSelector(_v8b_sel_cfg, SECTOR_MAP)
-        _v8b_datasets = _v8b_selector.select(datasets, spy_returns_lookup)
-        # Warn if v8 and v9 select identical portfolios
-        _v8b_selected_syms = set(_v8b_selector.selection_log[-1]['selected']) if _v8b_selector.selection_log else set()
-        _v9_selected_syms = set(selector.selection_log[-1]['selected']) if selector.selection_log else set()
-        if _v8b_selected_syms and _v8b_selected_syms == _v9_selected_syms:
-            tprint(f"  Note: v8 and v9 selected identical portfolios "
-                   f"({', '.join(sorted(_v8b_selected_syms))}). "
-                   f"v9 features did not change selection on this universe. "
-                   f"Try broader universe or lower --min-score-pct.", "warn")
+        if _is_pit:
+            # PIT mode: bypass selector, use all PIT datasets
+            _v8b_datasets = datasets
+            tprint(f"  [PIT] v8 baseline: using all {len(datasets)} PIT symbols", "info")
+        else:
+            _v8b_datasets = _v8b_selector.select(datasets, spy_returns_lookup)
+        # Warn if v8 and v9 select identical portfolios (skip for PIT mode)
+        if not _is_pit:
+            _v8b_selected_syms = set(_v8b_selector.selection_log[-1]['selected']) if _v8b_selector.selection_log else set()
+            _v9_selected_syms = set(selector.selection_log[-1]['selected']) if selector.selection_log else set()
+            if _v8b_selected_syms and _v8b_selected_syms == _v9_selected_syms:
+                tprint(f"  Note: v8 and v9 selected identical portfolios "
+                       f"({', '.join(sorted(_v8b_selected_syms))}). "
+                       f"v9 features did not change selection on this universe. "
+                       f"Try broader universe or lower --min-score-pct.", "warn")
         _v8b_rank = {sym: i for i, sym in enumerate(
             (_v8b_selector.selection_log[-1]['selected']
              if _v8b_selector.selection_log else [])
@@ -4419,6 +4706,8 @@ def main():
     _vc_per_sym: dict = {}   # safe defaults; overwritten by alias block inside table section
     _xc_per_sym: dict = {}
     _pip_per_sym: dict = {}  # overwritten when pipeline_results is not None
+    _vc_results = None       # safe default; overwritten when v8 results are available
+    _xc_results = None       # safe default; overwritten when v9 results are available
 
     # -- Show comparison table --
     # Show when: (a) training was done (base_results exists), OR (b) pipeline ran (eval-only)
@@ -5605,144 +5894,371 @@ def main():
     if HAS_TORCH and torch.cuda.is_available():
         tprint(f"Peak GPU: {torch.cuda.max_memory_allocated()/1024**3:.2f}GB", "gpu")
 
-    # ── Cross-Strategy Summary: WaveRider + LETF alongside pipeline ──
-    print_section("CROSS-STRATEGY SUMMARY")
+    # ── Cross-Strategy Summary: all strategies in one unified table ──
+    print_section("CROSS-STRATEGY COMPARISON")
+    _is_pit_run = getattr(args, 'universe', 'default') == 'pit'
+    if _is_pit_run:
+        tprint("Universe: POINT-IN-TIME (survivorship-bias-free)", "ok")
+        tprint(f"  Top {getattr(args, 'universe_top_n', 150)} by dollar volume | "
+               f"Monthly rebalanced | Includes delisted stocks", "info")
+    else:
+        tprint("Universe: DEFAULT_SYMBOLS (206 current large-caps)", "info")
+        tprint("  NOTE: Subject to survivorship bias (~2-4% CAGR inflation). "
+               "Use --universe pit for bias-free results.", "warn")
     tprint("Running WaveRider + LETF backtests for comparison...", "info")
+
+    _all_strategy_rows = []  # list of metric dicts for unified table
+    _all_strategy_navs = {}  # name -> pd.Series NAV for year-by-year breakdown
+    _spy_nav_full = None     # SPY NAV for alpha computation
+    _pit_universe = getattr(args, '_pit_universe', None)  # TimeVaryingUniverse or None
+
+    # --- Pipeline strategies (v7/v8/v9) from NAV series ---
+    def _add_pipeline_strategy(results_dict, name):
+        """Build NAV from pipeline results and add to comparison."""
+        pdr = results_dict.get('per_symbol_date_returns', {})
+        nav = _build_portfolio_nav(pdr, universe=_pit_universe)
+        if nav is not None and len(nav) > 10:
+            m = _compute_strategy_metrics(nav, _spy_nav_full, name)
+            _all_strategy_rows.append(m)
+            _all_strategy_navs[name] = nav
+
+    if pipeline_results is not None:
+        _add_pipeline_strategy(pipeline_results, "v7.0 (Pipeline)")
+    if _has_v8 and _vc_results is not None:
+        _add_pipeline_strategy(_vc_results, "v8.0 (Stock Select)")
+    if _has_v9_col and _xc_results is not None:
+        _add_pipeline_strategy(_xc_results, "v9.0 (Full Stack)")
+
+    # --- WaveRider strategies (full history, survivorship-bias free) ---
     try:
         from waverider import (
             WaveRiderStrategy as _WRS, WaveRiderConfig as _WRC,
             load_universe as _load_u, load_spy as _load_s,
-            compute_nav_metrics as _cnm,
         )
-        import pandas as _xpd
-
         _wr_prices, _wr_rankings = _load_u()
         _wr_spy = _load_s()
-
         _wr_strat = _WRS(_WRC())
         _wr_res = _wr_strat.backtest(_wr_prices, _wr_spy, _wr_rankings)
-        _wr_m = _cnm(_wr_res.nav_leveraged)
-        _wr_u = _cnm(_wr_res.nav_unlevered)
 
-        # LETF backtest (reuse _run_letf_strategy internals)
-        _letf_results = []
-        try:
-            _letf_sectors = {
-                'XLK': 'TECL', 'XLE': 'ERX', 'XLF': 'FAS',
-                'QQQ': 'TQQQ', 'IWM': 'TNA', 'XLV': 'CURE',
-            }
-            _letf_spy = load_from_norgate("SPY", NORGATE_DIR, "US_Equities")
-            _letf_signal_data = {}
-            for sig in _letf_sectors:
-                s = load_from_norgate(sig, NORGATE_DIR, "US_Equities")
-                if s is not None and len(s) > 200:
-                    _letf_signal_data[sig] = s['Close']
-            _letf_spy_close = _letf_spy['Close']
-            _letf_sma200 = _letf_spy_close.rolling(200).mean()
+        # SPY NAV for alpha computation (use WaveRider's aligned SPY)
+        _spy_nav_full = _wr_spy / _wr_spy.iloc[0]
 
-            # Simple monthly rotation backtest
-            _letf_dates = _letf_spy_close.index[252:]
-            _letf_nav = [1.0]
-            for _i in range(1, len(_letf_dates)):
-                _d = _letf_dates[_i]
-                _dp = _letf_dates[_i-1]
-                if _xpd.notna(_letf_sma200.get(_dp)) and _letf_spy_close.get(_dp, 0) < _letf_sma200.get(_dp):
-                    _letf_nav.append(_letf_nav[-1])  # cash
-                    continue
-                # Pick top sector by 63d momentum
-                _mom = {}
-                for sig, pr in _letf_signal_data.items():
-                    if _dp in pr.index and pr.index.get_loc(_dp) >= 63:
-                        _loc = pr.index.get_loc(_dp)
-                        _mom[sig] = pr.iloc[_loc] / pr.iloc[_loc - 63] - 1
-                if _mom:
-                    _best = max(_mom, key=_mom.get)
-                    _sig_pr = _letf_signal_data[_best]
-                    if _d in _sig_pr.index and _dp in _sig_pr.index:
-                        _ret = _sig_pr.loc[_d] / _sig_pr.loc[_dp] - 1
-                        _letf_nav.append(_letf_nav[-1] * (1 + _ret * 3))  # 3x leverage
-                    else:
-                        _letf_nav.append(_letf_nav[-1])
-                else:
-                    _letf_nav.append(_letf_nav[-1])
-            _letf_nav_s = _xpd.Series(_letf_nav, index=_letf_dates)
-            _letf_m = _cnm(_letf_nav_s)
-        except Exception:
-            _letf_m = None
+        # Recompute pipeline rows with SPY alpha now available
+        _all_strategy_rows_new = []
+        for row in _all_strategy_rows:
+            # Re-derive NAV for each pipeline strategy
+            if row['name'] == "v7.0 (Pipeline)" and pipeline_results:
+                pdr = pipeline_results.get('per_symbol_date_returns', {})
+            elif row['name'] == "v8.0 (Stock Select)" and _vc_results:
+                pdr = _vc_results.get('per_symbol_date_returns', {})
+            elif row['name'] == "v9.0 (Full Stack)" and _xc_results:
+                pdr = _xc_results.get('per_symbol_date_returns', {})
+            else:
+                _all_strategy_rows_new.append(row)
+                continue
+            nav = _build_portfolio_nav(pdr, universe=_pit_universe)
+            if nav is not None and len(nav) > 10:
+                # Build a SPY NAV aligned to the pipeline test period
+                _spy_aligned = _spy_nav_full.reindex(nav.index).ffill()
+                if _spy_aligned is not None and len(_spy_aligned) > 10:
+                    _spy_aligned = _spy_aligned / _spy_aligned.iloc[0]
+                m = _compute_strategy_metrics(nav, _spy_aligned, row['name'])
+                _all_strategy_rows_new.append(m)
+                _all_strategy_navs[row['name']] = nav
+            else:
+                _all_strategy_rows_new.append(row)
+        _all_strategy_rows = _all_strategy_rows_new
 
-        # Pipeline aggregate CAGR (from v7/v8/v9 results already computed)
-        _pip_total_pnl = pipeline_results.get('total_pnl', 0)
-        _pip_peak = sum(d.get('peak_notional', 0) for d in _pip_per_sym.values()) if _pip_per_sym else 0
-        _pip_steps = max((d.get('step_count', 0) for d in _pip_per_sym.values()), default=0)
-        _pip_yrs = _pip_steps / 252 if _pip_steps > 0 else 1
-        _pip_rr = 1 + _pip_total_pnl / _pip_peak if _pip_peak > 0 else 1
-        _pip_cagr = (_pip_rr ** (1 / max(_pip_yrs, 0.01)) - 1) if _pip_rr > 0 else -1.0
+        # WaveRider leveraged
+        _wr_lev_m = _compute_strategy_metrics(
+            _wr_res.nav_leveraged, _spy_nav_full, "WaveRider T5 BearVol2x",
+            turnover_annual=len(_wr_res.rebalance_dates) / max(
+                (_wr_res.dates[-1] - _wr_res.dates[0]).days / 365.25, 0.01) * 5 * 2,
+        )
+        _all_strategy_rows.append(_wr_lev_m)
+        _all_strategy_navs["WaveRider T5 BearVol2x"] = _wr_res.nav_leveraged
 
-        # v8 CAGR
-        _v8_cagr = 0
-        if _has_v8 and _vc_results:
-            _v8_pnl = _vc_results.get('total_pnl', 0)
-            _v8_pk = sum(d.get('peak_notional', 0) for d in _vc_per_sym.values()) if _vc_per_sym else 0
-            _v8_st = max((d.get('step_count', 0) for d in _vc_per_sym.values()), default=0)
-            _v8_yr = _v8_st / 252 if _v8_st > 0 else 1
-            _v8_rr = 1 + _v8_pnl / _v8_pk if _v8_pk > 0 else 1
-            _v8_cagr = (_v8_rr ** (1 / max(_v8_yr, 0.01)) - 1) if _v8_rr > 0 else -1.0
-
-        # v9 CAGR
-        _v9_cagr = 0
-        if _has_v9_col and _xc_results:
-            _x9_pnl = _xc_results.get('total_pnl', 0)
-            _x9_pk = sum(d.get('peak_notional', 0) for d in _xc_per_sym.values()) if _xc_per_sym else 0
-            _x9_st = max((d.get('step_count', 0) for d in _xc_per_sym.values()), default=0)
-            _x9_yr = _x9_st / 252 if _x9_st > 0 else 1
-            _x9_rr = 1 + _x9_pnl / _x9_pk if _x9_pk > 0 else 1
-            _v9_cagr = (_x9_rr ** (1 / max(_x9_yr, 0.01)) - 1) if _x9_rr > 0 else -1.0
-
-        # Print unified table
-        print(f"\n    {'Strategy':<35s} {'CAGR':>8s} {'Sharpe':>7s} {'Sortino':>8s} {'MaxDD':>7s} {'Period':>12s}")
-        print(f"    {'─'*35} {'─'*8} {'─'*7} {'─'*8} {'─'*7} {'─'*12}")
-
-        # Pipeline strategies (short test period)
-        _pip_sh = pipeline_results.get('avg_sh', 0)
-        _pip_dd = pipeline_results.get('dd_max', 0)
-        print(f"    {'v3.0 (Base RL)':.<35s} {(base_results.get('total_pnl', 0) / max(_pip_peak, 1) / max(_pip_yrs, 0.01)):>+7.1%}  "
-              f"{base_results.get('avg_sh', 0):>7.2f} {'':>8s} {base_results.get('dd_max', 0):>6.1f}% "
-              f"{'~' + str(int(_pip_yrs)) + 'y test':>12s}") if _has_base else None
-        print(f"    {'v7.0 (Pipeline)':.<35s} {_pip_cagr:>+7.1%}  {_pip_sh:>7.2f} {'':>8s} {_pip_dd:>6.1f}% "
-              f"{'~' + str(int(_pip_yrs)) + 'y test':>12s}")
-        if _has_v8:
-            _v8_sh = _vc_results.get('avg_sh', 0)
-            _v8_dd = _vc_results.get('dd_max', 0)
-            print(f"    {'v8.0 (Stock Select)':.<35s} {_v8_cagr:>+7.1%}  {_v8_sh:>7.2f} {'':>8s} {_v8_dd:>6.1f}% "
-                  f"{'~' + str(int(_pip_yrs)) + 'y test':>12s}")
-        if _has_v9_col:
-            _x9_sh = _xc_results.get('avg_sh', 0)
-            _x9_dd = _xc_results.get('dd_max', 0)
-            print(f"    {'v9.0 (Full Stack)':.<35s} {_v9_cagr:>+7.1%}  {_x9_sh:>7.2f} {'':>8s} {_x9_dd:>6.1f}% "
-                  f"{'~' + str(int(_pip_yrs)) + 'y test':>12s}")
-
-        # Full-history strategies
-        print(f"    {'─'*35} {'─'*8} {'─'*7} {'─'*8} {'─'*7} {'─'*12}")
-        print(f"    {'WaveRider T5 BearVol2x':<35s} {_wr_m['cagr']:>+7.1%}  {_wr_m['sharpe']:>7.2f} "
-              f"{_wr_m['sortino']:>8.2f} {_wr_m['max_dd']*100:>6.1f}% {_wr_m['n_years']:>10.0f}y full")
-        print(f"    {'WaveRider T5 Unlevered':<35s} {_wr_u['cagr']:>+7.1%}  {_wr_u['sharpe']:>7.2f} "
-              f"{_wr_u['sortino']:>8.2f} {_wr_u['max_dd']*100:>6.1f}% {_wr_u['n_years']:>10.0f}y full")
-        if _letf_m:
-            print(f"    {'LETF 3x Sector Rotation':<35s} {_letf_m['cagr']:>+7.1%}  {_letf_m['sharpe']:>7.2f} "
-                  f"{_letf_m['sortino']:>8.2f} {_letf_m['max_dd']*100:>6.1f}% {_letf_m['n_years']:>10.0f}y full")
+        # WaveRider unleveraged
+        _wr_unl_m = _compute_strategy_metrics(
+            _wr_res.nav_unlevered, _spy_nav_full, "WaveRider T5 Unlevered",
+            turnover_annual=len(_wr_res.rebalance_dates) / max(
+                (_wr_res.dates[-1] - _wr_res.dates[0]).days / 365.25, 0.01) * 5 * 2,
+        )
+        _all_strategy_rows.append(_wr_unl_m)
+        _all_strategy_navs["WaveRider T5 Unlevered"] = _wr_res.nav_unlevered
 
         # SPY benchmark
-        _spy_cagr_f = ((float(_wr_spy.iloc[-1]) / float(_wr_spy.iloc[0])) ** (1 / _wr_m['n_years']) - 1)
-        _spy_nav_f = _wr_spy / _wr_spy.iloc[0]
-        _spy_r = _spy_nav_f.pct_change().dropna()
-        _spy_sh_f = float(_spy_r.mean() / _spy_r.std() * np.sqrt(252)) if _spy_r.std() > 0 else 0
-        _spy_dd_f = float((_spy_nav_f / _spy_nav_f.cummax() - 1).min() * 100)
-        print(f"    {'SPY Buy & Hold':<35s} {_spy_cagr_f:>+7.1%}  {_spy_sh_f:>7.2f} {'':>8s} {_spy_dd_f:>6.1f}% "
-              f"{_wr_m['n_years']:>10.0f}y full")
+        _spy_m = _compute_strategy_metrics(_spy_nav_full, None, "SPY Buy & Hold")
+        _all_strategy_rows.append(_spy_m)
+        _all_strategy_navs["SPY Buy & Hold"] = _spy_nav_full
 
-        tprint("Note: v3-v9 use short RL test windows; WaveRider/LETF use full 35-year backtests.", "info")
+        tprint(f"WaveRider: CAGR {_wr_lev_m['cagr']:+.1%}, Sharpe {_wr_lev_m['sharpe']:.2f} "
+               f"({_wr_lev_m['n_years']:.0f}y)", "ok")
     except Exception as _e:
-        tprint(f"Cross-strategy summary skipped: {_e}", "warn")
+        tprint(f"WaveRider comparison skipped: {_e}", "warn")
+        import traceback; traceback.print_exc()
+
+    # --- LETF rotation strategy ---
+    try:
+        from letf_rotation_backtest import run_all_strategies as _run_letf
+        _letf_all = _run_letf()
+        if _letf_all is not None and 'S5' in _letf_all:
+            _letf_s5 = _letf_all['S5']
+            _letf_eq = _letf_s5['equity']
+            _letf_met = _letf_s5['metrics']
+            _letf_spy_aligned = None
+            if _spy_nav_full is not None:
+                _sa = _spy_nav_full.reindex(_letf_eq.index).ffill()
+                if _sa is not None and len(_sa) > 10:
+                    _letf_spy_aligned = _sa / _sa.iloc[0]
+            _letf_m = _compute_strategy_metrics(
+                _letf_eq, _letf_spy_aligned, "LETF 3x ALR Rotation",
+                turnover_annual=_letf_met.get('turnover_annual', 0),
+            )
+            _all_strategy_rows.append(_letf_m)
+            _all_strategy_navs["LETF 3x ALR Rotation"] = _letf_eq
+            tprint(f"LETF ALR: CAGR {_letf_m['cagr']:+.1%}, Sharpe {_letf_m['sharpe']:.2f} "
+                   f"(2010+)", "ok")
+    except Exception as _e:
+        tprint(f"LETF comparison skipped: {_e}", "warn")
+
+    # --- Build unified table ---
+    if _all_strategy_rows:
+        # Sort by CAGR descending
+        _all_strategy_rows.sort(key=lambda x: x.get('cagr', 0), reverse=True)
+
+        if HAS_TABLE_FORMATTER:
+            _ctbl = TableFormatter(title="CROSS-STRATEGY COMPARISON")
+            _ctbl.add_column('Strategy', align='left')
+            _ctbl.add_column('CAGR', align='right')
+            _ctbl.add_column('Sharpe', align='right')
+            _ctbl.add_column('Sortino', align='right')
+            _ctbl.add_column('Calmar', align='right')
+            _ctbl.add_column('MaxDD', align='right')
+            _ctbl.add_column('Vol', align='right')
+            _ctbl.add_column('Alpha', align='right')
+            _ctbl.add_column('Period', align='left')
+
+            for _row in _all_strategy_rows:
+                _c = C.GREEN if _row['cagr'] > 0 else C.RED
+                _ac = C.GREEN if _row.get('alpha_vs_spy', 0) > 0 else (C.RED if _row.get('alpha_vs_spy', 0) < 0 else '')
+                _dc = C.RED if _row['max_dd'] < -0.20 else C.YELLOW if _row['max_dd'] < -0.10 else C.GREEN
+                _period = f"{_row['period_start'][:4]}-{_row['period_end'][:4]} ({_row['n_years']:.0f}y)"
+                _ctbl.add_row([
+                    _row['name'],
+                    f"{_c}{_row['cagr']:+.1%}{C.RESET}",
+                    f"{_row['sharpe']:.2f}",
+                    f"{_row['sortino']:.2f}",
+                    f"{_row['calmar']:.2f}",
+                    f"{_dc}{_row['max_dd']*100:.1f}%{C.RESET}",
+                    f"{_row['ann_vol']*100:.1f}%",
+                    f"{_ac}{_row.get('alpha_vs_spy', 0):+.1%}{C.RESET}" if _row['name'] != 'SPY Buy & Hold' else '-',
+                    _period,
+                ])
+            print(_ctbl.render())
+        else:
+            # Fallback: plain ASCII
+            _h = '\u2500'
+            print(f"\n    {'Strategy':<30s} {'CAGR':>8s} {'Sharpe':>7s} {'Sortino':>8s} {'Calmar':>7s} "
+                  f"{'MaxDD':>7s} {'Vol':>6s} {'Alpha':>8s} {'Period':>18s}")
+            print(f"    {_h*30} {_h*8} {_h*7} {_h*8} {_h*7} "
+                  f"{_h*7} {_h*6} {_h*8} {_h*18}")
+            for _row in _all_strategy_rows:
+                _alpha_str = f"{_row.get('alpha_vs_spy', 0):+.1%}" if _row['name'] != 'SPY Buy & Hold' else '   -'
+                print(f"    {_row['name']:<30s} {_row['cagr']:>+7.1%} {_row['sharpe']:>7.2f} "
+                      f"{_row['sortino']:>8.2f} {_row['calmar']:>7.2f} "
+                      f"{_row['max_dd']*100:>6.1f}% {_row['ann_vol']*100:>5.1f}% "
+                      f"{_alpha_str:>8s} "
+                      f"{_row['period_start'][:4]}-{_row['period_end'][:4]} ({_row['n_years']:.0f}y)")
+
+        tprint("Note: Pipeline strategies use short RL test windows; WaveRider/LETF use full historical backtests.", "info")
+    else:
+        tprint("No strategies available for cross-strategy comparison.", "warn")
+
+    # ── Year-by-Year Returns Breakdown ──
+    if _all_strategy_navs and len(_all_strategy_navs) >= 2:
+        try:
+            # Compute annual returns from NAV series
+            _yby_data = {}  # name -> {year -> annual_return_pct}
+            _all_years = set()
+            for _name, _nav in _all_strategy_navs.items():
+                if _nav is None or len(_nav) < 10:
+                    continue
+                # Resample to year-end, compute pct change
+                _yr_nav = _nav.resample('YE').last().dropna()
+                _yr_rets = _yr_nav.pct_change()
+                # First year: return from start to first year-end
+                if len(_yr_nav) > 0:
+                    _yr_rets.iloc[0] = _yr_nav.iloc[0] / 1.0 - 1.0  # NAV starts at 1.0
+                _yby_data[_name] = {}
+                for _dt, _ret in _yr_rets.items():
+                    if not pd.isna(_ret):
+                        _yr = _dt.year
+                        _yby_data[_name][_yr] = _ret * 100  # as percentage
+                        _all_years.add(_yr)
+
+            _all_years = sorted(_all_years)
+            # Select key strategies for the year-by-year table (max ~6 for readability)
+            _yby_names = []
+            _yby_short = {}
+            for _n in ["SPY Buy & Hold", "WaveRider T5 BearVol2x", "WaveRider T5 Unlevered",
+                        "LETF 3x ALR Rotation", "v9.0 (Full Stack)", "v8.0 (Stock Select)",
+                        "v7.0 (Pipeline)"]:
+                if _n in _yby_data:
+                    _yby_names.append(_n)
+                    # Short labels for table headers
+                    _short_map = {
+                        "SPY Buy & Hold": "SPY",
+                        "WaveRider T5 BearVol2x": "WR Lev",
+                        "WaveRider T5 Unlevered": "WR Unlev",
+                        "LETF 3x ALR Rotation": "LETF ALR",
+                        "v9.0 (Full Stack)": "v9.0",
+                        "v8.0 (Stock Select)": "v8.0",
+                        "v7.0 (Pipeline)": "v7.0",
+                    }
+                    _yby_short[_n] = _short_map.get(_n, _n[:10])
+
+            if _yby_names and _all_years:
+                if HAS_TABLE_FORMATTER:
+                    _ytbl = TableFormatter(title="YEAR-BY-YEAR RETURNS (%)")
+                    _ytbl.add_column('Year', align='center')
+                    for _n in _yby_names:
+                        _ytbl.add_column(_yby_short[_n], align='right')
+
+                    for _yr in _all_years:
+                        _row_vals = [str(_yr)]
+                        for _n in _yby_names:
+                            _val = _yby_data[_n].get(_yr)
+                            if _val is not None:
+                                _c = C.GREEN if _val > 0 else C.RED
+                                _row_vals.append(f"{_c}{_val:+.1f}%{C.RESET}")
+                            else:
+                                _row_vals.append("-")
+                        _ytbl.add_row(_row_vals)
+
+                    # Summary row: compound CAGR across each strategy's full period
+                    _sum_row = ['CAGR']
+                    for _n in _yby_names:
+                        _strat_row = [r for r in _all_strategy_rows if r['name'] == _n]
+                        if _strat_row:
+                            _cagr = _strat_row[0]['cagr']
+                            _c = C.GREEN if _cagr > 0 else C.RED
+                            _sum_row.append(f"{_c}{_cagr*100:+.1f}%{C.RESET}")
+                        else:
+                            _sum_row.append("-")
+                    _ytbl.add_row(_sum_row)
+                    print(_ytbl.render())
+                else:
+                    # Fallback ASCII
+                    _h = '\u2500'
+                    _hdr = f"  {'Year':<6s}" + "".join(f"  {_yby_short[n]:>10s}" for n in _yby_names)
+                    print(f"\n  YEAR-BY-YEAR RETURNS (%)")
+                    print(_hdr)
+                    print(f"  {_h*6}" + f"  {_h*10}" * len(_yby_names))
+                    for _yr in _all_years:
+                        _row = f"  {_yr:<6d}"
+                        for _n in _yby_names:
+                            _val = _yby_data[_n].get(_yr)
+                            _row += f"  {_val:+9.1f}%" if _val is not None else f"  {'N/A':>10s}"
+                        print(_row)
+        except Exception as _e:
+            tprint(f"Year-by-year breakdown failed: {_e}", "warn")
+
+    # ── Regime Analysis ──
+    if _all_strategy_navs and len(_all_strategy_navs) >= 2:
+        try:
+            _REGIMES = [
+                ("1990s Bull",      "1991-01-01", "2000-03-24"),
+                ("Dot-Com Bust",    "2000-03-24", "2002-10-09"),
+                ("Mid-2000s Bull",  "2002-10-09", "2007-10-09"),
+                ("GFC",             "2007-10-09", "2009-03-09"),
+                ("QE Bull",         "2009-03-09", "2020-02-19"),
+                ("COVID Crash",     "2020-02-19", "2020-03-23"),
+                ("Recovery + Hikes","2020-03-23", "2022-10-12"),
+                ("AI Cycle",        "2022-10-12", "2026-12-31"),
+            ]
+
+            def _regime_cagr(nav, start, end):
+                """Compute CAGR for a NAV slice within [start, end]."""
+                mask = (nav.index >= start) & (nav.index <= end)
+                slc = nav[mask]
+                if len(slc) < 10:
+                    return None
+                n_years = (slc.index[-1] - slc.index[0]).days / 365.25
+                if n_years < 0.1:
+                    return None
+                total_ret = slc.iloc[-1] / slc.iloc[0]
+                return total_ret ** (1 / n_years) - 1
+
+            # Build regime table for key strategies
+            _reg_names = [n for n in ["SPY Buy & Hold", "WaveRider T5 BearVol2x",
+                                       "WaveRider T5 Unlevered", "LETF 3x ALR Rotation",
+                                       "v9.0 (Full Stack)"]
+                          if n in _all_strategy_navs]
+            _reg_short = {
+                "SPY Buy & Hold": "SPY",
+                "WaveRider T5 BearVol2x": "WR Lev",
+                "WaveRider T5 Unlevered": "WR Unlev",
+                "LETF 3x ALR Rotation": "LETF ALR",
+                "v9.0 (Full Stack)": "v9.0",
+                "v8.0 (Stock Select)": "v8.0",
+                "v7.0 (Pipeline)": "v7.0",
+            }
+
+            if _reg_names and len(_reg_names) >= 2:
+                if HAS_TABLE_FORMATTER:
+                    _rtbl = TableFormatter(title="REGIME ANALYSIS (CAGR per regime)")
+                    _rtbl.add_column('Regime', align='left')
+                    _rtbl.add_column('Period', align='left')
+                    for _n in _reg_names:
+                        _rtbl.add_column(_reg_short.get(_n, _n[:10]), align='right')
+
+                    for _rname, _rstart, _rend in _REGIMES:
+                        _rr = [_rname, f"{_rstart[:4]}-{_rend[:4]}"]
+                        for _n in _reg_names:
+                            _nav = _all_strategy_navs[_n]
+                            _cagr = _regime_cagr(_nav, _rstart, _rend)
+                            if _cagr is not None:
+                                _c = C.GREEN if _cagr > 0 else C.RED
+                                _rr.append(f"{_c}{_cagr*100:+.1f}%{C.RESET}")
+                            else:
+                                _rr.append("-")
+                        _rtbl.add_row(_rr)
+                    print(_rtbl.render())
+                else:
+                    print(f"\n  REGIME ANALYSIS (CAGR per regime)")
+                    _h = '\u2500'
+                    _hdr = f"  {'Regime':<22s}{'Period':<12s}" + "".join(f"{_reg_short.get(n, n[:8]):>10s}" for n in _reg_names)
+                    print(_hdr)
+                    print(f"  {_h*22}{_h*12}" + f"{_h*10}" * len(_reg_names))
+                    for _rname, _rstart, _rend in _REGIMES:
+                        _row = f"  {_rname:<22s}{_rstart[:4]}-{_rend[:4]:<8s}"
+                        for _n in _reg_names:
+                            _cagr = _regime_cagr(_all_strategy_navs[_n], _rstart, _rend)
+                            _row += f"{_cagr*100:+9.1f}%" if _cagr is not None else f"{'N/A':>10s}"
+                        print(_row)
+        except Exception as _e:
+            tprint(f"Regime analysis failed: {_e}", "warn")
+
+    # ── PIT Universe Statistics (when --universe pit) ──
+    if _pit_universe is not None:
+        try:
+            from universe_builder import get_universe_stats, uid_to_ticker
+            _pit_rankings = getattr(args, '_pit_rankings', None)
+            if _pit_rankings is not None:
+                _ustats = get_universe_stats(_pit_rankings, top_n=_pit_universe.top_n)
+                if _ustats:
+                    print_subsection("PIT UNIVERSE STATISTICS")
+                    tprint(f"  Unique symbols ever in top-{_pit_universe.top_n}: "
+                           f"{_ustats['n_unique']}", "info")
+                    tprint(f"  History: {_ustats['first_date'].strftime('%Y-%m-%d')} to "
+                           f"{_ustats['last_date'].strftime('%Y-%m-%d')} "
+                           f"({_ustats['n_rebalances']} monthly rebalances)", "info")
+                    tprint(f"  Avg entries/year: {_ustats['avg_entries_per_year']:.0f}  "
+                           f"Avg exits/year: {_ustats['avg_exits_per_year']:.0f}", "info")
+                    tprint(f"  Annual membership turnover: {_ustats['turnover_rate']:.0%}", "info")
+        except Exception as _e:
+            tprint(f"PIT universe stats failed: {_e}", "warn")
 
     _complete_ver = "v9.0" if args.version == "v9" else "v8.0" if args.version == "v8" else "v7.0"
     _complete_score = v8_results['score'] if v8_results is not None else pipeline_results['score']

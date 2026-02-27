@@ -330,6 +330,77 @@ def uid_to_ticker(uid: str) -> str:
     return uid
 
 
+def get_full_universe_history(
+    rankings: pd.DataFrame,
+    top_n: int = 150,
+) -> dict:
+    """
+    Return dict mapping each rebalance date to its list of UIDs.
+
+    Useful for batch processing (year-by-year breakdown, regime analysis).
+
+    Returns:
+        dict[pd.Timestamp -> List[str]]
+    """
+    filtered = rankings[rankings["rank"] <= top_n]
+    result = {}
+    for dt in sorted(filtered["date"].unique()):
+        mask = filtered["date"] == dt
+        result[dt] = list(filtered.loc[mask, "uid"].values)
+    return result
+
+
+def get_universe_stats(rankings: pd.DataFrame, top_n: int = 150) -> dict:
+    """
+    Compute universe membership statistics.
+
+    Returns:
+        dict with keys: n_unique, n_entered_per_year, n_exited_per_year,
+        turnover_rate, first_date, last_date, n_rebalances.
+    """
+    filtered = rankings[rankings["rank"] <= top_n]
+    dates = sorted(filtered["date"].unique())
+    if len(dates) < 2:
+        return {}
+
+    # Build per-date sets
+    date_sets = {}
+    for dt in dates:
+        mask = filtered["date"] == dt
+        date_sets[dt] = set(filtered.loc[mask, "uid"].values)
+
+    # Count entries/exits per year
+    all_uids = set()
+    entries_per_year = {}
+    exits_per_year = {}
+    prev_set = set()
+    for dt in dates:
+        curr_set = date_sets[dt]
+        entered = curr_set - prev_set
+        exited = prev_set - curr_set
+        yr = dt.year
+        entries_per_year[yr] = entries_per_year.get(yr, 0) + len(entered)
+        exits_per_year[yr] = exits_per_year.get(yr, 0) + len(exited)
+        all_uids.update(curr_set)
+        prev_set = curr_set
+
+    years = sorted(set(entries_per_year.keys()) | set(exits_per_year.keys()))
+    avg_entries = np.mean([entries_per_year.get(y, 0) for y in years]) if years else 0
+    avg_exits = np.mean([exits_per_year.get(y, 0) for y in years]) if years else 0
+
+    return {
+        "n_unique": len(all_uids),
+        "n_rebalances": len(dates),
+        "first_date": dates[0],
+        "last_date": dates[-1],
+        "avg_entries_per_year": avg_entries,
+        "avg_exits_per_year": avg_exits,
+        "turnover_rate": (avg_entries + avg_exits) / (2 * top_n),
+        "entries_per_year": entries_per_year,
+        "exits_per_year": exits_per_year,
+    }
+
+
 if __name__ == "__main__":
     # Standalone test: build cache and print summary
     rankings, prices = build_universe_cache(force_rebuild=True)
