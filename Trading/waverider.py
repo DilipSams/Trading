@@ -29,6 +29,54 @@ CACHE_DIR = r"D:\Experiments\Trading\data_cache"
 
 RISK_FREE_TICKER = "%3MTCM"  # 3-month T-bill (annualized %)
 
+# ---------------------------------------------------------------------------
+# Sector classification (GICS-aligned, hand-curated for top-100 universe)
+# ---------------------------------------------------------------------------
+SECTOR_MAP = {
+    "Technology":    ["AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","AVGO","ORCL",
+                      "CRM","AMD","PLTR","ADBE","CSCO","ACN","IBM","NOW","TXN",
+                      "QCOM","KLAC","INTU","AMAT","LRCX","APH","ANET","PANW",
+                      "MU","INTC","ADI","NFLX","UBER","APP","CRWD","WDC","SNDK",
+                      "SNPS","CDNS","DELL","MSI","GLW","DASH","MRVL","NET",
+                      "FTNT","SNOW","MPWR","TSM","ASML","SAP","SHOP","SE","BIDU",
+                      "NTES","JD","BABA","PDD","MELI","IREN","RKLB","STX","LITE",
+                      "BE","SMCI","AXON","FSLR","COIN","EBAY","SOUN",
+                      # Historical/delisted tech
+                      "YHOO","AABA","JAVA","CPQ","NOVL","NXTL","DIGI","ASND",
+                      "SUNW","PALM","MOT","RIMM","BB","DNA","NOK","DELL",
+                      "EMC","TWC","SNPX","XYZ","TWX","USRX"],
+    "Financials":    ["JPM","V","MA","BAC","GS","MS","WFC","C","AXP","BLK",
+                      "SPGI","SCHW","CB","MMC","FI","BX","KKR","CME","ICE",
+                      "PYPL","COF","PGR","PNC","USB","IBKR","BK","MCO","APO",
+                      "HOOD","TRV","TFC","AFL","AJG","BRK-B",
+                      "FNMA","AIG","MER","LEH","BSC","WB","CFC","LM","AGE"],
+    "Healthcare":    ["LLY","UNH","JNJ","ABBV","MRK","TMO","ABT","ISRG","SYK",
+                      "VRTX","GILD","BSX","AMGN","PFE","REGN","CI","BMY","MCK",
+                      "DHR","CVS","HCA","ELV","COR","BDX","ZTS","MRNA","NVO",
+                      "SGP","WYE","AGN","MYL","CELG","BIIB","USHC"],
+    "Consumer Staples":       ["WMT","COST","PG","KO","PEP","PM","MCD","MDLZ",
+                               "EL","MO","MNST","CL","SAM","STZ","KHC","KR"],
+    "Consumer Discretionary": ["TSLA","HD","LOW","BKNG","TJX","SBUX","NKE",
+                               "DIS","MAR","RCL","ORLY","ABNB","GM","HLT","CVNA",
+                               "ROST","AZO","F","WBD","NIO","RIVN","LVS","WYNN",
+                               "MGM","CCL","EXPE","TRIP"],
+    "Industrials":   ["CAT","GE","RTX","DE","UNP","HON","BA","ADP","LMT","HWM",
+                      "NOC","UPS","GD","VRT","WM","FDX","MMM","ITW","EMR","PWR",
+                      "CMI","CTAS","TDG","NSC","CSX","RSG","PCAR","LHX","PH","URI",
+                      "DAL","UAL","AAL","LUV","JBLU"],
+    "Energy":        ["XOM","CVX","COP","WMB","EPD","SLB","KMI","EOG","ET",
+                      "PSX","VLO","BKR","MPLX","MPC","OXY","HAL","BP","TXU",
+                      "APC","DVN","PXD","FANG","MRO","APA"],
+    "Utilities":     ["NEE","SO","DUK","CEG","GEV","AEP","VST","SRE","D"],
+    "Materials":     ["LIN","APD","SCCO","NEM","FCX","SHW","ECL","GDX","GLD","SLV",
+                      "GOLD","NUE","CLF","VALE","AA","X","BAY"],
+    "Real Estate":   ["PLD","WELL","EQIX","AMT","SPG","DLR","O"],
+    "Telecom":       ["T","VZ","TMUS","CMCSA","SINA","LBTYA","CHTR"],
+}
+
+# Reverse lookup: symbol -> sector
+SYM_TO_SECTOR = {sym: sec for sec, syms in SECTOR_MAP.items() for sym in syms}
+
 
 # ---------------------------------------------------------------------------
 # Configuration

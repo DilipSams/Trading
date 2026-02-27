@@ -16,6 +16,7 @@ import pandas as pd
 from waverider import (
     WaveRiderStrategy, WaveRiderConfig, PortfolioSignal,
     load_universe, load_spy, clean_uid, compute_nav_metrics,
+    SECTOR_MAP, SYM_TO_SECTOR,
 )
 
 
@@ -340,6 +341,89 @@ def main():
         else:
             avg_strs.append("n/a")
     print(f"    {'Avg':<6s}  " + "  ".join(f"{s:>8s}" for s in avg_strs))
+
+    # ===================================================================
+    # Sector analysis — universe composition + historical performance
+    # ===================================================================
+    print(f"\n  SECTOR ANALYSIS (universe stocks by sector + historical holding performance):")
+
+    # 1. Map every UID ever held to its sector
+    def _sector(uid):
+        base = clean_uid(uid).rstrip("*")
+        return SYM_TO_SECTOR.get(base, "Other")
+
+    # 2. Compute per-holding returns between rebalance dates
+    from collections import defaultdict
+    sector_stats = defaultdict(lambda: {"hold_months": 0, "returns": [], "stocks": set(),
+                                         "current": []})
+
+    rdates = result.rebalance_dates
+    for idx in range(len(rdates)):
+        rd = rdates[idx]
+        next_rd = rdates[idx + 1] if idx + 1 < len(rdates) else result.dates[-1]
+        holdings = result.holdings_log.get(rd, [])
+
+        for uid in holdings:
+            sec = _sector(uid)
+            sym = clean_uid(uid)
+            sector_stats[sec]["hold_months"] += 1
+            sector_stats[sec]["stocks"].add(sym)
+
+            # Return from rd to next_rd
+            p0 = get_price_on_date(prices, uid, rd)
+            p1 = get_price_on_date(prices, uid, next_rd)
+            if p0 > 0 and p1 > 0:
+                sector_stats[sec]["returns"].append(p1 / p0 - 1)
+
+    # Mark current holdings
+    for uid in signal.holdings:
+        sec = _sector(uid)
+        sector_stats[sec]["current"].append(clean_uid(uid))
+
+    # 3. Current universe composition by sector
+    current_universe = set(prices.columns)  # all UIDs in the price matrix
+    sector_univ_count = defaultdict(int)
+    for uid in current_universe:
+        sec = _sector(uid)
+        sector_univ_count[sec] += 1
+
+    # 4. Print table sorted by total hold-months (most exposure first)
+    print(f"    {'Sector':<22s} {'Univ':>5s} {'Held':>5s} {'HoldMo':>7s} {'AvgMoRet':>9s} "
+          f"{'WinRate':>8s} {'BestMo':>8s} {'WorstMo':>9s}  Current Holdings")
+    print(f"    {'-' * 115}")
+
+    total_hold_months = 0
+    total_returns = []
+
+    for sec in sorted(sector_stats.keys(),
+                      key=lambda s: sector_stats[s]["hold_months"], reverse=True):
+        st = sector_stats[sec]
+        n_univ = sector_univ_count.get(sec, 0)
+        n_stocks = len(st["stocks"])
+        hm = st["hold_months"]
+        total_hold_months += hm
+        rets = st["returns"]
+        total_returns.extend(rets)
+
+        if rets:
+            avg_r = np.mean(rets) * 100
+            win = sum(1 for r in rets if r > 0) / len(rets) * 100
+            best = max(rets) * 100
+            worst = min(rets) * 100
+        else:
+            avg_r = win = best = worst = 0
+
+        cur = ", ".join(st["current"]) if st["current"] else ""
+        print(f"    {sec:<22s} {n_univ:>5d} {n_stocks:>5d} {hm:>7d} {avg_r:>+8.1f}% "
+              f"{win:>7.0f}% {best:>+7.1f}% {worst:>+8.1f}%  {cur}")
+
+    print(f"    {'-' * 115}")
+    if total_returns:
+        t_avg = np.mean(total_returns) * 100
+        t_win = sum(1 for r in total_returns if r > 0) / len(total_returns) * 100
+        print(f"    {'TOTAL':<22s} {sum(sector_univ_count.values()):>5d} "
+              f"{sum(len(sector_stats[s]['stocks']) for s in sector_stats):>5d} "
+              f"{total_hold_months:>7d} {t_avg:>+8.1f}% {t_win:>7.0f}%")
 
     # ===================================================================
     # Backtest model note

@@ -2675,6 +2675,7 @@ def _run_waverider_strategy(args):
     from waverider import (
         WaveRiderStrategy, WaveRiderConfig, load_universe, load_spy,
         load_risk_free, clean_uid, compute_nav_metrics,
+        SECTOR_MAP, SYM_TO_SECTOR,
     )
     import pandas as _pd
 
@@ -3054,6 +3055,64 @@ def _run_waverider_strategy(args):
         else:
             _avg_s.append("n/a")
     print(f"    {'Avg':<6s}  " + "  ".join(f"{s:>8s}" for s in _avg_s))
+
+    # ── 9. Sector analysis ────────────────────────────────────────────
+    print_section("SECTOR ANALYSIS")
+    from collections import defaultdict as _defaultdict
+
+    def _sector(uid):
+        base = clean_uid(uid).rstrip("*")
+        return SYM_TO_SECTOR.get(base, "Other")
+
+    _sec_stats = _defaultdict(lambda: {"hold_months": 0, "returns": [], "stocks": set(),
+                                        "current": []})
+    _rdates = result.rebalance_dates
+    for _idx in range(len(_rdates)):
+        _rd = _rdates[_idx]
+        _nrd = _rdates[_idx + 1] if _idx + 1 < len(_rdates) else dates[-1]
+        for _uid in result.holdings_log.get(_rd, []):
+            _sec = _sector(_uid)
+            _sec_stats[_sec]["hold_months"] += 1
+            _sec_stats[_sec]["stocks"].add(clean_uid(_uid))
+            _p0 = prices[_uid].asof(_rd) if _uid in prices.columns else 0
+            _p1 = prices[_uid].asof(_nrd) if _uid in prices.columns else 0
+            if _pd.notna(_p0) and _pd.notna(_p1) and _p0 > 0 and _p1 > 0:
+                _sec_stats[_sec]["returns"].append(float(_p1) / float(_p0) - 1)
+
+    for _uid in signal.holdings:
+        _sec_stats[_sector(_uid)]["current"].append(clean_uid(_uid))
+
+    _sec_univ = _defaultdict(int)
+    for _uid in prices.columns:
+        _sec_univ[_sector(_uid)] += 1
+
+    print(f"\n    {'Sector':<22s} {'Univ':>5s} {'Held':>5s} {'HoldMo':>7s} {'AvgMoRet':>9s} "
+          f"{'WinRate':>8s} {'BestMo':>8s} {'WorstMo':>9s}  Current")
+    print(f"    {'─' * 105}")
+
+    _total_hm = 0
+    _total_rets = []
+    for _sec in sorted(_sec_stats.keys(),
+                       key=lambda s: _sec_stats[s]["hold_months"], reverse=True):
+        _st = _sec_stats[_sec]
+        _hm = _st["hold_months"]
+        _total_hm += _hm
+        _rets = _st["returns"]
+        _total_rets.extend(_rets)
+        _ar = np.mean(_rets) * 100 if _rets else 0
+        _wr = sum(1 for r in _rets if r > 0) / len(_rets) * 100 if _rets else 0
+        _br = max(_rets) * 100 if _rets else 0
+        _wor = min(_rets) * 100 if _rets else 0
+        _cur = ", ".join(_st["current"]) if _st["current"] else ""
+        print(f"    {_sec:<22s} {_sec_univ.get(_sec, 0):>5d} {len(_st['stocks']):>5d} "
+              f"{_hm:>7d} {_ar:>+8.1f}% {_wr:>7.0f}% {_br:>+7.1f}% {_wor:>+8.1f}%  {_cur}")
+
+    print(f"    {'─' * 105}")
+    if _total_rets:
+        print(f"    {'TOTAL':<22s} {sum(_sec_univ.values()):>5d} "
+              f"{sum(len(_sec_stats[s]['stocks']) for s in _sec_stats):>5d} "
+              f"{_total_hm:>7d} {np.mean(_total_rets)*100:>+8.1f}% "
+              f"{sum(1 for r in _total_rets if r > 0)/len(_total_rets)*100:>7.0f}%")
 
     # ── Done ────────────────────────────────────────────────────────────
     print_box(
