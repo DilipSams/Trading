@@ -41,7 +41,8 @@ class WaveRiderConfig:
     top_n: int = 5
     exit_band_mult: float = 2.5
     transaction_cost_bps: int = 10
-    rebalance_freq: int = 21  # trading days
+    rebalance_freq: int = 21  # trading days (ignored when rebalance_eom=True)
+    rebalance_eom: bool = False  # if True, rebalance on last trading day of month
 
     # --- Momentum signal ---
     weight_12m: float = 0.40
@@ -463,12 +464,25 @@ class WaveRiderStrategy:
         filtered_log: Dict[pd.Timestamp, List[str]] = {}
         trades_log: Dict[pd.Timestamp, int] = {}
 
+        # Pre-compute EOM rebalance set if needed
+        if c.rebalance_eom:
+            _eom_set = set()
+            for _d in dates:
+                _eom_set.add(_d)          # keep updating — last one per month wins
+            # Actually need last trading day per (year, month)
+            _eom_set = set()
+            _by_month: Dict[tuple, pd.Timestamp] = {}
+            for _d in dates:
+                _by_month[(_d.year, _d.month)] = _d  # overwrites, so last day wins
+            _eom_set = set(_by_month.values())
+
         for i, date in enumerate(dates):
             if i == 0:
                 nav_vals.append(1.0)
                 continue
 
-            if i % c.rebalance_freq == 0:
+            is_rebal = (date in _eom_set) if c.rebalance_eom else (i % c.rebalance_freq == 0)
+            if is_rebal:
                 portfolio, filtered_out = self.select_portfolio(
                     date, composite, meme_scores, current_holdings
                 )
@@ -489,7 +503,7 @@ class WaveRiderStrategy:
                 trades_log[date] = len(buys) + len(sells)
 
             day_ret = (current_weights * daily_rets.loc[date]).sum()
-            if i % c.rebalance_freq == 0:
+            if is_rebal:
                 day_ret -= c.transaction_cost_bps / 10000
             nav_val *= 1 + day_ret
             nav_vals.append(nav_val)
