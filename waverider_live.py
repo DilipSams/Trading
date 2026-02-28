@@ -235,7 +235,7 @@ def main():
         return f"{val:>+{width-1}.1f}%"
 
     print(f"\n  PERFORMANCE COMPARISON:")
-    print(f"    {'Period':<8s} {'WR 2x':>9s} {'WR 1x':>9s} {'SPY':>9s} {'vs SPY':>9s}  "
+    print(f"    {'Period':<8s} {'WR 2x':>9s} {'WR 1x':>9s} {'SPY':>9s} {'Alpha':>9s}  "
           f"{'CAGR 2x':>8s} {'Sharpe':>7s} {'Sortino':>8s} {'MaxDD':>7s} {'AvgLev':>7s}")
     print(f"    {'-' * 98}")
 
