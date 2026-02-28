@@ -251,7 +251,7 @@ class WaveRiderStrategy:
         risk_adj = blended / (vol_63d + c.vol_adj_floor)
 
         sma200 = prices.rolling(200).mean()
-        trend_ok = (prices > sma200).shift(1).fillna(False).infer_objects(copy=False)
+        trend_ok = (prices > sma200).astype("boolean").shift(1).fillna(False).astype(bool)
 
         composite = risk_adj.copy()
         composite[~trend_ok] = np.nan
@@ -596,7 +596,7 @@ class WaveRiderStrategy:
 
         spy_aligned = spy_price.reindex(dates).ffill()
         spy_sma = spy_aligned.rolling(c.bear_sma).mean()
-        bear_signal = (spy_aligned > spy_sma).shift(1).fillna(True).infer_objects(copy=False)
+        bear_signal = (spy_aligned > spy_sma).astype("boolean").shift(1).fillna(True).astype(bool)
 
         unlev_rets = nav_unlevered.pct_change().fillna(0)
         realized_vol = unlev_rets.rolling(c.vol_lookback, min_periods=5).std() * np.sqrt(252)
