@@ -1,0 +1,31 @@
+# Alpha-Trade Project Requirements
+# Python 3.11.x recommended
+#
+# INSTALL ORDER:
+#   1. pip install -r requirements.txt
+#   2. For GPU (CUDA 12.x):  pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   3. For CPU only:          pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# NOTE: torch is NOT listed here so you can choose GPU vs CPU variant above.
+
+# Core numerics
+numpy>=1.26,<3.0
+pandas>=2.1,<3.0
+scipy>=1.11
+
+# Data I/O
+pyarrow>=14.0          # Parquet reading/writing (Norgate exports)
+requests>=2.31
+yfinance>=0.2.36       # Fallback market data
+
+# Norgate API (Windows only — requires Norgate Data software installed)
+# Install manually if you have a Norgate subscription:
+#   pip install norgatedata
+# norgatedata
+
+# Utilities (all stdlib — no extra install needed):
+#   argparse, collections, concurrent.futures, contextlib, copy,
+#   csv, dataclasses, datetime, enum, hashlib, io, json, logging,
+#   math, multiprocessing, os, pathlib, pickle, platform, re,
+#   signal, shutil, subprocess, sys, tempfile, threading, time,
+#   traceback, typing, uuid, warnings
