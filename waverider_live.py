@@ -146,11 +146,11 @@ def main():
         print(f"    {i:<3d} {sym:<7s} ${price:>8.2f} {shares:>6d}   ${alloc:>8,.0f}  "
               f"{ed_str:>10s} {ep_str:>8s} {since_entry:>7s}  {ms:>7.0f}   {cls}")
 
+    _price_cache = {s: get_current_price(prices, uid_map.get(s, s)) for s in signal.holdings_clean}
     cash_remainder = effective_capital - sum(
-        math.floor(per_stock / get_current_price(prices, uid_map.get(s, s))) *
-        get_current_price(prices, uid_map.get(s, s))
+        math.floor(per_stock / _price_cache[s]) * _price_cache[s]
         for s in signal.holdings_clean
-        if get_current_price(prices, uid_map.get(s, s)) > 0
+        if _price_cache[s] > 0
     )
     print(f"    {'':3s} {'CASH':<7s} {'':>9s} {'':>7s}   ${cash_remainder:>8,.0f}")
     print(f"    {'-' * 104}")
@@ -209,10 +209,14 @@ def main():
 
     # Define periods: (label, start_date)
     periods = []
-    # YTD
+    # YTD: base = last trading day of prior year so the first day of the year is included.
+    prior_year_dates = result.dates[result.dates.year == end_date.year - 1]
     ytd_start_dates = result.dates[result.dates.year == end_date.year]
-    if len(ytd_start_dates) > 5:
-        periods.append(("YTD", ytd_start_dates[0]))
+    if len(ytd_start_dates) > 0:
+        if len(prior_year_dates) > 0:
+            periods.append(("YTD", prior_year_dates[-1]))
+        else:
+            periods.append(("YTD", ytd_start_dates[0]))
     # 1Y, 3Y, 5Y, 10Y, 15Y, 20Y
     for yrs in [1, 3, 5, 10, 15, 20]:
         cutoff = end_date - pd.DateOffset(years=yrs)
@@ -250,7 +254,7 @@ def main():
         ret_u = (nav_u.loc[p_dates[-1]] / nav_u.loc[p_dates[0]] - 1) * 100
 
         # SPY return
-        spy_aligned = spy_price.reindex(p_dates).ffill().bfill().dropna()
+        spy_aligned = spy_price.reindex(p_dates).ffill().dropna()
         spy_ret = (spy_aligned.iloc[-1] / spy_aligned.iloc[0] - 1) * 100 if len(spy_aligned) > 5 and spy_aligned.iloc[0] > 0 else np.nan
         vs_spy = ret_l - spy_ret if not np.isnan(spy_ret) else np.nan
 
@@ -260,10 +264,13 @@ def main():
         p_years = (p_dates[-1] - p_dates[0]).days / 365.25
         p_cagr = (sub_nav_norm.iloc[-1] ** (1 / p_years) - 1) * 100 if p_years > 0.1 else ret_l
 
-        daily_r = sub_nav_norm.pct_change().dropna()
+        daily_r = sub_nav_norm.pct_change(fill_method=None).dropna()
         p_sharpe = daily_r.mean() / daily_r.std() * np.sqrt(252) if daily_r.std() > 0 else 0
-        down = daily_r[daily_r < 0]
-        p_sortino = daily_r.mean() * 252 / (down.std() * np.sqrt(252)) if len(down) > 0 and down.std() > 0 else 0
+        # Sortino: downside deviation uses ALL trading days (floor negative returns at 0)
+        # This gives the correct denominator per the standard Sortino formula.
+        downside_sq = np.minimum(daily_r.values, 0.0) ** 2
+        downside_dev = np.sqrt(downside_sq.mean() * 252)
+        p_sortino = (daily_r.mean() * 252) / downside_dev if downside_dev > 0 else 0
         p_maxdd = (sub_nav_norm / sub_nav_norm.cummax() - 1).min() * 100
 
         avg_lev = result.leverage_series.loc[p_dates].mean()

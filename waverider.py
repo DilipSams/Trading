@@ -769,10 +769,12 @@ def compute_nav_metrics(nav: pd.Series, label: str = "") -> Dict:
             "n_years": n_years,
         }
     cagr = final_ratio ** (1 / n_years) - 1
-    daily_r = nav.pct_change().dropna()
+    daily_r = nav.pct_change(fill_method=None).dropna()
     sharpe = (daily_r.mean() / daily_r.std() * np.sqrt(252)) if daily_r.std() > 0 else 0
-    down = daily_r[daily_r < 0].std() * np.sqrt(252)
-    sortino = (daily_r.mean() * 252 / down) if down > 0 else 0
+    # Sortino: downside deviation computed over ALL trading days (floor at 0), not just negative days
+    downside_sq = np.minimum(daily_r.values, 0.0) ** 2
+    downside_dev = np.sqrt(downside_sq.mean() * 252)
+    sortino = (daily_r.mean() * 252 / downside_dev) if downside_dev > 0 else 0
     max_dd = (nav / nav.cummax() - 1).min()
     total_ret = nav.iloc[-1] / nav.iloc[0] - 1
     return {
