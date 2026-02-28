@@ -355,12 +355,13 @@ class WaveRiderStrategy:
                 mask = (prices.index >= rdate) & (prices.index < end)
             else:
                 mask = prices.index >= rdate
-            for uid, months in snap.items():
-                if uid in col_set:
-                    if months <= 2:
-                        f6.loc[mask, uid] = 15
-                    elif months <= 5:
-                        f6.loc[mask, uid] = 8
+            # Batch by tier — one .loc call per tier instead of one per uid
+            low_t = [uid for uid, m in snap.items() if uid in col_set and m <= 2]
+            mid_t = [uid for uid, m in snap.items() if uid in col_set and 3 <= m <= 5]
+            if low_t:
+                f6.loc[mask, low_t] = 15
+            if mid_t:
+                f6.loc[mask, mid_t] = 8
         return f6
 
     # ------------------------------------------------------------------
@@ -385,8 +386,9 @@ class WaveRiderStrategy:
                 period = (mask.index >= rdate) & (mask.index < rank_dates[i + 1])
             else:
                 period = mask.index >= rdate
-            for uid in top:
-                mask.loc[period, uid] = 1
+            # Batch assign — one .loc call for all UIDs in this period
+            if top:
+                mask.loc[period, list(top)] = 1
         return mask
 
     # ------------------------------------------------------------------
@@ -607,26 +609,37 @@ class WaveRiderStrategy:
 
         borrow_rate = rf_daily + c.margin_spread_bps / 10000 / 252
 
-        n = len(dates)
-        nav_lev = np.ones(n, dtype=np.float64)
-        lev_arr = np.full(n, c.target_leverage, dtype=np.float64)
+        # --- Fully vectorized leverage + NAV computation ---
+        rv_arr = realized_vol.values
+        bear_arr = bear_signal.values        # True = bull (no cap), False = bear (cap)
+        unlev_arr = unlev_rets.values
+        borrow_arr = borrow_rate.values
 
-        for i in range(1, n):
-            rv = realized_vol.iloc[i]
-            vol_lev = (c.target_vol / rv * c.target_leverage) if rv > 0.01 else c.target_leverage
-            lev = min(c.target_leverage, vol_lev)
+        # Vol-targeting leverage (avoid division warnings where rv ≈ 0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vol_lev = np.where(
+                rv_arr > 0.01,
+                c.target_vol / rv_arr * c.target_leverage,
+                c.target_leverage,
+            )
+        lev = np.minimum(c.target_leverage, vol_lev)
 
-            if not bear_signal.iloc[i]:
-                lev = min(lev, c.bear_leverage)
+        # Bear gate: cap at bear_leverage when NOT in bull market
+        lev = np.where(~bear_arr, np.minimum(lev, c.bear_leverage), lev)
 
-            lev = max(c.min_leverage, min(lev, c.max_leverage))
-            lev_arr[i] = lev
+        # Hard clamp
+        lev = np.clip(lev, c.min_leverage, c.max_leverage)
+        lev[0] = c.target_leverage  # day-0 sentinel
 
-            borrow = max(lev - 1, 0) * borrow_rate.iloc[i]
-            day_ret = lev * unlev_rets.iloc[i] - borrow
-            nav_lev[i] = nav_lev[i - 1] * (1 + day_ret)
+        # Daily levered return (borrow cost on excess margin only)
+        borrow = np.maximum(lev - 1.0, 0.0) * borrow_arr
+        day_ret = lev * unlev_arr - borrow
+        day_ret[0] = 0.0  # no return on first day
 
-        return pd.Series(nav_lev, index=dates), pd.Series(lev_arr, index=dates)
+        # Compound NAV
+        nav_lev = np.cumprod(1.0 + day_ret)
+
+        return pd.Series(nav_lev, index=dates), pd.Series(lev, index=dates)
 
     # ------------------------------------------------------------------
     # Current portfolio signal (for live trading)
