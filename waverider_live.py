@@ -294,7 +294,7 @@ def main():
     for h in capture_horizons:
         trading_days = h * 252
         if len(prices) > trading_days:
-            ret_by_horizon[h] = prices.pct_change(trading_days)
+            ret_by_horizon[h] = prices.pct_change(trading_days, fill_method=None)
 
     # Show for each year that has enough data
     snap_years = sorted(set(d.year for d in result.dates))

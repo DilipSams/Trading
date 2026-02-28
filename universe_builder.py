@@ -37,6 +37,12 @@ UNIVERSE_EXCLUDE = {
     # Leveraged ETFs
     "TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SDS", "QLD", "SSO",
     "TECL", "ERX", "FAS", "FAZ", "LABU", "LABD", "SOXL", "SOXS",
+    # Commodity / thematic ETFs that slipped through
+    "GDX", "GDXJ", "SIL", "SILJ",                      # gold/silver miners
+    "EWY", "EWZ", "EWJ", "EWC", "EWT", "EWA", "EWG",   # country ETFs
+    "FXI", "KWEB", "CQQQ", "ASHR",                      # China ETFs
+    "ARKK", "ARKG", "ARKW", "ARKF", "ARKQ",             # ARK ETFs
+    "XOP", "OIH", "KRE", "KBE", "SMH", "IBB",           # sector ETFs (missed)
 }
 
 # Compiled exclude pattern for non-equity instruments

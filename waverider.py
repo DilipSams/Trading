@@ -70,7 +70,7 @@ SECTOR_MAP = {
                       "PSX","VLO","BKR","MPLX","MPC","OXY","HAL","BP","TXU",
                       "APC","DVN","PXD","FANG","MRO","APA"],
     "Utilities":     ["NEE","SO","DUK","CEG","GEV","AEP","VST","SRE","D"],
-    "Materials":     ["LIN","APD","SCCO","NEM","FCX","SHW","ECL","GDX","GLD","SLV",
+    "Materials":     ["LIN","APD","SCCO","NEM","FCX","SHW","ECL",
                       "GOLD","NUE","CLF","VALE","AA","X","BAY"],
     "Real Estate":   ["PLD","WELL","EQIX","AMT","SPG","DLR","O"],
     "Telecom":       ["T","VZ","TMUS","CMCSA","SINA","LBTYA","CHTR"],
