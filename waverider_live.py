@@ -435,6 +435,16 @@ def main():
     # ===================================================================
     # Backtest model note
     # ===================================================================
+    print(f"\n  COLUMN LEGEND:")
+    print(f"    WR 2x   = WaveRider with BearVol2x leverage overlay (live strategy)")
+    print(f"    WR 1x   = WaveRider unlevered (momentum signal only, no leverage)")
+    print(f"    SPY     = S&P 500 ETF buy-and-hold benchmark")
+    print(f"    Alpha   = WR 2x total return minus SPY total return (excess return vs benchmark)")
+    print(f"    CAGR 2x = Compound Annual Growth Rate of WR 2x for the period")
+    print(f"    Sharpe  = Risk-adjusted return (annualised mean / std, 0% risk-free rate)")
+    print(f"    Sortino = Downside risk-adjusted return (penalises only negative volatility)")
+    print(f"    MaxDD   = Maximum peak-to-trough drawdown of WR 2x")
+    print(f"    AvgLev  = Average daily leverage applied by BearVol2x overlay")
     print(f"\n  NOTE: Backtest uses fixed-dollar equal-weight allocation.")
     print(f"  Each month, all {cfg.top_n} positions rebalanced to equal $ amounts.")
     print(f"  CAGR reflects compounded percentage returns, not a specific $ amount.")
