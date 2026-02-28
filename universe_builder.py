@@ -10,6 +10,10 @@ runs load from parquet cache in <1s.
 
 Parallelism: ThreadPoolExecutor saturates all I/O cores for file loading.
 Falls back to directory scan when _catalog.parquet is absent.
+
+Performance: rolling mean is computed per-stock during load (parallel),
+producing a precomputed monthly matrix. Step 3 rankings then become a
+vectorized matrix slice + nlargest — no inner Python loop over stocks.
 """
 
 import os
@@ -203,61 +207,82 @@ def _parse_catalog(norgate_root: str) -> pd.DataFrame:
     return cat
 
 
-def _preload_turnover_parallel(catalog: pd.DataFrame) -> dict:
+def _preload_and_resample_turnover(catalog: pd.DataFrame) -> pd.DataFrame:
     """
-    Pre-load all Turnover series from catalog in parallel.
+    Load all Turnover series in parallel, compute trailing 63-day rolling
+    mean per stock, and resample to month-ends.
 
-    Returns dict: uid -> pd.Series (empty Series if unavailable).
-    Loading everything upfront eliminates per-month lazy I/O in the
-    ranking loop and reduces total wall-clock time by 4-8×.
+    Returns a wide DataFrame: index=month-end dates, columns=uid,
+    values=trailing 63-day average turnover as of each month-end.
+
+    This replaces the old _preload_turnover_parallel() and eliminates
+    the per-stock inner loop in _compute_monthly_rankings() entirely.
     """
     uids = catalog["uid"].tolist()
     fpaths = catalog["filepath"].tolist()
     n = len(uids)
 
-    print(f"    Pre-loading {n} Turnover series ({_IO_WORKERS} workers)...", end="\r")
+    print(f"    Loading & rolling {n} Turnover series ({_IO_WORKERS} workers)...", end="\r")
     t0 = time.time()
 
-    def _load_one(args: Tuple[str, str]) -> Tuple[str, pd.Series]:
+    def _load_and_resample(args: Tuple[str, str]) -> Tuple[str, Optional[pd.Series]]:
         uid, fpath = args
         if not os.path.exists(fpath):
-            return uid, pd.Series(dtype=float)
+            return uid, None
         try:
             df = pd.read_parquet(fpath, columns=["Turnover"])
             df.index = pd.to_datetime(df.index)
-            return uid, df["Turnover"]
+            ts = df["Turnover"].sort_index()
+            if len(ts) < 21:
+                return uid, None
+            # 63-day trailing mean (min 21 days = 1 month of data)
+            # then take the last value of each calendar month
+            ts_roll = ts.rolling(63, min_periods=21).mean()
+            ts_me = ts_roll.resample("ME").last()
+            ts_me = ts_me[ts_me > 0].dropna()
+            if ts_me.empty:
+                return uid, None
+            return uid, ts_me
         except Exception:
-            return uid, pd.Series(dtype=float)
+            return uid, None
 
-    cache: dict = {}
+    monthly_series: dict = {}
     n_loaded = 0
     with ThreadPoolExecutor(max_workers=_IO_WORKERS) as ex:
-        for i, (uid, ts) in enumerate(ex.map(_load_one, zip(uids, fpaths)), 1):
+        for i, (uid, ts_me) in enumerate(ex.map(_load_and_resample, zip(uids, fpaths)), 1):
             if i % 2000 == 0:
-                print(f"    Pre-loaded {i}/{n} Turnover series...", end="\r")
-            cache[uid] = ts
-            if len(ts) > 0:
+                print(f"    Loaded {i}/{n} Turnover series...", end="\r")
+            if ts_me is not None:
+                monthly_series[uid] = ts_me
                 n_loaded += 1
 
     elapsed = time.time() - t0
-    print(f"    Pre-loaded {n_loaded}/{n} Turnover series in {elapsed:.1f}s       ")
-    return cache
+    print(f"    Loaded {n_loaded}/{n} Turnover series in {elapsed:.1f}s       ")
+
+    # Build the monthly wide matrix: index=ME dates, columns=uid
+    # pd.DataFrame aligns series on their indices automatically (NaN where absent)
+    print(f"    Building monthly turnover matrix ({n_loaded} stocks)...", end="\r")
+    t1 = time.time()
+    monthly_matrix = pd.DataFrame(monthly_series).sort_index()
+    print(f"    Matrix: {monthly_matrix.shape[0]} months × {monthly_matrix.shape[1]} stocks "
+          f"in {time.time() - t1:.1f}s")
+
+    return monthly_matrix
 
 
 def _compute_monthly_rankings(
     catalog: pd.DataFrame,
     top_n: int = 150,
     start_date: str = "1990-01-01",
-    turnover_cache: Optional[dict] = None,
+    monthly_matrix: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     For each month-end, rank all alive stocks by trailing 63-day average
     Turnover. Return top-N rankings.
 
-    If turnover_cache is provided (pre-loaded via _preload_turnover_parallel),
-    skips all lazy file I/O during the per-month loop.
+    When monthly_matrix is provided (precomputed by _preload_and_resample_turnover),
+    each month is a single vectorized matrix slice + nlargest — no inner loop.
     """
-    # Generate month-end dates
     today = pd.Timestamp.now().normalize()
     month_ends = pd.date_range(start_date, today, freq="ME")
     if len(month_ends) == 0:
@@ -268,108 +293,163 @@ def _compute_monthly_rankings(
     cat_last = catalog["last_date"].values.astype("datetime64[ns]")
     cat_uids = catalog["uid"].values
     cat_bases = catalog["base_symbol"].values
-    cat_paths = catalog["filepath"].values
-    n_stocks = len(catalog)
+    uid_to_base = dict(zip(cat_uids, cat_bases))
 
-    # Use provided cache or start fresh for lazy-load fallback
-    if turnover_cache is None:
-        turnover_cache = {}
-        lazy_load = True
-    else:
-        lazy_load = False
-
-    _n_turnover_errs = [0]
     all_records: List[dict] = []
     total_months = len(month_ends)
     t0 = time.time()
 
-    for mi, me in enumerate(month_ends):
-        if mi % 24 == 0:
-            elapsed = time.time() - t0
-            pct = mi / total_months * 100
-            print(
-                f"    Building rankings: {mi}/{total_months} months ({pct:.0f}%), "
-                f"{elapsed:.0f}s elapsed",
-                end="\r",
-            )
+    if monthly_matrix is not None:
+        # ---------------------------------------------------------------
+        # Fast path: vectorized per-month slice of precomputed matrix
+        # ---------------------------------------------------------------
+        # Reindex to our exact month-end grid (no forward-fill so we don't
+        # carry stale values forward for delisted stocks)
+        mat = monthly_matrix.reindex(month_ends)
+        mat_uids = np.array(mat.columns)
 
-        me_np = np.datetime64(me)
-        # 63 trading days ≈ 90 calendar days lookback
-        lookback_start = me_np - np.timedelta64(90, "D")
+        # Pre-build numpy arrays for matrix lookup speed
+        mat_values = mat.values  # shape (n_months, n_stocks)
 
-        # Alive stocks: first_date <= me AND last_date >= lookback_start
-        alive_mask = (cat_first <= me_np) & (cat_last >= lookback_start)
-        alive_idx = np.where(alive_mask)[0]
+        # Build uid -> column index for fast alive-uid filtering
+        uid_to_col = {uid: i for i, uid in enumerate(mat.columns)}
 
-        turnover_vals: List[float] = []
-        alive_uids_for_month: List[str] = []
-        alive_bases_for_month: List[str] = []
+        for mi, me in enumerate(month_ends):
+            if mi % 48 == 0:
+                elapsed = time.time() - t0
+                pct = mi / total_months * 100
+                print(
+                    f"    Building rankings: {mi}/{total_months} months ({pct:.0f}%), "
+                    f"{elapsed:.1f}s elapsed",
+                    end="\r",
+                )
 
-        for idx in alive_idx:
-            uid = cat_uids[idx]
-            base = cat_bases[idx]
+            me_np = np.datetime64(me)
+            lookback_start = me_np - np.timedelta64(90, "D")
 
-            # Lazy-load fallback (only when no pre-loaded cache)
-            if lazy_load and uid not in turnover_cache:
-                fpath = cat_paths[idx]
-                if os.path.exists(fpath):
-                    try:
-                        df = pd.read_parquet(fpath, columns=["Turnover"])
-                        df.index = pd.to_datetime(df.index)
-                        turnover_cache[uid] = df["Turnover"]
-                    except Exception as e:
-                        if _n_turnover_errs[0] < 5:
-                            print(f"\n    WARNING: {uid}: {type(e).__name__}: {e}")
-                        _n_turnover_errs[0] += 1
-                        turnover_cache[uid] = pd.Series(dtype=float)
-                else:
-                    turnover_cache[uid] = pd.Series(dtype=float)
+            # Alive stocks at this month-end
+            alive_mask = (cat_first <= me_np) & (cat_last >= lookback_start)
+            alive_uids = cat_uids[alive_mask]
 
-            ts = turnover_cache.get(uid)
-            if ts is None or len(ts) == 0:
+            # Get column indices for alive stocks that exist in matrix
+            alive_cols = [uid_to_col[u] for u in alive_uids if u in uid_to_col]
+            if not alive_cols:
                 continue
 
-            # Trailing 63 trading days up to me
-            mask = ts.index <= me
-            recent = ts[mask].iloc[-63:] if mask.any() else pd.Series(dtype=float)
+            # Slice the precomputed row for this month
+            row_vals = mat_values[mi, alive_cols]
+            alive_cols_arr = np.array(alive_cols)
 
-            if len(recent) >= 21:  # need at least 1 month of data
-                avg_to = recent.mean()
-                if avg_to > 0 and not np.isnan(avg_to):
-                    turnover_vals.append(avg_to)
-                    alive_uids_for_month.append(uid)
-                    alive_bases_for_month.append(base)
+            # Filter out NaN and zero
+            valid = np.isfinite(row_vals) & (row_vals > 0)
+            if not valid.any():
+                continue
 
-        # Rank by turnover, take top-N
-        if turnover_vals:
-            arr = np.array(turnover_vals)
-            top_idx = np.argsort(arr)[::-1][:top_n]
+            row_vals = row_vals[valid]
+            alive_cols_arr = alive_cols_arr[valid]
+
+            # Rank: argsort descending, take top-N
+            if len(row_vals) > top_n:
+                top_idx = np.argpartition(row_vals, -top_n)[-top_n:]
+                top_idx = top_idx[np.argsort(row_vals[top_idx])[::-1]]
+            else:
+                top_idx = np.argsort(row_vals)[::-1]
+
             for rank, ti in enumerate(top_idx, 1):
+                uid = mat_uids[alive_cols_arr[ti]]
                 all_records.append(
                     {
                         "date": me,
                         "rank": rank,
-                        "uid": alive_uids_for_month[ti],
-                        "base_symbol": alive_bases_for_month[ti],
-                        "avg_turnover_63d": turnover_vals[ti],
+                        "uid": uid,
+                        "base_symbol": uid_to_base.get(uid, uid),
+                        "avg_turnover_63d": float(row_vals[ti]),
                     }
                 )
 
-        # Periodically prune lazy cache (delisted > 6 months ago)
-        if lazy_load and mi % 12 == 0 and mi > 0:
-            prune_cutoff = me_np - np.timedelta64(180, "D")
-            to_remove = [
-                cat_uids[ci]
-                for ci in range(n_stocks)
-                if cat_uids[ci] in turnover_cache and cat_last[ci] < prune_cutoff
-            ]
-            for uid in to_remove:
-                del turnover_cache[uid]
+    else:
+        # ---------------------------------------------------------------
+        # Slow fallback: lazy per-stock I/O inside the monthly loop
+        # ---------------------------------------------------------------
+        turnover_cache: dict = {}
+        n_stocks = len(catalog)
+        cat_paths = catalog["filepath"].values
+        _n_errs = [0]
+
+        for mi, me in enumerate(month_ends):
+            if mi % 24 == 0:
+                elapsed = time.time() - t0
+                pct = mi / total_months * 100
+                print(
+                    f"    Building rankings: {mi}/{total_months} months ({pct:.0f}%), "
+                    f"{elapsed:.0f}s elapsed, cache={len(turnover_cache)}",
+                    end="\r",
+                )
+
+            me_np = np.datetime64(me)
+            lookback_start = me_np - np.timedelta64(90, "D")
+            alive_mask = (cat_first <= me_np) & (cat_last >= lookback_start)
+            alive_idx = np.where(alive_mask)[0]
+
+            turnover_vals: List[float] = []
+            alive_uids_month: List[str] = []
+            alive_bases_month: List[str] = []
+
+            for idx in alive_idx:
+                uid = cat_uids[idx]
+                base = cat_bases[idx]
+                if uid not in turnover_cache:
+                    fpath = cat_paths[idx]
+                    if os.path.exists(fpath):
+                        try:
+                            df = pd.read_parquet(fpath, columns=["Turnover"])
+                            df.index = pd.to_datetime(df.index)
+                            turnover_cache[uid] = df["Turnover"]
+                        except Exception as e:
+                            if _n_errs[0] < 5:
+                                print(f"\n    WARNING: {uid}: {e}")
+                            _n_errs[0] += 1
+                            turnover_cache[uid] = pd.Series(dtype=float)
+                    else:
+                        turnover_cache[uid] = pd.Series(dtype=float)
+
+                ts = turnover_cache.get(uid)
+                if ts is None or len(ts) == 0:
+                    continue
+                mask = ts.index <= me
+                recent = ts[mask].iloc[-63:] if mask.any() else pd.Series(dtype=float)
+                if len(recent) >= 21:
+                    avg_to = recent.mean()
+                    if avg_to > 0 and not np.isnan(avg_to):
+                        turnover_vals.append(avg_to)
+                        alive_uids_month.append(uid)
+                        alive_bases_month.append(base)
+
+            if turnover_vals:
+                arr = np.array(turnover_vals)
+                top_idx = np.argsort(arr)[::-1][:top_n]
+                for rank, ti in enumerate(top_idx, 1):
+                    all_records.append(
+                        {
+                            "date": me,
+                            "rank": rank,
+                            "uid": alive_uids_month[ti],
+                            "base_symbol": alive_bases_month[ti],
+                            "avg_turnover_63d": turnover_vals[ti],
+                        }
+                    )
+
+            if mi % 12 == 0 and mi > 0:
+                prune_cutoff = me_np - np.timedelta64(180, "D")
+                for ci in range(n_stocks):
+                    uid = cat_uids[ci]
+                    if uid in turnover_cache and cat_last[ci] < prune_cutoff:
+                        del turnover_cache[uid]
 
     elapsed = time.time() - t0
     print(
         f"    Building rankings: {total_months}/{total_months} months (100%), "
-        f"{elapsed:.0f}s total, {len(all_records)} rank records          "
+        f"{elapsed:.1f}s total, {len(all_records)} rank records          "
     )
     return pd.DataFrame(all_records)
 
@@ -445,7 +525,6 @@ def build_universe_cache(
         if os.path.exists(cat_path):
             stale = cache_mtime < os.path.getmtime(cat_path)
         else:
-            # No catalog file: compare cache against newest equity parquet
             eq_dir = os.path.join(norgate_root, "US_Equities")
             try:
                 newest_data = max(
@@ -455,7 +534,7 @@ def build_universe_cache(
                 )
                 stale = cache_mtime < newest_data
             except (FileNotFoundError, ValueError):
-                stale = True  # unknown state → rebuild
+                stale = True
 
         if not stale:
             print("  Loading cached universe...")
@@ -471,7 +550,7 @@ def build_universe_cache(
             print("  Cache stale (data updated), rebuilding...")
 
     # --- Build from scratch ---
-    print("  Building point-in-time universe (first run, ~60-90s)...")
+    print("  Building point-in-time universe...")
     t_start = time.time()
 
     print("  Step 1/4: Parsing catalog...")
@@ -482,12 +561,12 @@ def build_universe_cache(
         )
     print(f"    {len(catalog)} candidate stocks (active + delisted)")
 
-    print(f"  Step 2/4: Pre-loading Turnover series ({_IO_WORKERS} workers)...")
-    turnover_cache = _preload_turnover_parallel(catalog)
+    print(f"  Step 2/4: Loading & resampling Turnover series ({_IO_WORKERS} workers)...")
+    monthly_matrix = _preload_and_resample_turnover(catalog)
 
-    print("  Step 3/4: Computing monthly rankings...")
+    print("  Step 3/4: Computing monthly rankings (vectorized)...")
     rankings = _compute_monthly_rankings(
-        catalog, top_n=top_n, turnover_cache=turnover_cache
+        catalog, top_n=top_n, monthly_matrix=monthly_matrix
     )
     if rankings.empty:
         raise RuntimeError("No rankings computed — check data range or catalog.")
@@ -534,8 +613,6 @@ def get_full_universe_history(
     """
     Return dict mapping each rebalance date to its list of UIDs.
 
-    Useful for batch processing (year-by-year breakdown, regime analysis).
-
     Returns:
         dict[pd.Timestamp -> List[str]]
     """
@@ -560,13 +637,11 @@ def get_universe_stats(rankings: pd.DataFrame, top_n: int = 150) -> dict:
     if len(dates) < 2:
         return {}
 
-    # Build per-date sets
     date_sets = {}
     for dt in dates:
         mask = filtered["date"] == dt
         date_sets[dt] = set(filtered.loc[mask, "uid"].values)
 
-    # Count entries/exits per year
     all_uids: set = set()
     entries_per_year: dict = {}
     exits_per_year: dict = {}
@@ -607,7 +682,6 @@ if __name__ == "__main__":
     print(f"Unique symbols: {rankings['uid'].nunique()}")
     print(f"Price matrix: {prices.shape}")
 
-    # Show top 10 at a few dates
     for check_date in ["2000-01-31", "2008-01-31", "2020-01-31"]:
         dt = pd.Timestamp(check_date)
         top10 = get_universe_at_date(rankings, dt, top_n=10)
