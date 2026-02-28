@@ -234,13 +234,13 @@ class WaveRiderStrategy:
             (composite, daily_rets, vol_63d)
             composite: risk-adjusted blended momentum, NaN where ineligible
         """
-        daily_rets = prices.pct_change()
+        daily_rets = prices.pct_change(fill_method=None)
         c = self.cfg
 
-        mom_12m = prices.pct_change(252).shift(1)
-        mom_6m = prices.pct_change(126).shift(1)
-        mom_3m = prices.pct_change(63).shift(1)
-        mom_1m = prices.pct_change(21).shift(1)
+        mom_12m = prices.pct_change(252, fill_method=None).shift(1)
+        mom_6m = prices.pct_change(126, fill_method=None).shift(1)
+        mom_3m = prices.pct_change(63, fill_method=None).shift(1)
+        mom_1m = prices.pct_change(21, fill_method=None).shift(1)
 
         carhart_12 = mom_12m - mom_1m
         carhart_6 = mom_6m - mom_1m
@@ -251,7 +251,7 @@ class WaveRiderStrategy:
         risk_adj = blended / (vol_63d + c.vol_adj_floor)
 
         sma200 = prices.rolling(200).mean()
-        trend_ok = (prices > sma200).shift(1).fillna(False)
+        trend_ok = (prices > sma200).shift(1).fillna(False).infer_objects(copy=False)
 
         composite = risk_adj.copy()
         composite[~trend_ok] = np.nan
@@ -291,7 +291,7 @@ class WaveRiderStrategy:
         f1[vol_63d > 1.00] = 25
 
         # Factor 2: Parabolic 3m move
-        ret_3m_abs = prices.pct_change(63).shift(1).abs()
+        ret_3m_abs = prices.pct_change(63, fill_method=None).shift(1).abs()
         f2 = pd.DataFrame(0.0, index=idx, columns=cols)
         f2[ret_3m_abs > 0.50] = 8
         f2[ret_3m_abs > 1.00] = 18
@@ -306,8 +306,8 @@ class WaveRiderStrategy:
         f3[stretch > 3.0] = 20
 
         # Factor 4: Momentum concentration
-        mom_1m = prices.pct_change(21).shift(1)
-        mom_12m = prices.pct_change(252).shift(1)
+        mom_1m = prices.pct_change(21, fill_method=None).shift(1)
+        mom_12m = prices.pct_change(252, fill_method=None).shift(1)
         both_pos = (mom_1m > 0) & (mom_12m > 0.01)
         conc = pd.DataFrame(0.0, index=idx, columns=cols)
         conc[both_pos] = (mom_1m[both_pos] / mom_12m[both_pos]).clip(0, 2)
@@ -596,7 +596,7 @@ class WaveRiderStrategy:
 
         spy_aligned = spy_price.reindex(dates).ffill()
         spy_sma = spy_aligned.rolling(c.bear_sma).mean()
-        bear_signal = (spy_aligned > spy_sma).shift(1).fillna(True)
+        bear_signal = (spy_aligned > spy_sma).shift(1).fillna(True).infer_objects(copy=False)
 
         unlev_rets = nav_unlevered.pct_change().fillna(0)
         realized_vol = unlev_rets.rolling(c.vol_lookback, min_periods=5).std() * np.sqrt(252)
