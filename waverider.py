@@ -696,10 +696,22 @@ class WaveRiderStrategy:
         buys = [clean_uid(s) for s in sorted(current_set - prev_holdings)]
         sells = [clean_uid(s) for s in sorted(prev_holdings - current_set)]
 
-        # Top-20 candidates
+        # Top-20 candidates (deduped: same company → show only the higher-scored uid)
         scores = result.composite.loc[last_rebal].dropna().sort_values(ascending=False)
         candidates = []
-        for uid in scores.head(20).index:
+        seen_canonicals: set = set()
+
+        def _canonical_uid(uid: str) -> str:
+            base = clean_uid(uid).rstrip("*")
+            return c.dedup_map.get(base, base)
+
+        for uid in scores.index:
+            if len(candidates) >= 20:
+                break
+            canon = _canonical_uid(uid)
+            if canon in seen_canonicals:
+                continue  # already have the higher-scored entry for this company
+            seen_canonicals.add(canon)
             sc = float(scores[uid])
             ms = float(ms_today.get(uid, 0)) if pd.notna(ms_today.get(uid, 0)) else 0.0
             if ms <= c.meme_max2:
