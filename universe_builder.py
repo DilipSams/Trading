@@ -17,7 +17,7 @@ import pandas as pd
 from typing import Tuple, List, Optional
 
 # Default paths
-NORGATE_ROOT = r"D:\Experiments\norgate_data"
+NORGATE_ROOT = os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData")
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "data_cache")
 
 # ETFs / indices to exclude from the stock universe (they'd dominate by turnover)
@@ -261,7 +261,7 @@ def _build_price_matrix(
 def build_universe_cache(
     norgate_root: str = NORGATE_ROOT,
     cache_dir: str = CACHE_DIR,
-    top_n: int = 150,
+    top_n: int = 250,
     force_rebuild: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -413,7 +413,7 @@ def get_universe_stats(rankings: pd.DataFrame, top_n: int = 150) -> dict:
 
 if __name__ == "__main__":
     # Standalone test: build cache and print summary
-    rankings, prices = build_universe_cache(force_rebuild=True)
+    rankings, prices = build_universe_cache(top_n=250, force_rebuild=True)
 
     print(f"\nRankings: {len(rankings)} records")
     print(f"Date range: {rankings['date'].min()} to {rankings['date'].max()}")

@@ -24,7 +24,7 @@ import pandas as pd
 # Paths — Norgate data + cached universe files
 # ---------------------------------------------------------------------------
 _NORGATE_ROOT = os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData")
-_TRADING_ROOT = os.environ.get("TRADING_ROOT", r"C:\Users\Administrator\.claude\Trading\Trading")
+_TRADING_ROOT = os.environ.get("TRADING_ROOT", r"C:\Users\Administrator\.claude\Trading")
 NORGATE_EQ   = os.path.join(_NORGATE_ROOT, "US_Equities")
 NORGATE_ECON = os.path.join(_NORGATE_ROOT, "Economic")
 CACHE_DIR    = os.path.join(_TRADING_ROOT, "data_cache")
@@ -120,7 +120,7 @@ class WaveRiderConfig:
     margin_spread_bps: int = 50
 
     # --- Universe ---
-    universe_top_n: int = 100
+    universe_top_n: int = 200
 
     # --- Deduplication (same company, multiple share classes) ---
     dedup_map: Dict[str, str] = field(default_factory=lambda: {
@@ -174,8 +174,8 @@ class PortfolioSignal:
 # ---------------------------------------------------------------------------
 def load_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Load cached universe prices and rankings."""
-    prices = pd.read_parquet(os.path.join(CACHE_DIR, "universe_prices_top150.parquet"))
-    rankings = pd.read_parquet(os.path.join(CACHE_DIR, "universe_rankings_top150.parquet"))
+    prices = pd.read_parquet(os.path.join(CACHE_DIR, "universe_prices_top250.parquet"))
+    rankings = pd.read_parquet(os.path.join(CACHE_DIR, "universe_rankings_top250.parquet"))
     return prices, rankings
 
 
