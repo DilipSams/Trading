@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 # ── Load ABBV ──────────────────────────────────────────────────────────────────
-NORGATE_DIR = r"D:\Experiments\norgate_data"
+NORGATE_DIR = os.environ.get("NORGATE_ROOT", r"D:\Experiments\norgate_data")
 abbv_path = os.path.join(NORGATE_DIR, "US_Equities", "ABBV.parquet")
 df = pd.read_parquet(abbv_path)
 

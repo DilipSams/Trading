@@ -5295,7 +5295,7 @@ def load_from_dir(dd,mb=200):
     tprint(f"Loaded {len(data)} symbols","ok"); return data
 
 # ── Norgate Data loader (PIT-safe, reads from norgate_download_all.py output) ──
-NORGATE_DIR = r"D:\Experiments\norgate_data"
+NORGATE_DIR = os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData")
 NORGATE_DATABASES = {
     "US_Equities":          {"has_volume": True,  "desc": "Active US stocks (PIT-adjusted)"},
     "US_Equities_Delisted": {"has_volume": True,  "desc": "Delisted US stocks (survivorship-bias-free)"},

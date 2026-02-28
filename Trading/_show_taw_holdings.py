@@ -7,11 +7,13 @@ import numpy as np
 import pandas as pd
 import os, sys
 
-sys.path.insert(0, r"D:\Experiments\Trading")
+_NORGATE_ROOT = os.environ.get("NORGATE_ROOT", r"D:\Experiments\norgate_data")
+_TRADING_ROOT = os.environ.get("TRADING_ROOT", r"D:\Experiments\Trading")
+sys.path.insert(0, _TRADING_ROOT)
 
-NORGATE_EQ = r"D:\Experiments\norgate_data\US_Equities"
-NORGATE_IDX = r"D:\Experiments\norgate_data\US_Indices"
-NORGATE_ECON = r"D:\Experiments\norgate_data\Economic"
+NORGATE_EQ   = os.path.join(_NORGATE_ROOT, "US_Equities")
+NORGATE_IDX  = os.path.join(_NORGATE_ROOT, "US_Indices")
+NORGATE_ECON = os.path.join(_NORGATE_ROOT, "Economic")
 
 def load_series(symbol, col="Adj Close", db="eq"):
     if db == "eq":

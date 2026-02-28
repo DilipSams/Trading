@@ -63,7 +63,7 @@ except ImportError as e:
 # ============================================================================
 # Configuration
 # ============================================================================
-BASE_DIR = Path(r"D:\Experiments\norgate_data")
+BASE_DIR = Path(os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData"))
 CATALOG_FILE = BASE_DIR / "_catalog.parquet"
 LOG_FILE = BASE_DIR / "_download_log.txt"
 

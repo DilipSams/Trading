@@ -23,9 +23,11 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Paths — Norgate data + cached universe files
 # ---------------------------------------------------------------------------
-NORGATE_EQ = r"D:\Experiments\norgate_data\US_Equities"
-NORGATE_ECON = r"D:\Experiments\norgate_data\Economic"
-CACHE_DIR = r"D:\Experiments\Trading\data_cache"
+_NORGATE_ROOT = os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData")
+_TRADING_ROOT = os.environ.get("TRADING_ROOT", r"C:\Users\Administrator\.claude\Trading\Trading")
+NORGATE_EQ   = os.path.join(_NORGATE_ROOT, "US_Equities")
+NORGATE_ECON = os.path.join(_NORGATE_ROOT, "Economic")
+CACHE_DIR    = os.path.join(_TRADING_ROOT, "data_cache")
 
 RISK_FREE_TICKER = "%3MTCM"  # 3-month T-bill (annualized %)
 

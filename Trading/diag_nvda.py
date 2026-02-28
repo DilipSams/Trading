@@ -2,7 +2,7 @@ import sys, os
 import numpy as np
 import pandas as pd
 
-NORGATE_DIR = "D:/Experiments/norgate_data"
+NORGATE_DIR = os.environ.get("NORGATE_ROOT", r"D:\Experiments\norgate_data")
 ACTION_TARGETS = [-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.25, 1.5]
 N_SELECTED = 50
 

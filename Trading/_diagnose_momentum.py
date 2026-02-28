@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import os
 
-CACHE_DIR = r"D:\Experiments\Trading\data_cache"
+CACHE_DIR = os.path.join(os.environ.get("TRADING_ROOT", r"D:\Experiments\Trading"), "data_cache")
 rankings = pd.read_parquet(os.path.join(CACHE_DIR, "universe_rankings_top150.parquet"))
 prices_df = pd.read_parquet(os.path.join(CACHE_DIR, "universe_prices_top150.parquet"))
 
@@ -145,7 +145,7 @@ print(f"  COMPARISON: QQQ vs INDIVIDUAL STOCK PICKING (2018-2025)")
 print(f"{'='*120}")
 
 # Load QQQ
-NORGATE_EQ = r"D:\Experiments\norgate_data\US_Equities"
+NORGATE_EQ = os.path.join(os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData"), "US_Equities")
 qqq_path = os.path.join(NORGATE_EQ, "QQQ.parquet")
 spy_path = os.path.join(NORGATE_EQ, "SPY.parquet")
 xlk_path = os.path.join(NORGATE_EQ, "XLK.parquet")

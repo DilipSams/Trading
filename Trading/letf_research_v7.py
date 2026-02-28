@@ -4,7 +4,7 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-DATA_DIR   = r"D:\Experiments\norgate_data\US_Equities"
+DATA_DIR   = os.path.join(os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData"), "US_Equities")
 START_DATE = "2010-03-11"
 
 SIGNAL_ETFS   = ["XLK", "XLE", "XLF", "QQQ", "IWM", "XLV"]

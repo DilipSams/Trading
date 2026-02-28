@@ -22,9 +22,11 @@ warnings.filterwarnings("ignore")
 # Configuration
 # ============================================================================
 
-NORGATE_EQ   = r"D:\Experiments\norgate_data\US_Equities"
-NORGATE_IDX  = r"D:\Experiments\norgate_data\US_Indices"
-NORGATE_ECON = r"D:\Experiments\norgate_data\Economic"
+# Override via env var: set NORGATE_ROOT=C:\your\path\norgate_data
+_NORGATE_ROOT = os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData")
+NORGATE_EQ   = os.path.join(_NORGATE_ROOT, "US_Equities")
+NORGATE_IDX  = os.path.join(_NORGATE_ROOT, "US_Indices")
+NORGATE_ECON = os.path.join(_NORGATE_ROOT, "Economic")
 
 TRANSACTION_COST_BPS = 10  # 10 bps round-trip
 RISK_FREE_PROXY      = "%3MTCM"  # 3-month T-bill for Sharpe calculations

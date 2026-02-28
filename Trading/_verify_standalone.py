@@ -6,9 +6,11 @@ import numpy as np
 import pandas as pd
 import os, sys
 
-CACHE_DIR = r"D:\Experiments\Trading\data_cache"
-NORGATE_EQ = r"D:\Experiments\norgate_data\US_Equities"
-NORGATE_ECON = r"D:\Experiments\norgate_data\Economic"
+_NORGATE_ROOT = os.environ.get("NORGATE_ROOT", r"D:\Experiments\norgate_data")
+_TRADING_ROOT = os.environ.get("TRADING_ROOT", r"D:\Experiments\Trading")
+CACHE_DIR    = os.path.join(_TRADING_ROOT, "data_cache")
+NORGATE_EQ   = os.path.join(_NORGATE_ROOT, "US_Equities")
+NORGATE_ECON = os.path.join(_NORGATE_ROOT, "Economic")
 
 rankings = pd.read_parquet(os.path.join(CACHE_DIR, "universe_rankings_top150.parquet"))
 prices_df = pd.read_parquet(os.path.join(CACHE_DIR, "universe_prices_top150.parquet"))

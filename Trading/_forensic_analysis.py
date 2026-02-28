@@ -13,7 +13,7 @@ import pandas as pd
 import os, re
 from collections import defaultdict
 
-CACHE_DIR = r"D:\Experiments\Trading\data_cache"
+CACHE_DIR = os.path.join(os.environ.get("TRADING_ROOT", r"D:\Experiments\Trading"), "data_cache")
 rankings = pd.read_parquet(os.path.join(CACHE_DIR, "universe_rankings_top150.parquet"))
 prices_df = pd.read_parquet(os.path.join(CACHE_DIR, "universe_prices_top150.parquet"))
 

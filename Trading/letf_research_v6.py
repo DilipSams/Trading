@@ -5,7 +5,7 @@ from pathlib import Path
 from collections import Counter
 warnings.filterwarnings("ignore")
 
-DATA_DIR = Path(r"D:/Experiments/norgate_data/US_Equities")
+DATA_DIR = Path(os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData")) / "US_Equities"
 START_DATE = "2010-03-11"
 TC = 0.0005
 INIT_CAPITAL = 100_000.0

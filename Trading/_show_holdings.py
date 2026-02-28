@@ -6,10 +6,11 @@ import numpy as np
 import pandas as pd
 import sys, os
 
-sys.path.insert(0, r"D:\Experiments\Trading")
+_TRADING_ROOT = os.environ.get("TRADING_ROOT", r"D:\Experiments\Trading")
+sys.path.insert(0, _TRADING_ROOT)
 
 # Load cached universe data
-CACHE_DIR = r"D:\Experiments\Trading\data_cache"
+CACHE_DIR = os.path.join(_TRADING_ROOT, "data_cache")
 rankings = pd.read_parquet(os.path.join(CACHE_DIR, "universe_rankings_top150.parquet"))
 prices_df = pd.read_parquet(os.path.join(CACHE_DIR, "universe_prices_top150.parquet"))
 

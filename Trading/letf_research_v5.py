@@ -3,7 +3,7 @@ import numpy as np
 import warnings
 warnings.filterwarnings("ignore")
 
-DATA_DIR = "d:/Experiments/norgate_data/US_Equities/"
+DATA_DIR = os.path.join(os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData"), "US_Equities") + os.sep
 START_FULL  = "2010-02-11"
 START_TECL  = "2008-12-17"
 START_TQQQ  = "2010-02-11"

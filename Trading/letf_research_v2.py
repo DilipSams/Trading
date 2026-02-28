@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 
-DATA_DIR = "D:/Experiments/norgate_data/US_Equities"
+DATA_DIR = os.path.join(os.environ.get("NORGATE_ROOT", r"C:\ProgramData\NorgateData"), "US_Equities")
 COST = 0.0005
 
 def load(t):

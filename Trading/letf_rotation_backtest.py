@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 import os
 
-DATA_DIR = r'D:/Experiments/norgate_data/US_Equities'
+DATA_DIR = os.path.join(os.environ.get("NORGATE_ROOT", r"D:\Experiments\norgate_data"), "US_Equities")
 COST_BPS = 0.0005
 
 TICKERS = ['UPRO', 'SPXU', 'TQQQ', 'SQQQ', 'UDOW', 'SDOW', 'SPY', 'QQQ', 'DIA']
