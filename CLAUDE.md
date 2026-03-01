@@ -1781,7 +1781,6 @@ No trimming, no rebalancing, no leverage re-application
 
 ### What NEVER to do:
 - **NEVER** compute `per_position = capital × leverage / N` at rebalance time and use it to size new buys — this ignores accumulated wealth
-- **NEVER** resize or trim existing (hold) positions to restore equal weighting
 - **NEVER** use unrealized P&L as available capital for new positions — only BOOKED (sold) proceeds count
 - **NEVER** implement a different compounding model for a new strategy without first backtesting it against Realized-Only and getting explicit approval
 
