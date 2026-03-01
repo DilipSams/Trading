@@ -1718,3 +1718,70 @@ ledger.save()
 
 For individual holdings, `_read_norgate_prices(sym, days=3)` reads `{sym}.parquet` (e.g., `NEM.parquet`) from the same directory. The uid_map on hold days is identity: `{sym: sym}`. This works for all simple (non-relisted) symbols. Relisted symbols with UIDs like `DELL-200308` require catalog lookup — add handling if such a symbol enters the portfolio.
 
+---
+
+## INSTRUCTION: ALL Strategies MUST Use the Realized-Only Compounding Model — No Exceptions
+
+**This is a mandatory architectural rule. Every strategy implemented in this project — current and future — MUST use the Realized-Only compounding model for position sizing and capital management. NEVER use fixed capital, equal-weight rebalancing (full compounding), or any model that resets position sizes at each rebalance.**
+
+### Why Realized-Only (backtested evidence, Jan 1991 – Feb 2026)
+
+| Model | CAGR | Notes |
+|---|---|---|
+| **Realized-Only** | **34.36%** | Lets winners run; only recycles booked cash |
+| Full Compounding | 30.62% | Trims winners monthly — anti-momentum |
+| Fixed $100k | 7.44% | No compounding at all |
+| SPY Buy & Hold | 10.63% | Benchmark |
+
+Realized-Only beats Full Compounding by **+3.74 pp CAGR** over 35 years. Standout years where letting winners run mattered most: 1997 (+82% vs +54%), 1998 (+388% vs +249%), 2016 (+80% vs +44%).
+
+**Root cause why Full Compounding loses:** Equal-weight rebalancing at each EOM forces trimming of winning momentum stocks to restore 1/N weight. This is directly anti-momentum — the strategy's core thesis. Realized-Only avoids this by only sizing new positions from booked cash, never touching held positions.
+
+### The Realized-Only Model — Exact Mechanics
+
+#### At strategy launch (bootstrap):
+1. Deploy initial capital × leverage equally across N stocks
+2. `shares = floor((capital × leverage / N) / entry_price)`
+3. `cash = initial_gross − sum(shares × entry_price)` (fractional-share remainder)
+4. Positions are locked — share count NEVER changes while held
+
+#### At each rebalance (EOM):
+**SELL side — book proceeds:**
+```
+For each symbol in sells:
+    gross_proceeds = shares × exit_price          # 100% of sale value
+    realized_pnl   = shares × (exit_price − entry_price)
+    cash_pool      += gross_proceeds              # entire proceeds go to cash
+    remove position from ledger
+```
+
+**BUY side — size from cash pool only:**
+```
+available_cash = cash_pool                        # ONLY booked proceeds
+per_buy        = available_cash / len(buys)       # equal split
+For each symbol in buys:
+    shares = floor(per_buy / entry_price)         # no leverage re-applied
+    cost   = shares × entry_price
+    cash_pool -= cost
+    add position to ledger with today's price and share count
+```
+
+**HOLD side — do nothing:**
+```
+For each continuing position: share count is UNCHANGED
+No trimming, no rebalancing, no leverage re-application
+```
+
+#### Key rules:
+- **Gross proceeds** (not net P&L) fund new buys — the full `shares × exit_price` goes back to cash, including original capital
+- **No leverage re-application** on new buys — the original entry already embedded leverage; gross proceeds carry that forward naturally
+- **`ledger.cash`** tracks the uninvested pool at all times; it persists in `portfolio_ledger.json` as `"cash"` (float)
+- **Winners grow unbounded** — a position entered at $20k can become $100k+ over time; that is correct and intentional
+- **Cash pool can be zero** — when sells == buys in count, cash is recycled fully; when sells > buys, excess cash sits idle until next rebalance
+
+### What NEVER to do:
+- **NEVER** compute `per_position = capital × leverage / N` at rebalance time and use it to size new buys — this ignores accumulated wealth
+- **NEVER** resize or trim existing (hold) positions to restore equal weighting
+- **NEVER** use unrealized P&L as available capital for new positions — only BOOKED (sold) proceeds count
+- **NEVER** implement a different compounding model for a new strategy without first backtesting it against Realized-Only and getting explicit approval
+
