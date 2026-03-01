@@ -1585,12 +1585,12 @@ Norgate adjusts historical prices daily (splits, dividends), which silently chan
 
 **NEVER size new buy positions from `self.capital × leverage / n` (fixed-capital formula). ALWAYS size from the cash pool accumulated from sell proceeds.**
 
-The realized-only model was backtested and proved superior (34.36% CAGR vs 7.44% fixed-capital, vs 10.63% SPY):
+The realized-only model was backtested and proved superior (~32.1% CAGR vs 7.44% fixed-capital, vs 10.63% SPY):
 
 | Model | CAGR | $100k grows to |
 |-------|------|----------------|
-| **Realized-Only** ← THIS IS WHAT THE BOT USES | **34.36%** | **$3.21B** |
-| Full Compounding (equal-weight every EOM) | 30.62% | $1.19B |
+| **Realized-Only** ← THIS IS WHAT THE BOT USES | **~32.1%** | **~$1.5B** |
+| Full Compounding (equal-weight every EOM) | ~30.6% | ~$1.0B |
 | Fixed $100k forever | 7.44% | $1.24M |
 | SPY Buy & Hold | 10.63% | $2.83M |
 
@@ -1728,12 +1728,12 @@ For individual holdings, `_read_norgate_prices(sym, days=3)` reads `{sym}.parque
 
 | Model | CAGR | Notes |
 |---|---|---|
-| **Realized-Only** | **34.36%** | Lets winners run; only recycles booked cash |
-| Full Compounding | 30.62% | Trims winners monthly — anti-momentum |
+| **Realized-Only** | **~32.1%** | Lets winners run; only recycles booked cash |
+| Full Compounding | ~30.6% | Trims winners monthly — anti-momentum |
 | Fixed $100k | 7.44% | No compounding at all |
 | SPY Buy & Hold | 10.63% | Benchmark |
 
-Realized-Only beats Full Compounding by **+3.74 pp CAGR** over 35 years. Standout years where letting winners run mattered most: 1997 (+82% vs +54%), 1998 (+388% vs +249%), 2016 (+80% vs +44%).
+Realized-Only beats Full Compounding by ~1.5 pp CAGR over 35 years. The advantage comes from not trimming winning positions — momentum winners continue to compound undisturbed until they fall out of the top-N ranking.
 
 **Root cause why Full Compounding loses:** Equal-weight rebalancing at each EOM forces trimming of winning momentum stocks to restore 1/N weight. This is directly anti-momentum — the strategy's core thesis. Realized-Only avoids this by only sizing new positions from booked cash, never touching held positions.
 

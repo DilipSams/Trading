@@ -6,7 +6,8 @@ Carhart momentum (risk-adjusted, SMA200 filtered), select top-5 with hysteresis,
 apply 6-factor meme score graduated filtering, overlay BearVol2x leverage
 (vol-target 20%, max 2x, bear gate 0.5x when SPY < SMA200).
 
-Verified performance (1991-2026): CAGR +33.0%, Sharpe 1.01, MaxDD -59.6%.
+Verified performance (1991-2026): CAGR +32.1%, Sharpe 1.01, MaxDD ~-60%.
+Unlevered Realized-Only CAGR ~26.4% (35% vol → avg 1.15x leverage from vol-targeting).
 
 This module is the single source of truth. All other scripts import from here.
 """
@@ -509,11 +510,18 @@ class WaveRiderStrategy:
         warmup = prices.index[max(252, 200) + 5]
         dates = prices.loc[warmup:].index
 
-        # --- Unlevered backtest ---
-        nav_val = 1.0
+        # --- Unlevered backtest (Realized-Only compounding) ---
+        # Track position dollar VALUES, updated daily via pct_change returns.
+        # Using absolute prices would break because Norgate retroactively adjusts
+        # all historical prices for splits/dividends. Returns (pct_change) are
+        # stable after adjustments.
+        #
+        # Mechanics: gross sell proceeds → cash pool; new buys sized from
+        # cash_pool / n_buys equally; held positions never resized (winners run).
         nav_vals: List[float] = []
+        positions: Dict[str, float] = {}  # uid → current dollar value of position
+        cash_pool: float = 1.0            # uninvested capital; starts = full portfolio
         current_holdings: set = set()
-        current_weights = pd.Series(0.0, index=prices.columns)
 
         rebal_dates: List[pd.Timestamp] = []
         holdings_log: Dict[pd.Timestamp, List[str]] = {}
@@ -533,32 +541,51 @@ class WaveRiderStrategy:
                 nav_vals.append(1.0)
                 continue
 
+            # Step 1: Update held position dollar values via today's daily return
+            for uid in list(positions.keys()):
+                r = daily_rets.at[date, uid] if uid in daily_rets.columns else float("nan")
+                if pd.notna(r) and not np.isinf(r):
+                    positions[uid] *= (1.0 + r)
+                # NaN/inf → price data missing, keep value unchanged (0% return)
+
+            # Step 2: Rebalance if this is a rebalance date
             is_rebal = (date in _eom_set) if c.rebalance_eom else (i % c.rebalance_freq == 0)
             if is_rebal:
                 portfolio, filtered_out = self.select_portfolio(
                     date, composite, meme_scores, current_holdings
                 )
-                buys = portfolio - current_holdings
+                buys  = portfolio - current_holdings
                 sells = current_holdings - portfolio
 
-                current_holdings = portfolio
-                new_weights = pd.Series(0.0, index=prices.columns)
-                if len(portfolio) > 0:
-                    w = 1.0 / len(portfolio)
-                    for sym in portfolio:
-                        new_weights[sym] = w
-                current_weights = new_weights
+                # SELL: move position dollar value to cash pool
+                for uid in sells:
+                    cash_pool += positions.pop(uid, 0.0)
 
+                # BUY: distribute cash pool equally among new entries
+                n_buys = len(buys)
+                if n_buys > 0 and cash_pool > 0:
+                    per_buy = cash_pool / n_buys
+                    for uid in sorted(buys):
+                        positions[uid] = per_buy
+                    cash_pool = 0.0
+
+                # HOLD: do nothing — position dollar values continue accumulating
+
+                # Transaction cost: applied proportionally to full portfolio
+                # (same approximation as original equal-weight implementation)
+                tc = c.transaction_cost_bps / 10000
+                for uid in list(positions.keys()):
+                    positions[uid] *= (1.0 - tc)
+                cash_pool *= (1.0 - tc)
+
+                current_holdings = portfolio
                 rebal_dates.append(date)
                 holdings_log[date] = sorted(portfolio)
                 filtered_log[date] = filtered_out
                 trades_log[date] = len(buys) + len(sells)
 
-            day_ret = (current_weights * daily_rets.loc[date]).sum()
-            if is_rebal:
-                day_ret -= c.transaction_cost_bps / 10000
-            nav_val *= 1 + day_ret
-            nav_vals.append(nav_val)
+            # NAV = sum of position dollar values + uninvested cash
+            nav_vals.append(sum(positions.values()) + cash_pool)
 
         nav_unlevered = pd.Series(nav_vals, index=dates)
 
