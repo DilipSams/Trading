@@ -1565,3 +1565,91 @@ If numbers differ from these, run the audit script before assuming the code chan
 - `current_portfolio()` internally calls `backtest()` once.
 - `main()` then calls `backtest()` again for the performance tables.
 - This means the full backtest runs **twice** on every waverider_live.py run. If speed is a concern, cache the result.
+
+---
+
+## INSTRUCTION: Portfolio Ledger Is the Source of Truth for Live P&L
+
+**ALWAYS read entry price, entry date, and share count from `portfolio_ledger.json`. NEVER recompute them from the backtest `holdings_log`.**
+
+Norgate adjusts historical prices daily (splits, dividends), which silently changes the backtest's computed entry prices on every run. Any P&L computed from the backtest is unstable and wrong for live tracking.
+
+- Ledger path: `LEDGER_PATH = SCRIPT_DIR / "portfolio_ledger.json"` (gitignored)
+- Bootstrap (first run only): `PortfolioLedger.bootstrap()` — walks `holdings_log` backward via `find_entry_date()` to find continuous-streak entry. Uses `result.leverage_series.asof(entry_date)` for share count — **NOT** `signal.leverage` (current leverage ≠ historical leverage).
+- Reset after manual trades: `python waverider_signal_bot.py --reset-ledger`
+- `get_entry_info()` returns `{sym: (pd.Timestamp, entry_price, actual_shares)}` — 3-tuple. All display functions unpack this; never use computed shares when ledger shares are available.
+
+---
+
+## INSTRUCTION: Position Sizing MUST Use the Realized-Only Model
+
+**NEVER size new buy positions from `self.capital × leverage / n` (fixed-capital formula). ALWAYS size from the cash pool accumulated from sell proceeds.**
+
+The realized-only model was backtested and proved superior (34.36% CAGR vs 7.44% fixed-capital, vs 10.63% SPY):
+
+| Model | CAGR | $100k grows to |
+|-------|------|----------------|
+| **Realized-Only** ← THIS IS WHAT THE BOT USES | **34.36%** | **$3.21B** |
+| Full Compounding (equal-weight every EOM) | 30.62% | $1.19B |
+| Fixed $100k forever | 7.44% | $1.24M |
+| SPY Buy & Hold | 10.63% | $2.83M |
+
+**The formula in `update_rebalance()`:**
+```python
+# 1. Collect sell proceeds
+sell_proceeds = sum(int(pos["shares"]) * exit_price  for each sold position)
+
+# 2. Size new buys from available cash only
+available = self.cash + sell_proceeds
+per_buy   = available / len(signal.buys)          # equal split, no extra leverage
+shares    = math.floor(per_buy / entry_price)
+self.cash = available - sum(shares * price)        # fractional remainder carries forward
+```
+
+**Held positions are NEVER resized.** Their share count stays frozen until the strategy removes them. Winners compound at full size — this is why realized-only outperforms full compounding for a momentum strategy (trimming winners is anti-momentum).
+
+---
+
+## INSTRUCTION: format_portfolio_table() Must Receive ledger.cash
+
+**ALWAYS call `format_portfolio_table(..., ledger_cash=ledger.cash)`. NEVER compute cash as `capital × leverage - total_value`.**
+
+The old formula was wrong: it used a fixed capital base that never reflected actual proceeds. The correct display:
+- `💵 CASH` line = `ledger.cash` (actual uninvested pool from sell proceeds)
+- `💰 TOTAL` line = `sum(shares × cur_price) + ledger.cash`
+- Header = `avg $X/pos` from actual position values, not `capital × leverage / n`
+
+---
+
+## INSTRUCTION: Rebalance Message BUY Lines Must Use Ledger Shares
+
+**ALWAYS read shares and entry_price from `ledger.positions[sym]` for BUY lines. NEVER recompute with `floor(capital × leverage / n / price)`.**
+
+`update_rebalance()` runs before `format_rebalance_message()`, so the new positions are already in the ledger with the correct realized-only share counts. Use them directly:
+```python
+pos = ledger.positions.get(sym, {})
+shares = int(pos.get("shares", 0))
+entry_price = float(pos.get("entry_price", 0))
+```
+
+---
+
+## INSTRUCTION: PortfolioLedger.cash Must Always Be Saved and Loaded
+
+**ALWAYS include `"cash"` in `save()` and load it in `load()` with `data.get("cash", 0.0)` as default.**
+
+`self.cash` tracks the uninvested gross cash pool. It starts at ~0 after bootstrap (all capital deployed) and grows each time a position is sold. It is the ONLY funding source for new buys. If it's reset to 0 on every load, position sizing reverts to the broken fixed-capital model.
+
+JSON key: `"cash"` (float, rounded to 2 decimal places). Backward-compatible default: `0.0`.
+
+---
+
+## INSTRUCTION: Windows stdout — Always Use UTF-8 for Bot Scripts
+
+**ALWAYS add the following at the top of any script that prints emoji or Unicode (dry-run, comparison scripts, any bot output):**
+```python
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+```
+Windows terminal defaults to cp1252, which crashes on any emoji or arrow character with `UnicodeEncodeError`. Also call `sys.stdout.flush()` before binary writes to prevent output interleaving.
+

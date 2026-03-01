@@ -63,11 +63,14 @@ class PortfolioLedger:
     """
 
     def __init__(self, capital: float, positions: dict, closed_trades: list,
-                 last_rebalance_date: str):
+                 last_rebalance_date: str, cash: float = 0.0):
         self.capital = capital
         self.positions = positions          # {sym: {entry_date, entry_price, shares}}
         self.closed_trades = closed_trades  # list of closed trade dicts
         self.last_rebalance_date = last_rebalance_date
+        # Uninvested cash pool: grows when positions are sold, shrinks on new buys.
+        # This is the "realized-only" cash — only booked proceeds available for reinvestment.
+        self.cash = cash
 
     # ------------------------------------------------------------------
     # Load / Save
@@ -85,6 +88,7 @@ class PortfolioLedger:
                 positions=data.get("positions", {}),
                 closed_trades=data.get("closed_trades", []),
                 last_rebalance_date=data.get("last_rebalance_date", ""),
+                cash=float(data.get("cash", 0.0)),
             )
         except Exception as e:
             print(f"  Warning: could not load ledger ({e}). Will re-bootstrap.")
@@ -96,6 +100,7 @@ class PortfolioLedger:
             "version": 1,
             "capital": self.capital,
             "last_rebalance_date": self.last_rebalance_date,
+            "cash": round(self.cash, 2),
             "positions": self.positions,
             "closed_trades": self.closed_trades,
         }
@@ -136,11 +141,20 @@ class PortfolioLedger:
                 "shares": int(shares),
             }
 
+        # Compute fractional-share cash remainder from initial deployment
+        gross_deployed = sum(
+            int(p["shares"]) * float(p["entry_price"])
+            for p in positions.values()
+        )
+        initial_gross = capital * float(result.leverage_series.iloc[-1]) if hasattr(result, "leverage_series") else capital
+        cash_remainder = max(0.0, initial_gross - gross_deployed)
+
         return cls(
             capital=capital,
             positions=positions,
             closed_trades=[],
             last_rebalance_date=signal.date.strftime("%Y-%m-%d"),
+            cash=round(cash_remainder, 2),
         )
 
     # ------------------------------------------------------------------
@@ -148,13 +162,21 @@ class PortfolioLedger:
     # ------------------------------------------------------------------
 
     def update_rebalance(self, signal, prices, uid_map):
-        """Apply EOM rebalance: close sells, open buys, leave holds untouched."""
-        n = len(signal.holdings_clean)
-        effective = self.capital * signal.leverage
-        per_stock = effective / n if n > 0 else 0
+        """Apply EOM rebalance using the Realized-Only model.
+
+        • SELLS:  close positions → full gross proceeds (shares × exit_price) added
+                  to the cash pool.  P&L is recorded in closed_trades.
+        • HOLDS:  share count is UNCHANGED.  Unrealized gains/losses compound in-place.
+        • BUYS:   sized from available cash pool ÷ number of new buys.
+                  No leverage re-application — the gross proceeds from leveraged
+                  positions already embed the leverage from the original entry.
+
+        This matches the backtested Realized-Only model (34.36% CAGR) exactly.
+        """
         today_str = signal.date.strftime("%Y-%m-%d")
 
-        # --- Close sold positions ---
+        # ── Step 1: close sold positions → accumulate cash ──────────────
+        sell_proceeds = 0.0
         for sym in signal.sells:
             if sym not in self.positions:
                 continue
@@ -163,6 +185,8 @@ class PortfolioLedger:
             exit_price = get_current_price(prices, uid)
             entry_price = float(pos["entry_price"])
             shares = int(pos["shares"])
+            gross = shares * exit_price if exit_price > 0 else 0.0
+            sell_proceeds += gross
             realized_pnl = round(shares * (exit_price - entry_price), 2) if exit_price > 0 else 0.0
             pnl_pct = round((exit_price / entry_price - 1) * 100, 2) if entry_price > 0 and exit_price > 0 else 0.0
             self.closed_trades.append({
@@ -174,19 +198,33 @@ class PortfolioLedger:
                 "shares": shares,
                 "realized_pnl": realized_pnl,
                 "pnl_pct": pnl_pct,
+                "gross_proceeds": round(gross, 2),
             })
             del self.positions[sym]
 
-        # --- Open new positions ---
-        for sym in signal.buys:
-            uid = uid_map.get(sym, sym)
-            entry_price = get_current_price(prices, uid)
-            shares = math.floor(per_stock / entry_price) if entry_price > 0 else 0
-            self.positions[sym] = {
-                "entry_date": today_str,
-                "entry_price": round(float(entry_price), 4),
-                "shares": int(shares),
-            }
+        # ── Step 2: size new buys from available cash pool only ──────────
+        # Cash pool = prior uninvested cash + today's sell proceeds
+        available = self.cash + sell_proceeds
+        n_buys = len(signal.buys)
+
+        if n_buys > 0 and available > 0:
+            per_buy = available / n_buys          # equal split among new entries
+            cash_spent = 0.0
+            for sym in signal.buys:
+                uid = uid_map.get(sym, sym)
+                entry_price = get_current_price(prices, uid)
+                shares = math.floor(per_buy / entry_price) if entry_price > 0 else 0
+                actual_cost = shares * entry_price
+                cash_spent += actual_cost
+                self.positions[sym] = {
+                    "entry_date": today_str,
+                    "entry_price": round(float(entry_price), 4),
+                    "shares": int(shares),
+                }
+            self.cash = round(available - cash_spent, 2)   # fractional share leftover
+        else:
+            # No new buys (pure hold month) — accumulate any sell proceeds as cash
+            self.cash = round(available, 2)
 
         self.last_rebalance_date = today_str
 
@@ -326,33 +364,33 @@ def build_entry_info(signal, result, prices, uid_map):
     return info
 
 
-def format_portfolio_table(signal, prices, uid_map, capital, entry_info) -> str:
-    """Format a detailed portfolio table with entry dates and P&L."""
+def format_portfolio_table(signal, prices, uid_map, capital, entry_info, ledger_cash: float = 0.0) -> str:
+    """Format a detailed portfolio table with entry dates and P&L.
+
+    ledger_cash: uninvested cash from the realized-only pool (from ledger.cash).
+    """
     n = len(signal.holdings_clean)
-    effective = capital * signal.leverage
-    per_stock = effective / n if n > 0 else 0
 
     # Build rows with P&L for sorting
     rows = []
-    total_value = 0
-    total_pnl = 0
+    total_value = 0.0
+    total_pnl = 0.0
 
     for sym in signal.holdings_clean:
         uid = uid_map.get(sym, sym)
         cur_price = get_current_price(prices, uid)
 
-        # Use actual share count from ledger (3-tuple); fall back to computed
+        # Shares always come from the ledger (actual locked share count)
         raw = entry_info.get(sym, (None, 0, 0))
         ed, ep = raw[0], raw[1]
-        actual_shares = raw[2] if len(raw) > 2 else 0
-        shares = actual_shares if actual_shares > 0 else (math.floor(per_stock / cur_price) if cur_price > 0 else 0)
+        shares = raw[2] if len(raw) > 2 and raw[2] > 0 else 0
 
         value = shares * cur_price
         total_value += value
 
         ed_str = ed.strftime("%b %d") if ed else "n/a"
 
-        if ep > 0:
+        if ep > 0 and shares > 0:
             pnl_pct = (cur_price / ep - 1) * 100
             pnl_dollar = shares * (cur_price - ep)
             total_pnl += pnl_dollar
@@ -365,8 +403,14 @@ def format_portfolio_table(signal, prices, uid_map, capital, entry_info) -> str:
     # Sort by P&L% descending (best first)
     rows.sort(key=lambda r: r[6], reverse=True)
 
+    total_portfolio = total_value + ledger_cash
+    # Initial cost basis for total P&L: sum of (shares × entry_price) across all positions
+    total_cost = sum(r[5] * r[2] for r in rows if r[5] > 0)
+    total_unrealized = total_pnl   # same as above, already computed
+
     lines = []
-    lines.append(f"\U0001F4BC <b>PORTFOLIO</b> ({n} stocks, {100/n:.0f}% each, ${per_stock:,.0f}/pos)")
+    avg_pos = total_value / n if n > 0 else 0
+    lines.append(f"\U0001F4BC <b>PORTFOLIO</b> ({n} stocks, avg ${avg_pos:,.0f}/pos)")
     lines.append("")
     lines.append("<pre>")
 
@@ -377,11 +421,10 @@ def format_portfolio_table(signal, prices, uid_map, capital, entry_info) -> str:
             f"${value:>7,.0f}  {ed_str:>6s}  {pnl_pct:>+6.1f}% ${pnl_dollar:>+7,.0f}"
         )
 
-    cash = effective - total_value
     pnl_icon = "\U0001F4B0" if total_pnl >= 0 else "\U0001F534"
     lines.append(f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-    lines.append(f"\U0001F4B5 CASH {' ':>24s}${cash:>7,.0f}")
-    lines.append(f"{pnl_icon} TOTAL{' ':>24s}${effective:>7,.0f}  P&L: ${total_pnl:>+7,.0f}")
+    lines.append(f"\U0001F4B5 CASH {' ':>24s}${ledger_cash:>7,.0f}")
+    lines.append(f"{pnl_icon} TOTAL{' ':>24s}${total_portfolio:>7,.0f}  P&L: ${total_unrealized:>+7,.0f}")
     lines.append("</pre>")
 
     return "\n".join(lines)
@@ -392,50 +435,47 @@ def format_rebalance_message(signal, prices, uid_map, capital, result, ledger) -
     from waverider import compute_nav_metrics
 
     entry_info = ledger.get_entry_info()
-    n = len(signal.holdings_clean)
-    effective = capital * signal.leverage
-    per_stock = effective / n if n > 0 else 0
     m = compute_nav_metrics(result.nav_leveraged)
+    today_str = signal.date.strftime("%Y-%m-%d")
 
     lines = []
     lines.append(f"\U0001F514 <b>REBALANCE</b> | {signal.date.strftime('%Y-%m-%d')}")
     lines.append("")
 
-    # Trades
-    if signal.buys or signal.sells:
-        lines.append("\U0001F4CB <b>TRADES:</b>")
-        for sym in signal.buys:
-            uid = uid_map.get(sym, sym)
-            price = get_current_price(prices, uid)
-            shares = math.floor(per_stock / price) if price > 0 else 0
-            alloc = shares * price
-            lines.append(f"  \U0001F7E2 BUY  <b>{sym}</b>  {shares} sh @ ${price:.2f} = ${alloc:,.0f}")
-        for sym in signal.sells:
-            lines.append(f"  \U0001F534 SELL <b>{sym}</b>  (exit entire position)")
-        lines.append("")
-
-    # Realized P&L for positions closed today
-    today_str = signal.date.strftime("%Y-%m-%d")
+    # ── Closed today (SELL side) ─────────────────────────────────────────
     closed_today = [t for t in ledger.closed_trades if t.get("exit_date") == today_str]
     if closed_today:
         lines.append("\U0001F4B0 <b>CLOSED TODAY:</b>")
         for t in closed_today:
             icon = "\u2705" if t["pnl_pct"] >= 0 else "\u274C"
+            gross_str = f"  gross ${t.get('gross_proceeds', 0):,.0f}" if t.get("gross_proceeds") else ""
             lines.append(
                 f"  {icon} {t['symbol']:<6s} "
                 f"${t['entry_price']:.2f} \u2192 ${t['exit_price']:.2f}  "
-                f"{t['pnl_pct']:+.1f}%  ${t['realized_pnl']:+,.0f}"
+                f"{t['pnl_pct']:+.1f}%  ${t['realized_pnl']:+,.0f}{gross_str}"
             )
         lines.append("")
 
-    # Detailed portfolio table (new state after rebalance)
-    lines.append(format_portfolio_table(signal, prices, uid_map, capital, entry_info))
+    # ── New buys (shares come from ledger — sized by realized cash pool) ─
+    if signal.buys:
+        lines.append("\U0001F4CB <b>NEW POSITIONS:</b>")
+        for sym in signal.buys:
+            pos = ledger.positions.get(sym, {})
+            shares = int(pos.get("shares", 0))
+            entry_price = float(pos.get("entry_price", 0))
+            alloc = shares * entry_price
+            lines.append(f"  \U0001F7E2 BUY  <b>{sym}</b>  {shares} sh @ ${entry_price:.2f} = ${alloc:,.0f}")
+        lines.append(f"  \U0001F4B5 Cash remaining: ${ledger.cash:,.0f}")
+        lines.append("")
+
+    # ── Detailed portfolio table (new state after rebalance) ─────────────
+    lines.append(format_portfolio_table(signal, prices, uid_map, capital, entry_info, ledger_cash=ledger.cash))
     lines.append("")
 
-    # Summary
+    # Summary footer
     bear_icon = "\U0001F6A8" if signal.bear_regime else "\U0001F6E1"
     bear_str = "ON (SPY &lt; SMA200)" if signal.bear_regime else "OFF"
-    lines.append(f"\u26A1 Leverage: <b>{signal.leverage:.2f}x</b> | Exposure: ${effective:,.0f}")
+    lines.append(f"\u26A1 Leverage: <b>{signal.leverage:.2f}x</b>")
     lines.append(f"{bear_icon} Bear gate: {bear_str}")
     lines.append(f"\U0001F4CA Vol (21d): {signal.realized_vol:.2f} ann.")
     lines.append(f"\U0001F3AF CAGR: <b>{m['cagr']*100:+.1f}%</b> | Sharpe: {m['sharpe']:.2f}")
@@ -469,35 +509,38 @@ def format_daily_summary(signal, prices, uid_map, capital, result, ledger) -> st
 
     bear_icon = "\U0001F6A8" if signal.bear_regime else "\U0001F6E1"
     bear_str = "ON" if signal.bear_regime else "OFF"
-    effective = capital * signal.leverage
 
     lines = []
     lines.append(f"\U0001F4CA <b>WaveRider Daily</b> | {datetime.now().strftime('%Y-%m-%d')}")
     lines.append("")
 
-    # Detailed portfolio table
-    lines.append(format_portfolio_table(signal, prices, uid_map, capital, entry_info))
+    # Detailed portfolio table — pass actual cash from ledger
+    lines.append(format_portfolio_table(signal, prices, uid_map, capital, entry_info, ledger_cash=ledger.cash))
     lines.append("")
 
-    # Last signal summary
+    # Last signal summary — show actual ledger shares for buys
     lines.append(f"\U0001F4E1 <b>Last signal:</b> {signal.date.strftime('%Y-%m-%d')}")
     if signal.buys or signal.sells:
-        n = len(signal.holdings_clean)
-        per_stock = effective / n if n > 0 else 0
         for sym in signal.buys:
-            uid = uid_map.get(sym, sym)
-            price = get_price_on_date(prices, uid, signal.date)
-            shares = math.floor(per_stock / price) if price > 0 else 0
-            lines.append(f"  \U0001F7E2 BUY  <b>{sym}</b>  {shares} sh @ ${price:.2f} = ${shares*price:,.0f}")
+            pos = ledger.positions.get(sym, {})
+            shares = int(pos.get("shares", 0))
+            ep = float(pos.get("entry_price", 0))
+            lines.append(f"  \U0001F7E2 BUY  <b>{sym}</b>  {shares} sh @ ${ep:.2f} = ${shares*ep:,.0f}")
         for sym in signal.sells:
-            uid = uid_map.get(sym, sym)
-            price = get_price_on_date(prices, uid, signal.date)
-            lines.append(f"  \U0001F534 SELL <b>{sym}</b>  @ ${price:.2f}")
+            # Prefer closed_trades record; fall back to Norgate price on signal date
+            ct = next((t for t in reversed(ledger.closed_trades) if t["symbol"] == sym), None)
+            if ct:
+                price_str = f"@ ${ct['exit_price']:.2f}"
+            else:
+                uid = uid_map.get(sym, sym)
+                px = get_price_on_date(prices, uid, signal.date)
+                price_str = f"@ ${px:.2f}" if px and px > 0 else "(price n/a)"
+            lines.append(f"  \U0001F534 SELL <b>{sym}</b>  {price_str}")
     else:
         lines.append("  \u2696 No trades (hold)")
     lines.append("")
 
-    lines.append(f"\u26A1 Leverage: <b>{signal.leverage:.2f}x</b> | Exposure: ${effective:,.0f}")
+    lines.append(f"\u26A1 Leverage: <b>{signal.leverage:.2f}x</b>")
     lines.append(f"{bear_icon} Bear gate: {bear_str} | {daily_icon} Today: <b>{daily_str}</b>")
     lines.append(f"\U0001F3AF CAGR: <b>{m['cagr']*100:+.1f}%</b> | Sharpe: {m['sharpe']:.2f}")
     lines.append(f"\U0001F4C5 Next rebalance: ~{est_next.strftime('%b %d')}")
