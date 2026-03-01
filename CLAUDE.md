@@ -1653,3 +1653,68 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 ```
 Windows terminal defaults to cp1252, which crashes on any emoji or arrow character with `UnicodeEncodeError`. Also call `sys.stdout.flush()` before binary writes to prevent output interleaving.
 
+---
+
+## INSTRUCTION: Entry Point Is run_daily.py — Never Schedule the Bot Directly
+
+**The Task Scheduler MUST run `run_daily.py`, NOT `waverider_signal_bot.py` directly.**
+
+`run_daily.py` is the daily orchestrator. It:
+1. Triggers the Norgate Data Updater (`ndu.trigger.exe`) to fetch today's closing prices
+2. Waits (polling `norgatedata.last_price_update_time("SPY")`) until today's data is confirmed fresh
+3. Checks `rebalance_calendar.json` to determine if today is an EOM rebalance day
+4. Runs the bot with the correct flag: `--rebalance` (EOM) or `--hold-day` (all other days)
+
+**NEVER** point the scheduled task at `waverider_signal_bot.py` directly — it will run without waiting for fresh Norgate data and will trigger an expensive full universe rebuild every single day.
+
+NDU executable path: `C:\Program Files\Norgate Data Updater\bin\ndu.trigger.exe`
+Freshness check: `norgatedata.last_price_update_time("SPY")` returns a timezone-aware datetime; compare `.date()` against `datetime.date.today()`.
+
+---
+
+## INSTRUCTION: Universe Rebuild Only Happens on EOM Rebalance Days
+
+**NEVER trigger `build_universe_cache()` on hold days (non-EOM days).**
+
+Norgate updates its parquet files daily after market close. Because the cache freshness check compares file mtimes, the cache is flagged stale every day — causing a full 4-step rebuild (~3 min, scans 2000+ stocks) even on days when no rebalance trades are made.
+
+The correct split:
+- **Hold days** (~240×/year): `--hold-day` flag → reads 5 holdings + SPY directly from Norgate parquet files in `_read_norgate_prices()`. No universe rebuild. Completes in ~10 seconds.
+- **EOM days** (~12×/year): `--rebalance` flag → `build_universe_cache(force_rebuild=True)` → full signal + backtest. Necessary to determine which stocks to buy/sell.
+
+`rebalance_calendar.json` contains the pre-computed last NYSE trading day of each month for 2026–2035. If the file is missing or expired, it is regenerated automatically using `CustomBusinessMonthEnd` with the NYSE holiday calendar (includes Good Friday and Juneteenth).
+
+---
+
+## INSTRUCTION: signal_cache Must Be Written After Every Full Run
+
+**After every full run (any run that calls `strategy.backtest()` and `compute_nav_metrics()`), populate and save `ledger.signal_cache`.**
+
+`signal_cache` is the only data source for the hold-day fast path. If it is missing or stale, the next `--hold-day` run falls back to the full path (expensive). Always write it even on non-rebalance full runs.
+
+Required fields:
+```python
+ledger.signal_cache = {
+    "last_signal_date": signal.date.strftime("%Y-%m-%d"),
+    "leverage": signal.leverage,          # float (e.g. 1.05)
+    "cagr": m["cagr"],                    # float (e.g. 0.306)
+    "sharpe": m["sharpe"],                # float (e.g. 0.95)
+    "last_buys":  [{"sym": s, "shares": int(...), "price": float(...)} for s in signal.buys],
+    "last_sells": signal.sells,           # list of clean symbol strings
+}
+ledger.save()
+```
+`signal_cache` is persisted as a top-level key in `portfolio_ledger.json`. Load it with `data.get("signal_cache", {})` and default to `{}`.
+
+---
+
+## INSTRUCTION: Hold-Day Message Uses SPY for Bear Gate and Daily Return
+
+**On hold days (`--hold-day`), the bear gate and "Today: X%" are computed from SPY prices read directly from Norgate, NOT from the portfolio NAV.**
+
+`_read_norgate_prices("SPY", days=252)` reads `C:\ProgramData\NorgateData\US_Equities\SPY.parquet` and returns the last 252 rows of adjusted close. Then:
+- Bear gate: `spy.iloc[-1] < spy.rolling(200).mean().iloc[-1]`
+- Daily return: `(spy.iloc[-1] / spy.iloc[-2] - 1) * 100`
+
+For individual holdings, `_read_norgate_prices(sym, days=3)` reads `{sym}.parquet` (e.g., `NEM.parquet`) from the same directory. The uid_map on hold days is identity: `{sym: sym}`. This works for all simple (non-relisted) symbols. Relisted symbols with UIDs like `DELL-200308` require catalog lookup — add handling if such a symbol enters the portfolio.
+
