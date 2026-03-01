@@ -63,7 +63,8 @@ class PortfolioLedger:
     """
 
     def __init__(self, capital: float, positions: dict, closed_trades: list,
-                 last_rebalance_date: str, cash: float = 0.0):
+                 last_rebalance_date: str, cash: float = 0.0,
+                 signal_cache: dict = None):
         self.capital = capital
         self.positions = positions          # {sym: {entry_date, entry_price, shares}}
         self.closed_trades = closed_trades  # list of closed trade dicts
@@ -71,6 +72,10 @@ class PortfolioLedger:
         # Uninvested cash pool: grows when positions are sold, shrinks on new buys.
         # This is the "realized-only" cash — only booked proceeds available for reinvestment.
         self.cash = cash
+        # Cached signal metadata for fast hold-day path (skip full backtest).
+        # Populated after every full run. Keys: last_signal_date, leverage, cagr,
+        # sharpe, last_buys (list of {sym, shares, price}), last_sells (list of sym).
+        self.signal_cache = signal_cache or {}
 
     # ------------------------------------------------------------------
     # Load / Save
@@ -89,6 +94,7 @@ class PortfolioLedger:
                 closed_trades=data.get("closed_trades", []),
                 last_rebalance_date=data.get("last_rebalance_date", ""),
                 cash=float(data.get("cash", 0.0)),
+                signal_cache=data.get("signal_cache", {}),
             )
         except Exception as e:
             print(f"  Warning: could not load ledger ({e}). Will re-bootstrap.")
@@ -103,6 +109,7 @@ class PortfolioLedger:
             "cash": round(self.cash, 2),
             "positions": self.positions,
             "closed_trades": self.closed_trades,
+            "signal_cache": self.signal_cache,
         }
         LEDGER_PATH.write_text(json.dumps(data, indent=2))
 
@@ -549,6 +556,117 @@ def format_daily_summary(signal, prices, uid_map, capital, result, ledger) -> st
 
 
 # ---------------------------------------------------------------------------
+# Hold-day fast path — skips full universe rebuild
+# ---------------------------------------------------------------------------
+
+_NORGATE_EQ = r"C:\ProgramData\NorgateData\US_Equities"
+
+
+def _read_norgate_prices(sym: str, days: int = 250) -> "pd.Series | None":
+    """Read the last `days` rows of adjusted close for `sym` from Norgate parquet.
+
+    Used on hold days to fetch current prices without loading the full universe cache.
+    """
+    path = os.path.join(_NORGATE_EQ, f"{sym}.parquet")
+    if not os.path.exists(path):
+        return None
+    df = pd.read_parquet(path)
+    df.index = pd.to_datetime(df.index)
+    col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    return df[col].sort_index().iloc[-days:]
+
+
+def format_hold_day_message(ledger, capital: float, calendar: dict) -> str:
+    """Fast hold-day message built from ledger + direct Norgate reads.
+
+    Skips universe rebuild and full backtest entirely (~5 sec vs ~3 min).
+    Uses ledger.signal_cache for CAGR, Sharpe, leverage, and last trade details.
+    """
+    from types import SimpleNamespace
+
+    sc = ledger.signal_cache  # populated by last full run
+
+    # ── Load SPY (250 rows for SMA-200 bear gate + daily return) ──────────
+    spy = _read_norgate_prices("SPY", days=252)
+    if spy is None or len(spy) < 2:
+        spy = pd.Series(dtype=float)
+
+    spy_sma200 = spy.rolling(200).mean()
+    bear_regime = bool(len(spy) > 0 and spy.iloc[-1] < spy_sma200.iloc[-1])
+    bear_icon = "\U0001F6A8" if bear_regime else "\U0001F6E1"
+    bear_str = "ON" if bear_regime else "OFF"
+
+    # Daily SPY return for "Today:" display
+    if len(spy) >= 2:
+        daily_pnl = (spy.iloc[-1] / spy.iloc[-2] - 1) * 100
+    else:
+        daily_pnl = 0.0
+    daily_icon = "\U0001F7E2" if daily_pnl >= 0 else "\U0001F534"
+    daily_str = f"{daily_pnl:+.2f}%"
+
+    # ── Load current prices for each holding ─────────────────────────────
+    holdings = list(ledger.positions.keys())
+    price_series: dict = {}
+    for sym in holdings:
+        s = _read_norgate_prices(sym, days=3)
+        if s is not None and len(s) > 0:
+            price_series[sym] = s
+
+    # Build mini prices DataFrame (uid_map is identity: sym -> sym)
+    uid_map = {sym: sym for sym in holdings}
+    prices_mini = pd.DataFrame({sym: price_series[sym] for sym in holdings if sym in price_series})
+
+    # ── Entry info from ledger ────────────────────────────────────────────
+    entry_info = ledger.get_entry_info()
+
+    # ── Mock signal (only fields used by format_portfolio_table) ─────────
+    signal_mock = SimpleNamespace(
+        holdings_clean=holdings,
+        holdings=holdings,
+    )
+
+    # ── Next rebalance from EOM calendar ─────────────────────────────────
+    today_iso = datetime.now().date().isoformat()
+    next_eom = next((d for d in calendar.get("eom_dates", []) if d > today_iso), None)
+    next_rebal_str = pd.Timestamp(next_eom).strftime("%b %d") if next_eom else "?"
+
+    # ── Cached signal metadata ────────────────────────────────────────────
+    last_signal_date = sc.get("last_signal_date", ledger.last_rebalance_date)
+    leverage = sc.get("leverage", 1.0)
+    cagr = sc.get("cagr", 0.0)
+    sharpe = sc.get("sharpe", 0.0)
+    last_buys = sc.get("last_buys", [])   # [{sym, shares, price}, ...]
+    last_sells = sc.get("last_sells", [])
+
+    lines = []
+    lines.append(f"\U0001F4CA <b>WaveRider Daily</b> | {datetime.now().strftime('%Y-%m-%d')}")
+    lines.append("")
+    lines.append(format_portfolio_table(signal_mock, prices_mini, uid_map, capital, entry_info,
+                                        ledger_cash=ledger.cash))
+    lines.append("")
+
+    lines.append(f"\U0001F4E1 <b>Last signal:</b> {last_signal_date}")
+    if last_buys or last_sells:
+        for b in last_buys:
+            sym, shares, ep = b["sym"], b.get("shares", 0), b.get("price", 0)
+            lines.append(f"  \U0001F7E2 BUY  <b>{sym}</b>  {shares} sh @ ${ep:.2f} = ${shares*ep:,.0f}")
+        for sym in last_sells:
+            ct = next((t for t in reversed(ledger.closed_trades) if t["symbol"] == sym), None)
+            price_str = f"@ ${ct['exit_price']:.2f}" if ct else "(price n/a)"
+            lines.append(f"  \U0001F534 SELL <b>{sym}</b>  {price_str}")
+    else:
+        lines.append("  \u2696 No trades (hold)")
+    lines.append("")
+
+    lines.append(f"\u26A1 Leverage: <b>{leverage:.2f}x</b>")
+    lines.append(f"{bear_icon} Bear gate: {bear_str} | {daily_icon} Today: <b>{daily_str}</b>")
+    lines.append(f"\U0001F3AF CAGR: <b>{cagr*100:+.1f}%</b> | Sharpe: {sharpe:.2f}")
+    lines.append(f"\U0001F4C5 Next rebalance: ~{next_rebal_str}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -698,6 +816,10 @@ def main():
                         help="Interactive first-time Telegram bot setup")
     parser.add_argument("--reset-ledger", action="store_true",
                         help="Re-bootstrap portfolio ledger from backtest (use after manual trades)")
+    parser.add_argument("--hold-day", action="store_true",
+                        help="Fast path: skip universe rebuild, use cached signal + fresh Norgate prices")
+    parser.add_argument("--rebalance", action="store_true",
+                        help="Force full universe rebuild (use on EOM rebalance days)")
     args = parser.parse_args()
 
     # Load config
@@ -717,72 +839,136 @@ def main():
         print("ERROR: Telegram not configured. Run with --setup first.")
         sys.exit(1)
 
+    # ── EOM calendar (needed by both fast and full paths) ─────────────────
+    CALENDAR_PATH = SCRIPT_DIR / "rebalance_calendar.json"
+    if CALENDAR_PATH.exists():
+        calendar: dict = json.loads(CALENDAR_PATH.read_text())
+    else:
+        # Generate on first direct bot run (run_daily.py also generates this)
+        try:
+            from pandas.tseries.holiday import (
+                AbstractHolidayCalendar, GoodFriday, Holiday,
+                USLaborDay, USMemorialDay, USMartinLutherKingJr,
+                USPresidentsDay, USThanksgivingDay, nearest_workday,
+            )
+            from pandas.tseries.offsets import CustomBusinessMonthEnd
+
+            class _NYSECal(AbstractHolidayCalendar):
+                rules = [
+                    Holiday("New Year's Day",   month=1,  day=1,  observance=nearest_workday),
+                    USMartinLutherKingJr, USPresidentsDay, GoodFriday, USMemorialDay,
+                    Holiday("Juneteenth", month=6, day=19, observance=nearest_workday,
+                            start_date="2022-01-01"),
+                    Holiday("Independence Day", month=7, day=4, observance=nearest_workday),
+                    USLaborDay, USThanksgivingDay,
+                    Holiday("Christmas", month=12, day=25, observance=nearest_workday),
+                ]
+
+            cbme = CustomBusinessMonthEnd(calendar=_NYSECal())
+            eom_dates = [d.strftime("%Y-%m-%d")
+                         for d in pd.date_range("2026-01-01", "2035-12-31", freq=cbme)]
+            calendar = {"generated": datetime.now().isoformat(), "eom_dates": eom_dates}
+            CALENDAR_PATH.write_text(json.dumps(calendar, indent=2))
+            print(f"  Generated EOM calendar: {len(eom_dates)} dates saved.")
+        except Exception:
+            calendar = {}
+
     try:
-        # 1. Rebuild universe cache if Norgate data changed
-        sys.path.insert(0, str(SCRIPT_DIR))
-        from universe_builder import build_universe_cache
-        print("  Checking universe cache...", end="", flush=True)
-        build_universe_cache(force_rebuild=False)
-        print(" done.")
+        # ── FAST PATH: hold-day — skip universe rebuild ────────────────────
+        if args.hold_day:
+            ledger = PortfolioLedger.load()
+            if ledger is None or not ledger.signal_cache:
+                print("  No ledger / signal_cache found — falling back to full run.")
+                args.hold_day = False  # will fall through to full path below
+            else:
+                print("  Hold-day fast path: loading fresh prices from Norgate...",
+                      end="", flush=True)
+                msg = format_hold_day_message(ledger, capital, calendar)
+                print(" done.")
 
-        # 2. Generate signal
-        from waverider import (
-            WaveRiderStrategy, WaveRiderConfig, load_universe, load_spy,
-            clean_uid, compute_nav_metrics,
-        )
-        print("  Loading data...", end="", flush=True)
-        prices, rankings = load_universe()
-        spy = load_spy()
-        print(" done.")
+        # ── FULL PATH: rebalance or first run ─────────────────────────────
+        if not args.hold_day:
+            # 1. Rebuild universe cache
+            sys.path.insert(0, str(SCRIPT_DIR))
+            from universe_builder import build_universe_cache
+            print("  Checking universe cache...", end="", flush=True)
+            build_universe_cache(force_rebuild=args.rebalance)
+            print(" done.")
 
-        cfg_wr = WaveRiderConfig()
-        strategy = WaveRiderStrategy(cfg_wr)
+            # 2. Generate signal
+            from waverider import (
+                WaveRiderStrategy, WaveRiderConfig, load_universe, load_spy,
+                clean_uid, compute_nav_metrics,
+            )
+            print("  Loading data...", end="", flush=True)
+            prices, rankings = load_universe()
+            spy = load_spy()
+            print(" done.")
 
-        print("  Computing signal...", end="", flush=True)
-        signal = strategy.current_portfolio(prices, spy, rankings)
-        result = strategy.backtest(prices, spy, rankings)
-        print(" done.")
+            cfg_wr = WaveRiderConfig()
+            strategy = WaveRiderStrategy(cfg_wr)
 
-        # Build UID lookup
-        uid_map = {}
-        for uid in signal.holdings:
-            uid_map[clean_uid(uid)] = uid
+            print("  Computing signal...", end="", flush=True)
+            signal = strategy.current_portfolio(prices, spy, rankings)
+            result = strategy.backtest(prices, spy, rankings)
+            print(" done.")
 
-        # 3. Load or bootstrap the persistent portfolio ledger
-        if args.reset_ledger and LEDGER_PATH.exists():
-            LEDGER_PATH.unlink()
-            print("  Ledger reset.")
+            # Build UID lookup
+            uid_map = {}
+            for uid in signal.holdings:
+                uid_map[clean_uid(uid)] = uid
 
-        ledger = PortfolioLedger.load()
-        if ledger is None:
-            print("  No portfolio ledger found — bootstrapping from backtest...", end="", flush=True)
-            ledger = PortfolioLedger.bootstrap(signal, result, prices, uid_map, capital)
+            # 3. Load or bootstrap the persistent portfolio ledger
+            if args.reset_ledger and LEDGER_PATH.exists():
+                LEDGER_PATH.unlink()
+                print("  Ledger reset.")
+
+            ledger = PortfolioLedger.load()
+            if ledger is None:
+                print("  No portfolio ledger found — bootstrapping from backtest...", end="", flush=True)
+                ledger = PortfolioLedger.bootstrap(signal, result, prices, uid_map, capital)
+                ledger.save()
+                print(f" done ({len(ledger.positions)} positions saved).")
+
+            # 4. Determine if today is a rebalance day with trades
+            today = pd.Timestamp(datetime.now().date())
+            is_rebalance = args.rebalance or (
+                (signal.date.date() == today.date()) and (signal.buys or signal.sells)
+            )
+
+            # 5. On rebalance day, update ledger BEFORE formatting message
+            if is_rebalance:
+                ledger.update_rebalance(signal, prices, uid_map)
+
+            # 6. Cache signal metadata for future hold-day fast path
+            m = compute_nav_metrics(result.nav_leveraged)
+            ledger.signal_cache = {
+                "last_signal_date": signal.date.strftime("%Y-%m-%d"),
+                "leverage": signal.leverage,
+                "cagr": m["cagr"],
+                "sharpe": m["sharpe"],
+                "last_buys": [
+                    {"sym": sym,
+                     "shares": int(ledger.positions.get(sym, {}).get("shares", 0)),
+                     "price": float(ledger.positions.get(sym, {}).get("entry_price", 0))}
+                    for sym in signal.buys
+                ],
+                "last_sells": signal.sells,
+            }
             ledger.save()
-            print(f" done ({len(ledger.positions)} positions saved).")
 
-        # 4. Determine if today is a rebalance day with trades
-        today = pd.Timestamp(datetime.now().date())
-        is_rebalance = (signal.date.date() == today.date()) and (signal.buys or signal.sells)
+            # 7. Format message
+            if is_rebalance:
+                msg = format_rebalance_message(signal, prices, uid_map, capital, result, ledger)
+            else:
+                msg = format_daily_summary(signal, prices, uid_map, capital, result, ledger)
 
-        # 5. On rebalance day, update ledger BEFORE formatting message
-        if is_rebalance:
-            ledger.update_rebalance(signal, prices, uid_map)
-            ledger.save()
-
-        # 6. Format message
-        if is_rebalance:
-            msg = format_rebalance_message(signal, prices, uid_map, capital, result, ledger)
-        else:
-            msg = format_daily_summary(signal, prices, uid_map, capital, result, ledger)
-
-        # 7. Send or print
+        # ── Send or print ──────────────────────────────────────────────────
         if args.dry_run:
-            # Ensure all pending text-mode output is flushed before we print the message
             sys.stdout.flush()
             print("\n" + "=" * 50)
             print("  DRY RUN -- message that would be sent:")
             print("=" * 50)
-            # Reconfigure stdout to utf-8 so emoji prints cleanly on Windows
             try:
                 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             except (AttributeError, Exception):
@@ -798,20 +984,30 @@ def main():
             sent_ok = send_telegram(msg, bot_token, chat_id)
             print(" sent!" if sent_ok else " FAILED!")
 
-        # 8. Log
-        log_signal(signal, msg, sent_ok)
+        # ── Log (use a simple placeholder signal on hold-day fast path) ───
+        if args.hold_day:
+            from types import SimpleNamespace
+            sc = ledger.signal_cache
+            _sig = SimpleNamespace(
+                date=pd.Timestamp(sc.get("last_signal_date", ledger.last_rebalance_date)),
+                holdings_clean=list(ledger.positions.keys()),
+                buys=[b["sym"] for b in sc.get("last_buys", [])],
+                sells=sc.get("last_sells", []),
+                leverage=sc.get("leverage", 1.0),
+            )
+            log_signal(_sig, msg, sent_ok)
+        else:
+            log_signal(signal, msg, sent_ok)
 
     except Exception as e:
         tb = traceback.format_exc()
         print(f"\n  ERROR: {e}")
         print(tb)
 
-        # Log the error
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_PATH, "a") as f:
             f.write(f"[{ts}] ERROR: {e}\n{tb}\n")
 
-        # Try to send error alert
         if not args.dry_run and bot_token and chat_id:
             send_error_alert(str(e), bot_token, chat_id)
 
