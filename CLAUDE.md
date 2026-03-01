@@ -1480,3 +1480,88 @@ powershell -ExecutionPolicy Bypass -File setup_scheduler.ps1
 |------|--------|
 | `alphago_enhancements.py` | **EXCLUDED — do not modify or import** |
 | `_backup/` | Archived versions, old docs, investigation scripts |
+
+---
+
+# PART N: WAVERIDER LEARNINGS & VERIFIED DECISIONS
+
+> These are confirmed decisions from live testing and auditing. Do not revert without explicit user approval and a re-run of the audit script.
+
+## Git Policy
+- **Branch**: ALL changes go to `dev/new-machine-setup`. NEVER commit or push to master.
+- Python environment: `C:\Users\Administrator\miniconda3\envs\alphatrade\python.exe`
+
+## Verified Performance Baseline (as of 2026-03-01)
+Produced by deterministic audit — two consecutive runs give identical NAV (diff = 0.00e+00).
+
+| Metric | Value |
+|--------|-------|
+| CAGR (leveraged 2x) | +30.62% |
+| Sharpe (0% rf) | 0.9531 |
+| Sortino (correct formula) | 1.3858 |
+| Max Drawdown | -53.18% |
+| Avg Leverage | 1.17x |
+| Total Return | +1,190,781% |
+| Data period | 35.1 years (1991-01-08 to 2026-02-27) |
+| Rebalances | 422 (EOM) |
+
+If numbers differ from these, run the audit script before assuming the code changed. Numbers can shift between sessions if the price cache is rebuilt with new data.
+
+## Rebalancing: EOM beats 21-Day Fixed Cycle
+- **Decision**: `rebalance_eom = True` (default in `WaveRiderConfig`)
+- **Evidence**: Backtested over 35 years. EOM gives CAGR +30.6% vs +24.2% for 21-day (+6.4pp), Sharpe 0.95 vs 0.81, better Sortino and lower MaxDD. Year-by-year: EOM wins 21 of 36 years, 21-day wins 13.
+- **Why**: Monthly rankings data is computed at month-end boundaries. Rebalancing at EOM reads the signal at the exact boundary it was built for, eliminating mid-cycle noise.
+- **Do not revert**: Unless a full re-backtest shows otherwise.
+
+## Correct Sortino Formula
+- **Wrong** (old code): `down = daily_r[daily_r < 0]; down.std() * sqrt(252)` — uses only negative-return days, underestimates downside dev, inflates Sortino.
+- **Correct** (current code): `sqrt(mean(min(r, 0)^2) * 252)` — floors ALL daily returns at 0 and averages over ALL trading days. Industry-standard denominator.
+- Applied in both `compute_nav_metrics()` in `waverider.py` and inline in `waverider_live.py`.
+
+## SPY Benchmark Alignment
+- **Never use `.bfill()`** after `.ffill()` when aligning SPY to strategy dates. `.bfill()` fills a missing period-start price with a future price = lookahead bias.
+- Current code: `spy_price.reindex(p_dates).ffill().dropna()`
+
+## pct_change — Always Use fill_method=None
+- All calls to `.pct_change()` must pass `fill_method=None` to suppress FutureWarning and prevent silent forward-fill of NaN gaps before differencing.
+- Applies to: `compute_nav_metrics()`, daily_r in `waverider_live.py`, `winner_capture_rate`.
+
+## YTD Base Date
+- Use the **last trading day of the prior year** as the YTD base price, not the first trading day of the current year.
+- First trading day of current year already has that day's return baked into the NAV — using it as base excludes the first day's return from YTD.
+
+## Universe Integrity — ETF Exclusion
+- ETFs must be excluded from **both** the price matrix AND the rankings table.
+- The `UNIVERSE_EXCLUDE` list in `universe_builder.py` controls this. Excluded tickers: GDX, GDXJ, SIL, SILJ, EWY, EWZ, EWJ, EWC, EWT, EWA, EWG, FXI, KWEB, CQQQ, ASHR, ARKK, ARKG, ARKW, ARKF, ARKQ, XOP, OIH, KRE, KBE, SMH, IBB (and all broad-market ETFs).
+- After any universe rebuild, verify: `len([s for s in rankings['uid'].unique() if s in ETF_PATTERNS]) == 0`
+- ETFs in the universe historically inflated CAGR by picking high-momentum ETFs (ARKK 2020, SMH 2023) that are not tradeable as momentum stocks.
+
+## Auditing Methodology — Before Claiming Any Performance Number
+1. Run two consecutive backtests — NAV diff must be 0.00e+00 (deterministic).
+2. Verify metric formulas: manual formula vs `compute_nav_metrics()` — diff must be < 1e-8.
+3. Verify rebalance dates: every date must be the last trading day of its month.
+4. Verify holdings: every month must have exactly `top_n` stocks, no duplicates.
+5. **Never assert a performance number without running this check first.**
+6. If numbers differ from a previous session, possible causes in order of likelihood:
+   a. Price cache was rebuilt with new data (more days = slightly different returns).
+   b. Config changed (e.g., `rebalance_eom` toggled).
+   c. Universe changed (ETF exclusions added/removed).
+   d. Actual bug introduced — check git diff.
+
+## Performance Attribution — Why Numbers Change Between Sessions
+- Adding new data (rebuilding cache with fresher prices): minor CAGR drift, expected.
+- Switching rebalancing mode (21-day -> EOM): +6.4pp CAGR, major.
+- Excluding ETFs from universe: removes high-momentum ETF selections — can reduce CAGR if ETFs were top picks in some years.
+- Sortino fix: does NOT affect CAGR, Sharpe, or MaxDD — only changes the Sortino column.
+- SPY bfill fix: negligible impact on strategy returns (only affects benchmark comparison display).
+
+## cash_remainder — Cache Price Lookups
+- `get_current_price()` was called 2-3x per stock in the cash remainder calculation. Fixed by building `_price_cache` dict once per portfolio print. No correctness impact, only efficiency.
+
+## find_entry_date() — Behaviour
+- Walks backwards through rebalance dates to find the start of the most recent **continuous** holding streak. Correct by design. If a stock was held, dropped for one month, then re-entered — shows the more recent entry date. This is intentional.
+
+## Backtest Calls in waverider_live.py
+- `current_portfolio()` internally calls `backtest()` once.
+- `main()` then calls `backtest()` again for the performance tables.
+- This means the full backtest runs **twice** on every waverider_live.py run. If speed is a concern, cache the result.
