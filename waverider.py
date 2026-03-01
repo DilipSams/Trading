@@ -92,7 +92,7 @@ class WaveRiderConfig:
     exit_band_mult: float = 2.5
     transaction_cost_bps: int = 10
     rebalance_freq: int = 21  # trading days (ignored when rebalance_eom=True)
-    rebalance_eom: bool = False  # if True, rebalance on last trading day of month
+    rebalance_eom: bool = True   # if True, rebalance on last trading day of month
 
     # --- Momentum signal ---
     weight_12m: float = 0.40

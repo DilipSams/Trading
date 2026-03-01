@@ -84,6 +84,19 @@ def main():
     result = strategy.backtest(prices, spy_price, rankings)
     m_lev = compute_nav_metrics(result.nav_leveraged)
 
+    # Print last 5 rebalance dates so you can see the 21-day cycle
+    print("  Rebalance schedule (last 5 dates, end-of-month):")
+    for rd in result.rebalance_dates[-5:]:
+        marker = " <-- CURRENT" if rd == result.rebalance_dates[-1] else ""
+        print(f"    {rd.strftime('%Y-%m-%d')}{marker}")
+    if len(result.rebalance_dates) >= 2:
+        last_two = result.rebalance_dates[-2:]
+        gap = (last_two[1] - last_two[0]).days
+        import datetime
+        next_rebal = last_two[1] + datetime.timedelta(days=gap)
+        print(f"    Next rebalance: ~{next_rebal.strftime('%Y-%m-%d')} ({gap} calendar days)")
+    print()
+
     # Build UID lookup: clean symbol -> UID (for price lookup)
     uid_map = {}
     for uid in signal.holdings:
