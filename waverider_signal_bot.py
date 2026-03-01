@@ -11,6 +11,7 @@ Usage:
     python waverider_signal_bot.py --setup            # first-time Telegram setup
 """
 import argparse
+import json
 import math
 import os
 import sys
@@ -21,6 +22,10 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# Suppress SSL verification warnings (verify=False used for EC2 compatibility)
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 import numpy as np
 import pandas as pd
 import requests
@@ -28,6 +33,182 @@ import requests
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
 LOG_PATH = SCRIPT_DIR / "signal_log.txt"
+LEDGER_PATH = SCRIPT_DIR / "portfolio_ledger.json"
+
+# ---------------------------------------------------------------------------
+# Portfolio Ledger — persistent trade state
+# ---------------------------------------------------------------------------
+
+class PortfolioLedger:
+    """Persistent portfolio state tracking entry prices, shares, and closed trades.
+
+    Positions are locked at the moment of entry (EOM rebalance day) and never
+    recomputed from backtest data. This gives stable P&L regardless of daily
+    Norgate price adjustments.
+
+    JSON structure:
+    {
+      "version": 1,
+      "capital": 100000,
+      "last_rebalance_date": "2026-02-27",
+      "positions": {
+        "NEM": {"entry_date": "2026-01-30", "entry_price": 112.34, "shares": 160}
+      },
+      "closed_trades": [
+        {"symbol": "GLDM", "entry_date": "...", "entry_price": 89.50,
+         "exit_date": "...", "exit_price": 104.14, "shares": 95,
+         "realized_pnl": 1389.30, "pnl_pct": 16.4}
+      ]
+    }
+    """
+
+    def __init__(self, capital: float, positions: dict, closed_trades: list,
+                 last_rebalance_date: str):
+        self.capital = capital
+        self.positions = positions          # {sym: {entry_date, entry_price, shares}}
+        self.closed_trades = closed_trades  # list of closed trade dicts
+        self.last_rebalance_date = last_rebalance_date
+
+    # ------------------------------------------------------------------
+    # Load / Save
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def load(cls):
+        """Load from file. Returns None if file doesn't exist or is corrupt."""
+        if not LEDGER_PATH.exists():
+            return None
+        try:
+            data = json.loads(LEDGER_PATH.read_text())
+            return cls(
+                capital=float(data.get("capital", 100000)),
+                positions=data.get("positions", {}),
+                closed_trades=data.get("closed_trades", []),
+                last_rebalance_date=data.get("last_rebalance_date", ""),
+            )
+        except Exception as e:
+            print(f"  Warning: could not load ledger ({e}). Will re-bootstrap.")
+            return None
+
+    def save(self):
+        """Write ledger to JSON."""
+        data = {
+            "version": 1,
+            "capital": self.capital,
+            "last_rebalance_date": self.last_rebalance_date,
+            "positions": self.positions,
+            "closed_trades": self.closed_trades,
+        }
+        LEDGER_PATH.write_text(json.dumps(data, indent=2))
+
+    # ------------------------------------------------------------------
+    # Bootstrap — initialise from backtest on first run
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def bootstrap(cls, signal, result, prices, uid_map, capital: float):
+        """Initialise ledger from backtest state when no ledger file exists.
+
+        Entry dates and prices come from Norgate closing prices at the detected
+        entry date (continuous-streak walk). Shares are floor(per_stock / price)
+        using the leverage that was active on the entry date (from result.leverage_series),
+        not today's leverage — this gives accurate "as-traded" share counts.
+        """
+        n = len(signal.holdings_clean)
+
+        positions = {}
+        for sym in signal.holdings_clean:
+            uid = uid_map.get(sym, sym)
+            entry_date = find_entry_date(uid, result.holdings_log, result.rebalance_dates)
+            entry_price = get_price_on_date(prices, uid, entry_date) if entry_date else 0.0
+
+            # Use leverage at entry date (not current) for accurate share count
+            if entry_date is not None and hasattr(result, "leverage_series"):
+                lev_at_entry = float(result.leverage_series.asof(entry_date))
+            else:
+                lev_at_entry = signal.leverage
+            per_stock = capital * lev_at_entry / n if n > 0 else 0
+
+            shares = math.floor(per_stock / entry_price) if entry_price > 0 else 0
+            positions[sym] = {
+                "entry_date": entry_date.strftime("%Y-%m-%d") if entry_date else "",
+                "entry_price": round(float(entry_price), 4),
+                "shares": int(shares),
+            }
+
+        return cls(
+            capital=capital,
+            positions=positions,
+            closed_trades=[],
+            last_rebalance_date=signal.date.strftime("%Y-%m-%d"),
+        )
+
+    # ------------------------------------------------------------------
+    # Rebalance update — called once on EOM day
+    # ------------------------------------------------------------------
+
+    def update_rebalance(self, signal, prices, uid_map):
+        """Apply EOM rebalance: close sells, open buys, leave holds untouched."""
+        n = len(signal.holdings_clean)
+        effective = self.capital * signal.leverage
+        per_stock = effective / n if n > 0 else 0
+        today_str = signal.date.strftime("%Y-%m-%d")
+
+        # --- Close sold positions ---
+        for sym in signal.sells:
+            if sym not in self.positions:
+                continue
+            pos = self.positions[sym]
+            uid = uid_map.get(sym, sym)
+            exit_price = get_current_price(prices, uid)
+            entry_price = float(pos["entry_price"])
+            shares = int(pos["shares"])
+            realized_pnl = round(shares * (exit_price - entry_price), 2) if exit_price > 0 else 0.0
+            pnl_pct = round((exit_price / entry_price - 1) * 100, 2) if entry_price > 0 and exit_price > 0 else 0.0
+            self.closed_trades.append({
+                "symbol": sym,
+                "entry_date": pos["entry_date"],
+                "entry_price": entry_price,
+                "exit_date": today_str,
+                "exit_price": round(float(exit_price), 4),
+                "shares": shares,
+                "realized_pnl": realized_pnl,
+                "pnl_pct": pnl_pct,
+            })
+            del self.positions[sym]
+
+        # --- Open new positions ---
+        for sym in signal.buys:
+            uid = uid_map.get(sym, sym)
+            entry_price = get_current_price(prices, uid)
+            shares = math.floor(per_stock / entry_price) if entry_price > 0 else 0
+            self.positions[sym] = {
+                "entry_date": today_str,
+                "entry_price": round(float(entry_price), 4),
+                "shares": int(shares),
+            }
+
+        self.last_rebalance_date = today_str
+
+    # ------------------------------------------------------------------
+    # Entry info accessor — drop-in replacement for build_entry_info()
+    # ------------------------------------------------------------------
+
+    def get_entry_info(self) -> dict:
+        """Return {sym: (pd.Timestamp, entry_price, actual_shares)} for all positions.
+
+        The 3-tuple is used by format_portfolio_table() to show locked share counts
+        and stable P&L.
+        """
+        info = {}
+        for sym, pos in self.positions.items():
+            try:
+                dt = pd.Timestamp(pos["entry_date"])
+            except Exception:
+                dt = None
+            info[sym] = (dt, float(pos["entry_price"]), int(pos.get("shares", 0)))
+        return info
+
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -72,7 +253,7 @@ def send_telegram(text: str, bot_token: str, chat_id: str) -> bool:
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
-            }, timeout=15)
+            }, timeout=15, verify=False)
             if resp.status_code == 200 and resp.json().get("ok"):
                 return True
             # HTML parse error — retry without formatting
@@ -83,7 +264,7 @@ def send_telegram(text: str, bot_token: str, chat_id: str) -> bool:
                     "chat_id": chat_id,
                     "text": plain,
                     "disable_web_page_preview": True,
-                }, timeout=15)
+                }, timeout=15, verify=False)
                 return resp.status_code == 200 and resp.json().get("ok")
         except Exception:
             if attempt == 0:
@@ -159,11 +340,16 @@ def format_portfolio_table(signal, prices, uid_map, capital, entry_info) -> str:
     for sym in signal.holdings_clean:
         uid = uid_map.get(sym, sym)
         cur_price = get_current_price(prices, uid)
-        shares = math.floor(per_stock / cur_price) if cur_price > 0 else 0
+
+        # Use actual share count from ledger (3-tuple); fall back to computed
+        raw = entry_info.get(sym, (None, 0, 0))
+        ed, ep = raw[0], raw[1]
+        actual_shares = raw[2] if len(raw) > 2 else 0
+        shares = actual_shares if actual_shares > 0 else (math.floor(per_stock / cur_price) if cur_price > 0 else 0)
+
         value = shares * cur_price
         total_value += value
 
-        ed, ep = entry_info.get(sym, (None, 0))
         ed_str = ed.strftime("%b %d") if ed else "n/a"
 
         if ep > 0:
@@ -201,10 +387,11 @@ def format_portfolio_table(signal, prices, uid_map, capital, entry_info) -> str:
     return "\n".join(lines)
 
 
-def format_rebalance_message(signal, prices, uid_map, capital, result, entry_info) -> str:
+def format_rebalance_message(signal, prices, uid_map, capital, result, ledger) -> str:
     """Full rebalance message with trade instructions."""
     from waverider import compute_nav_metrics
 
+    entry_info = ledger.get_entry_info()
     n = len(signal.holdings_clean)
     effective = capital * signal.leverage
     per_stock = effective / n if n > 0 else 0
@@ -227,7 +414,21 @@ def format_rebalance_message(signal, prices, uid_map, capital, result, entry_inf
             lines.append(f"  \U0001F534 SELL <b>{sym}</b>  (exit entire position)")
         lines.append("")
 
-    # Detailed portfolio table
+    # Realized P&L for positions closed today
+    today_str = signal.date.strftime("%Y-%m-%d")
+    closed_today = [t for t in ledger.closed_trades if t.get("exit_date") == today_str]
+    if closed_today:
+        lines.append("\U0001F4B0 <b>CLOSED TODAY:</b>")
+        for t in closed_today:
+            icon = "\u2705" if t["pnl_pct"] >= 0 else "\u274C"
+            lines.append(
+                f"  {icon} {t['symbol']:<6s} "
+                f"${t['entry_price']:.2f} \u2192 ${t['exit_price']:.2f}  "
+                f"{t['pnl_pct']:+.1f}%  ${t['realized_pnl']:+,.0f}"
+            )
+        lines.append("")
+
+    # Detailed portfolio table (new state after rebalance)
     lines.append(format_portfolio_table(signal, prices, uid_map, capital, entry_info))
     lines.append("")
 
@@ -242,15 +443,19 @@ def format_rebalance_message(signal, prices, uid_map, capital, result, entry_inf
     return "\n".join(lines)
 
 
-def format_daily_summary(signal, prices, uid_map, capital, result, entry_info) -> str:
+def format_daily_summary(signal, prices, uid_map, capital, result, ledger) -> str:
     """Daily status message with portfolio details."""
     from waverider import compute_nav_metrics
 
+    entry_info = ledger.get_entry_info()
     m = compute_nav_metrics(result.nav_leveraged)
 
-    # Estimate next rebalance: ~21 trading days from last signal date
+    # Estimate next rebalance: end of NEXT calendar month.
+    # signal.date is the last trading day of its month (EOM), so +MonthEnd(1) gives
+    # the last calendar day of the SAME month. We want the next month's end instead.
     last_rebal = signal.date
-    est_next = last_rebal + pd.tseries.offsets.BDay(21)
+    next_month_first = (last_rebal + pd.DateOffset(months=1)).replace(day=1)
+    est_next = next_month_first + pd.offsets.MonthEnd(0)
 
     # Compute daily P&L from NAV
     nav = result.nav_leveraged
@@ -357,6 +562,7 @@ def run_setup(capital: float):
         resp = requests.get(
             f"https://api.telegram.org/bot{token}/getUpdates",
             timeout=10,
+            verify=False,
         )
         data = resp.json()
         if not data.get("ok") or not data.get("result"):
@@ -447,6 +653,8 @@ def main():
                         help="Print message to terminal without sending")
     parser.add_argument("--setup", action="store_true",
                         help="Interactive first-time Telegram bot setup")
+    parser.add_argument("--reset-ledger", action="store_true",
+                        help="Re-bootstrap portfolio ledger from backtest (use after manual trades)")
     args = parser.parse_args()
 
     # Load config
@@ -492,32 +700,54 @@ def main():
         result = strategy.backtest(prices, spy, rankings)
         print(" done.")
 
-        # Build UID lookup + entry info
+        # Build UID lookup
         uid_map = {}
         for uid in signal.holdings:
             uid_map[clean_uid(uid)] = uid
-        entry_info = build_entry_info(signal, result, prices, uid_map)
 
-        # 3. Determine if today is a rebalance day with trades
+        # 3. Load or bootstrap the persistent portfolio ledger
+        if args.reset_ledger and LEDGER_PATH.exists():
+            LEDGER_PATH.unlink()
+            print("  Ledger reset.")
+
+        ledger = PortfolioLedger.load()
+        if ledger is None:
+            print("  No portfolio ledger found — bootstrapping from backtest...", end="", flush=True)
+            ledger = PortfolioLedger.bootstrap(signal, result, prices, uid_map, capital)
+            ledger.save()
+            print(f" done ({len(ledger.positions)} positions saved).")
+
+        # 4. Determine if today is a rebalance day with trades
         today = pd.Timestamp(datetime.now().date())
         is_rebalance = (signal.date.date() == today.date()) and (signal.buys or signal.sells)
 
-        # 4. Format message
+        # 5. On rebalance day, update ledger BEFORE formatting message
         if is_rebalance:
-            msg = format_rebalance_message(signal, prices, uid_map, capital, result, entry_info)
-        else:
-            msg = format_daily_summary(signal, prices, uid_map, capital, result, entry_info)
+            ledger.update_rebalance(signal, prices, uid_map)
+            ledger.save()
 
-        # 5. Send or print
+        # 6. Format message
+        if is_rebalance:
+            msg = format_rebalance_message(signal, prices, uid_map, capital, result, ledger)
+        else:
+            msg = format_daily_summary(signal, prices, uid_map, capital, result, ledger)
+
+        # 7. Send or print
         if args.dry_run:
+            # Ensure all pending text-mode output is flushed before we print the message
+            sys.stdout.flush()
             print("\n" + "=" * 50)
-            print("  DRY RUN — message that would be sent:")
+            print("  DRY RUN -- message that would be sent:")
             print("=" * 50)
-            # Windows terminal may not support emoji — encode safely
+            # Reconfigure stdout to utf-8 so emoji prints cleanly on Windows
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, Exception):
+                pass
             try:
                 print(msg)
             except UnicodeEncodeError:
-                print(msg.encode("utf-8", errors="replace").decode("utf-8"))
+                print(msg.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
             print("=" * 50)
             sent_ok = True
         else:
@@ -525,7 +755,7 @@ def main():
             sent_ok = send_telegram(msg, bot_token, chat_id)
             print(" sent!" if sent_ok else " FAILED!")
 
-        # 6. Log
+        # 8. Log
         log_signal(signal, msg, sent_ok)
 
     except Exception as e:
