@@ -511,16 +511,22 @@ class WaveRiderStrategy:
         dates = prices.loc[warmup:].index
 
         # --- Unlevered backtest (Realized-Only compounding) ---
-        # Track position dollar VALUES, updated daily via pct_change returns.
-        # Using absolute prices would break because Norgate retroactively adjusts
-        # all historical prices for splits/dividends. Returns (pct_change) are
-        # stable after adjustments.
+        # Track fractional share counts sized from cash-pool proceeds.
+        # NAV uses prices_ffill (forward-filled) so that a stock acquired or
+        # delisted mid-month keeps its last valid (acquisition) price rather than
+        # showing $0 — the original bug that caused fake -50% annual losses.
         #
-        # Mechanics: gross sell proceeds → cash pool; new buys sized from
-        # cash_pool / n_buys equally; held positions never resized (winners run).
+        # For all normally-trading stocks prices_ffill == prices (no NaN → no diff).
+        # Only the 1,193 dated UIDs (SYM-YYYYMM) are affected: their price series
+        # ends on the termination date and is forward-filled with that final price.
+        # Using last valid price as "frozen" value is the standard financial treatment
+        # for cash acquisitions (shareholders receive the acquisition price in cash
+        # and hold it until the next monthly rebalance).
+        prices_ffill = prices.ffill()  # one-time; NaN tail → last valid price
+
         nav_vals: List[float] = []
-        positions: Dict[str, float] = {}  # uid → current dollar value of position
-        cash_pool: float = 1.0            # uninvested capital; starts = full portfolio
+        positions: Dict[str, float] = {}  # uid → fractional shares
+        cash_pool: float = 1.0
         current_holdings: set = set()
 
         rebal_dates: List[pd.Timestamp] = []
@@ -541,14 +547,6 @@ class WaveRiderStrategy:
                 nav_vals.append(1.0)
                 continue
 
-            # Step 1: Update held position dollar values via today's daily return
-            for uid in list(positions.keys()):
-                r = daily_rets.at[date, uid] if uid in daily_rets.columns else float("nan")
-                if pd.notna(r) and not np.isinf(r):
-                    positions[uid] *= (1.0 + r)
-                # NaN/inf → price data missing, keep value unchanged (0% return)
-
-            # Step 2: Rebalance if this is a rebalance date
             is_rebal = (date in _eom_set) if c.rebalance_eom else (i % c.rebalance_freq == 0)
             if is_rebal:
                 portfolio, filtered_out = self.select_portfolio(
@@ -557,22 +555,28 @@ class WaveRiderStrategy:
                 buys  = portfolio - current_holdings
                 sells = current_holdings - portfolio
 
-                # SELL: move position dollar value to cash pool
+                # SELL: proceeds use ffill price (acquisition price if stock delisted)
                 for uid in sells:
-                    cash_pool += positions.pop(uid, 0.0)
+                    if uid in positions:
+                        px = prices_ffill.at[date, uid] if uid in prices_ffill.columns else 0.0
+                        cash_pool += positions.pop(uid) * float(px)
 
-                # BUY: distribute cash pool equally among new entries
+                # BUY: size from cash pool using real price (selected stocks always valid)
                 n_buys = len(buys)
                 if n_buys > 0 and cash_pool > 0:
                     per_buy = cash_pool / n_buys
+                    cash_spent = 0.0
                     for uid in sorted(buys):
-                        positions[uid] = per_buy
-                    cash_pool = 0.0
+                        if uid in prices.columns:
+                            px = float(prices.at[date, uid])
+                            if pd.notna(px) and px > 0:
+                                positions[uid] = per_buy / px
+                                cash_spent += per_buy
+                    cash_pool = max(0.0, cash_pool - cash_spent)
 
-                # HOLD: do nothing — position dollar values continue accumulating
+                # HOLD: share counts never change — winners run undisturbed
 
-                # Transaction cost: applied proportionally to full portfolio
-                # (same approximation as original equal-weight implementation)
+                # Transaction cost: proportional to full portfolio (standard approximation)
                 tc = c.transaction_cost_bps / 10000
                 for uid in list(positions.keys()):
                     positions[uid] *= (1.0 - tc)
@@ -584,8 +588,14 @@ class WaveRiderStrategy:
                 filtered_log[date] = filtered_out
                 trades_log[date] = len(buys) + len(sells)
 
-            # NAV = sum of position dollar values + uninvested cash
-            nav_vals.append(sum(positions.values()) + cash_pool)
+            # NAV = Σ(shares × ffill_price) + cash; ffill freezes acquired stocks
+            pos_value = 0.0
+            for uid, sh in positions.items():
+                if uid in prices_ffill.columns:
+                    px = prices_ffill.at[date, uid]
+                    if pd.notna(px) and px > 0:
+                        pos_value += sh * float(px)
+            nav_vals.append(pos_value + cash_pool)
 
         nav_unlevered = pd.Series(nav_vals, index=dates)
 
