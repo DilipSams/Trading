@@ -1225,9 +1225,9 @@ waverider_live.py    waverider_signal_bot.py
 
 | File | Lines | Role |
 |------|-------|------|
-| `waverider.py` | ~754 | Core strategy: config, scoring, backtesting, signal generation |
+| `waverider.py` | ~913 | Core strategy: config, scoring, backtesting, signal generation |
 | `waverider_live.py` | ~445 | CLI signal generator with dollar allocations and trade instructions |
-| `waverider_signal_bot.py` | ~549 | Automated Telegram bot: daily summaries + rebalance alerts |
+| `waverider_signal_bot.py` | ~1156 | Automated Telegram bot: daily summaries + rebalance alerts |
 | `universe_builder.py` | ~348 | Point-in-time universe builder with survivorship-bias elimination |
 | `setup_scheduler.ps1` | ~37 | Windows Task Scheduler setup (S4U logon for headless execution) |
 
@@ -1491,19 +1491,23 @@ powershell -ExecutionPolicy Bypass -File setup_scheduler.ps1
 - **Branch**: ALL changes go to `dev/new-machine-setup`. NEVER commit or push to master.
 - Python environment: `C:\Users\Administrator\miniconda3\envs\alphatrade\python.exe`
 
-## Verified Performance Baseline (as of 2026-03-01)
+## Verified Performance Baseline (as of 2026-03-02)
 Produced by deterministic audit — two consecutive runs give identical NAV (diff = 0.00e+00).
+Includes 7-day NaN-streak delisting confirmation (mid-month sell + replace, commit b75d2d8).
 
 | Metric | Value |
 |--------|-------|
-| CAGR (leveraged 2x) | +30.62% |
-| Sharpe (0% rf) | 0.9531 |
-| Sortino (correct formula) | 1.3858 |
-| Max Drawdown | -53.18% |
-| Avg Leverage | 1.17x |
-| Total Return | +1,190,781% |
+| CAGR (leveraged 2x) | +32.8% |
+| CAGR (unlevered 1x) | +26.9% |
+| Sharpe (0% rf) | 1.00 |
+| Sortino (correct formula) | 1.45 |
+| Max Drawdown | -54.2% |
+| Avg Leverage | 1.15x |
+| Total Return | +2,124,598% |
+| Beat SPY | 27/34 years (79%) |
 | Data period | 35.1 years (1991-01-08 to 2026-02-27) |
-| Rebalances | 422 (EOM) |
+| Rebalances | 422 (EOM) + 50 mid-month delisting events |
+| Total trades | 1,451 |
 
 If numbers differ from these, run the audit script before assuming the code changed. Numbers can shift between sessions if the price cache is rebuilt with new data.
 
@@ -1783,4 +1787,139 @@ No trimming, no rebalancing, no leverage re-application
 - **NEVER** compute `per_position = capital × leverage / N` at rebalance time and use it to size new buys — this ignores accumulated wealth
 - **NEVER** use unrealized P&L as available capital for new positions — only BOOKED (sold) proceeds count
 - **NEVER** implement a different compounding model for a new strategy without first backtesting it against Realized-Only and getting explicit approval
+
+---
+
+## INSTRUCTION: 7-Day NaN-Streak Delisting Confirmation
+
+**Rule**: When a held stock shows 7 consecutive NaN trading days, treat it as confirmed delisted. Sell immediately at the ffill price. Replace on the same day. 7 trading days ≈ 2 calendar weeks — no legitimate data gap is that long.
+
+### Why 7 days (not 1 or 2):
+1-2 NaN days can occur from stale Norgate data, slow corporate action ingestion, or brief trading halts. Selling on day 1 risks selling a temporarily-halted stock and missing its resumption. 7 days is the conservative floor that eliminates all false positives in 35 years of data (verified).
+
+### Three cases to handle:
+
+**Case 1 — Mid-month confirm (streak hits 7 before EOM):**
+- Sell at `prices_ffill.at[date, uid]` — last valid price, frozen by ffill
+- Select exactly N replacement(s) where N = number of confirmed delistings
+- Buy replacements same day using the sell proceeds
+- `current_holdings.update(buys)` — ADD only; never reassign `current_holdings = new_portfolio`
+
+**Case 2 — EOM rebal with 1-6 NaN days (tentative hold):**
+- Do NOT force-sell. Stock occupies its slot as a "tentative hold"
+- Run `select_portfolio(effective_current)` where `effective_current = current_holdings - tentative`
+- Trim result to `top_n - n_tentative` by composite score
+- Re-add tentative holds: `portfolio = portfolio | tentative`
+- Final portfolio always has exactly `top_n` stocks
+
+**Case 3 — EOM rebal with 7+ NaN days (confirmed on EOM day):**
+- Sell confirmed stocks FIRST (before normal EOM selection)
+- Then run normal EOM rebalance on remaining holdings
+- The vacated slot(s) are filled by the EOM selection as new entries
+
+### Norgate dated UIDs:
+Delisted/acquired stocks are renamed from `SYM` to `SYM-YYYYMM` (e.g., `ATVI-202310`). `prices.ffill()` forwards-fills the NaN tail with the last valid price. For cash acquisitions this equals the merger price — no artificial loss.
+
+### Verified stats (35-year backtest):
+- 50 mid-month events fired (50 confirmed delistings between EOM dates)
+- All 50 are exactly N-for-N (1 sold → 1 bought, or 2 sold → 2 bought for simultaneous delistings)
+- CAGR improved from +32.1% → +32.8% vs ffill-only baseline (immediate replacement beats frozen slot)
+
+---
+
+## INSTRUCTION: Mid-Month Replacement MUST Use .update(), Never = Assignment
+
+**This is a critical correctness rule. Violating it creates ghost positions that silently corrupt NAV.**
+
+### The ghost position bug:
+When `select_portfolio(current_holdings)` is called mid-month (after removing delisted stocks), it can meme-filter or momentum-rank-out a non-delisted held stock (e.g., NVDA during a parabolic run). If you then write:
+```python
+current_holdings = new_portfolio   # WRONG
+```
+The meme-filtered stock disappears from `current_holdings` but remains in `positions`. It:
+- Still contributes to NAV (via `for uid, sh in positions.items()`)
+- Never gets tracked for delisting (not in `current_holdings`)
+- Never gets sold at EOM (`sells = current_holdings - portfolio` can't find it)
+- Becomes a permanent ghost — if it subsequently crashes, it drags NAV down forever
+
+This bug caused CAGR to drop from +32.1% to +16.7% in testing (2024 went from +172.9% to +6.0%).
+
+### The fix — always use this pattern:
+```python
+# After mid-month delisting sell:
+new_portfolio, _ = self.select_portfolio(date, composite, meme_scores, current_holdings)
+scores_today = composite.loc[date].dropna()
+new_entries = sorted(
+    new_portfolio - current_holdings,
+    key=lambda s: scores_today.get(s, -999), reverse=True
+)
+replacement_buys = set(new_entries[:n_vacant])   # cap to EXACTLY n_vacant
+
+# ... buy logic ...
+
+current_holdings.update(replacement_buys)   # ADD only -- never = new_portfolio
+```
+
+The `select_portfolio` result is used only to find candidates. Only the best `n_vacant` candidates are added. Non-delisted held stocks are never touched.
+
+### The APC* NaN-price edge case (Aug 9, 2019):
+If a selected replacement stock itself has NaN price on the buy day (already delisted):
+- The position buy guard `if pd.notna(px) and px > 0:` prevents the position from being opened
+- `current_holdings.update(buys)` still adds the stock (tracking its streak from next day)
+- Cash stays in pool; deployed when the ghost replacement's own streak hits 7 and a valid replacement is found
+- NAV is unaffected (NAV computed from `positions.items()`, not `current_holdings`)
+- Verified: this case occurred once (WP* → APC* → SBUX), handled correctly, no cash lost
+
+---
+
+## INSTRUCTION: Backtest Diagnostic Scripts Must Use Loop Replay, Not EOM Snapshot Diffing
+
+**Never attribute mid-month events by comparing two consecutive EOM portfolio snapshots.**
+
+### Why snapshot diffing is wrong:
+`holdings_log[prev_rebal]` → `holdings_log[next_rebal]` shows ALL changes between two EOM dates. This includes:
+1. The mid-month delisting sell+replace (what you want)
+2. Normal EOM rotation stocks that changed at the next rebalance (what you don't want)
+
+The diff incorrectly shows 3 new stocks when only 1 was replaced mid-month. The other 2 were normal EOM rotations.
+
+### Correct diagnostic approach — loop replay:
+```python
+current_holdings: set = set()
+nan_streak: dict = {}
+
+for i, date in enumerate(dates):
+    # ... track nan_streak ...
+    confirmed = {uid for uid in current_holdings if nan_streak.get(uid, 0) >= 7}
+    if confirmed and not is_rebal:
+        # Record: which stocks triggered, sell prices, replacement selected
+        delisting_events.append({...})
+        current_holdings -= confirmed
+        new_portfolio, _ = strategy.select_portfolio(...)
+        buys = set(new_entries[:n_vacant])
+        current_holdings.update(buys)
+
+    if is_rebal and date in result.holdings_log:
+        current_holdings = set(result.holdings_log[date])   # sync at EOM
+```
+
+Syncing `current_holdings` from `result.holdings_log` at each EOM ensures the replay stays aligned with the actual backtest. Mid-month events between EOM syncs are accurately replayed.
+
+### Verified: 50 events all correctly attributed, all N-for-N, no phantom extra stocks.
+
+---
+
+## INSTRUCTION: Backtest Modification Cross-Check Protocol
+
+Whenever the backtest loop in `waverider.py` is modified, run all four checks before committing:
+
+1. **CAGR check**: Run `_show_waverider_holdings.py`. CAGR must be within ±0.5pp of the verified baseline (+32.8% leveraged, +26.9% unlevered) unless the change is intentionally economic. A drop of >2pp means a bug — investigate before proceeding.
+
+2. **Year-by-year outlier scan**: Check each year. A single year dropping from +172% to +6% (like 2024 did during ghost-position debugging) signals a systematic error. A drop of >50pp in any year (vs baseline) is a red flag requiring investigation.
+
+3. **Ghost-position check**: Run a loop replay that compares `set(positions.keys())` vs `current_holdings` at every mid-month event. Any uid in positions but not in current_holdings is a ghost.
+
+4. **Mid-month event count consistency**: `len(mid_month_trades_in_trades_log)` must equal the replay event count. If they differ, the loop replay and the backtest are diverging.
+
+Root cause of the most common backtest regression: `current_holdings = new_portfolio` inside a mid-month block (see ghost position instruction above).
 
