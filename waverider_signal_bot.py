@@ -64,7 +64,8 @@ class PortfolioLedger:
 
     def __init__(self, capital: float, positions: dict, closed_trades: list,
                  last_rebalance_date: str, cash: float = 0.0,
-                 signal_cache: dict = None):
+                 signal_cache: dict = None, nan_streak: dict = None,
+                 last_known_price: dict = None):
         self.capital = capital
         self.positions = positions          # {sym: {entry_date, entry_price, shares}}
         self.closed_trades = closed_trades  # list of closed trade dicts
@@ -76,6 +77,10 @@ class PortfolioLedger:
         # Populated after every full run. Keys: last_signal_date, leverage, cagr,
         # sharpe, last_buys (list of {sym, shares, price}), last_sells (list of sym).
         self.signal_cache = signal_cache or {}
+        # Delisting detection: count consecutive NaN-price trading days per holding.
+        # Persisted so the 7-day window survives across daily bot invocations.
+        self.nan_streak: dict = nan_streak or {}         # {sym: int}
+        self.last_known_price: dict = last_known_price or {}  # {sym: float}
 
     # ------------------------------------------------------------------
     # Load / Save
@@ -95,6 +100,8 @@ class PortfolioLedger:
                 last_rebalance_date=data.get("last_rebalance_date", ""),
                 cash=float(data.get("cash", 0.0)),
                 signal_cache=data.get("signal_cache", {}),
+                nan_streak=data.get("nan_streak", {}),
+                last_known_price=data.get("last_known_price", {}),
             )
         except Exception as e:
             print(f"  Warning: could not load ledger ({e}). Will re-bootstrap.")
@@ -110,6 +117,8 @@ class PortfolioLedger:
             "positions": self.positions,
             "closed_trades": self.closed_trades,
             "signal_cache": self.signal_cache,
+            "nan_streak": self.nan_streak,
+            "last_known_price": self.last_known_price,
         }
         LEDGER_PATH.write_text(json.dumps(data, indent=2))
 
@@ -253,6 +262,33 @@ class PortfolioLedger:
                 dt = None
             info[sym] = (dt, float(pos["entry_price"]), int(pos.get("shares", 0)))
         return info
+
+    def record_emergency_sell(self, sym: str, exit_price: float, today_str: str):
+        """Sell a delisted holding at last known price and move to closed_trades."""
+        if sym not in self.positions:
+            return
+        pos = self.positions[sym]
+        entry_price = float(pos["entry_price"])
+        shares = int(pos["shares"])
+        gross = shares * exit_price
+        realized_pnl = round(shares * (exit_price - entry_price), 2)
+        pnl_pct = round((exit_price / entry_price - 1) * 100, 2) if entry_price > 0 else 0.0
+        self.closed_trades.append({
+            "symbol": sym,
+            "entry_date": pos["entry_date"],
+            "entry_price": entry_price,
+            "exit_date": today_str,
+            "exit_price": round(float(exit_price), 4),
+            "shares": shares,
+            "realized_pnl": realized_pnl,
+            "pnl_pct": pnl_pct,
+            "gross_proceeds": round(gross, 2),
+            "reason": "delisted",
+        })
+        self.cash = round(self.cash + gross, 2)
+        del self.positions[sym]
+        self.nan_streak.pop(sym, None)
+        self.last_known_price.pop(sym, None)
 
 
 # ---------------------------------------------------------------------------
@@ -437,20 +473,44 @@ def format_portfolio_table(signal, prices, uid_map, capital, entry_info, ledger_
     return "\n".join(lines)
 
 
-def format_rebalance_message(signal, prices, uid_map, capital, result, ledger) -> str:
+def format_rebalance_message(signal, prices, uid_map, capital, result, ledger,
+                             emergency_sells: list = None) -> str:
     """Full rebalance message with trade instructions."""
     from waverider import compute_nav_metrics
 
     entry_info = ledger.get_entry_info()
     m = compute_nav_metrics(result.nav_leveraged)
-    today_str = signal.date.strftime("%Y-%m-%d")
+    # Use actual today for closed_trades lookup (emergency sells use today's date,
+    # not signal.date which is the last EOM).
+    actual_today = datetime.now().date().isoformat()
+    signal_date_str = signal.date.strftime("%Y-%m-%d")
 
     lines = []
-    lines.append(f"\U0001F514 <b>REBALANCE</b> | {signal.date.strftime('%Y-%m-%d')}")
+    header = "⚠️ EMERGENCY REBALANCE" if emergency_sells else "🔔 REBALANCE"
+    lines.append(f"<b>{header}</b> | {actual_today}")
     lines.append("")
 
+    # ── Emergency delisting alert ─────────────────────────────────────────
+    if emergency_sells:
+        lines.append("⚠️ <b>MID-MONTH DELISTING DETECTED:</b>")
+        delisted_trades = [
+            t for t in ledger.closed_trades
+            if t.get("exit_date") == actual_today and t.get("reason") == "delisted"
+        ]
+        for t in delisted_trades:
+            icon = "✅" if t["pnl_pct"] >= 0 else "❌"
+            lines.append(
+                f"  {icon} SOLD {t['symbol']:<6s} "
+                f"${t['entry_price']:.2f} → ${t['exit_price']:.2f}  "
+                f"{t['pnl_pct']:+.1f}%  ${t['realized_pnl']:+,.0f}"
+            )
+        lines.append("")
+
     # ── Closed today (SELL side) ─────────────────────────────────────────
-    closed_today = [t for t in ledger.closed_trades if t.get("exit_date") == today_str]
+    closed_today = [
+        t for t in ledger.closed_trades
+        if t.get("exit_date") == actual_today and t.get("reason") != "delisted"
+    ]
     if closed_today:
         lines.append("\U0001F4B0 <b>CLOSED TODAY:</b>")
         for t in closed_today:
@@ -881,10 +941,44 @@ def main():
                 print("  No ledger / signal_cache found — falling back to full run.")
                 args.hold_day = False  # will fall through to full path below
             else:
-                print("  Hold-day fast path: loading fresh prices from Norgate...",
-                      end="", flush=True)
-                msg = format_hold_day_message(ledger, capital, calendar)
-                print(" done.")
+                today_str_hd = datetime.now().date().isoformat()
+                emergency_sells = []
+
+                # Track NaN streak for each holding (persisted across daily runs).
+                # 7 consecutive NaN trading days ≈ 2 calendar weeks → confirmed delisting.
+                for sym in list(ledger.positions.keys()):
+                    series = _read_norgate_prices(sym, days=3)
+                    if series is None or len(series) == 0:
+                        ledger.nan_streak[sym] = ledger.nan_streak.get(sym, 0) + 1
+                    else:
+                        latest_px = float(series.iloc[-1])
+                        if pd.isna(latest_px) or latest_px <= 0:
+                            ledger.nan_streak[sym] = ledger.nan_streak.get(sym, 0) + 1
+                        else:
+                            ledger.nan_streak[sym] = 0
+                            ledger.last_known_price[sym] = latest_px
+                    if ledger.nan_streak.get(sym, 0) >= 7:
+                        emergency_sells.append(sym)
+
+                if emergency_sells:
+                    # Confirmed delisting(s) — sell at last known price
+                    print(f"\n  ⚠ DELISTING CONFIRMED: {', '.join(emergency_sells)}")
+                    for sym in emergency_sells:
+                        exit_px = ledger.last_known_price.get(sym, 0.0)
+                        ledger.record_emergency_sell(sym, exit_px, today_str_hd)
+                        print(f"    Sold {sym} at ${exit_px:.2f} (last known price)")
+                    ledger.save()
+                    # Store emergency context and fall through to full path to find
+                    # replacement(s). update_rebalance() will use the emergency cash.
+                    args._emergency_sells = emergency_sells
+                    print("  Triggering emergency rebalance to find replacement(s)...")
+                    args.hold_day = False  # fall through to full path below
+                else:
+                    ledger.save()  # persist updated nan_streaks / last_known_prices
+                    print("  Hold-day fast path: loading fresh prices from Norgate...",
+                          end="", flush=True)
+                    msg = format_hold_day_message(ledger, capital, calendar)
+                    print(" done.")
 
         # ── FULL PATH: rebalance or first run ─────────────────────────────
         if not args.hold_day:
@@ -932,13 +1026,54 @@ def main():
 
             # 4. Determine if today is a rebalance day with trades
             today = pd.Timestamp(datetime.now().date())
-            is_rebalance = args.rebalance or (
+            emergency_sells = getattr(args, "_emergency_sells", [])
+            is_rebalance = args.rebalance or bool(emergency_sells) or (
                 (signal.date.date() == today.date()) and (signal.buys or signal.sells)
             )
 
             # 5. On rebalance day, update ledger BEFORE formatting message
             if is_rebalance:
                 ledger.update_rebalance(signal, prices, uid_map)
+
+            # 5b. Emergency: if vacant slots remain (update_rebalance may not have
+            # filled them in Scenario B), buy the best available replacements now.
+            if emergency_sells:
+                today_str_em = today.strftime("%Y-%m-%d")
+                from waverider import WaveRiderConfig as _WRC, clean_uid as _cu
+                _top_n = (_WRC()).top_n
+                n_missing = max(0, _top_n - len(ledger.positions))
+                if n_missing > 0 and ledger.cash > 0:
+                    score_date = result.composite.index[-1]
+                    current_syms = set(ledger.positions.keys())
+                    new_pf, _ = strategy.select_portfolio(
+                        score_date, result.composite, result.meme_scores, current_syms
+                    )
+                    scores_em = result.composite.loc[score_date].dropna()
+                    new_entries = sorted(
+                        new_pf - current_syms,
+                        key=lambda s: scores_em.get(s, -999),
+                        reverse=True,
+                    )
+                    repl_candidates = new_entries[:n_missing]
+                    if repl_candidates and ledger.cash > 0:
+                        per_buy = ledger.cash / len(repl_candidates)
+                        for sym in repl_candidates:
+                            uid = uid_map.get(_cu(sym), sym)
+                            px = get_current_price(prices, uid)
+                            if px > 0:
+                                shares = math.floor(per_buy / px)
+                                if shares > 0:
+                                    clean_s = _cu(sym)
+                                    ledger.positions[clean_s] = {
+                                        "entry_date": today_str_em,
+                                        "entry_price": round(px, 4),
+                                        "shares": shares,
+                                    }
+                                    ledger.cash = round(ledger.cash - shares * px, 2)
+                                    uid_map[clean_s] = uid
+                        ledger.save()
+                        print(f"  Emergency replacement(s) bought: "
+                              f"{[_cu(s) for s in repl_candidates]}")
 
             # 6. Cache signal metadata for future hold-day fast path
             m = compute_nav_metrics(result.nav_leveraged)
@@ -959,7 +1094,10 @@ def main():
 
             # 7. Format message
             if is_rebalance:
-                msg = format_rebalance_message(signal, prices, uid_map, capital, result, ledger)
+                msg = format_rebalance_message(
+                    signal, prices, uid_map, capital, result, ledger,
+                    emergency_sells=emergency_sells or None,
+                )
             else:
                 msg = format_daily_summary(signal, prices, uid_map, capital, result, ledger)
 

@@ -533,6 +533,7 @@ class WaveRiderStrategy:
         holdings_log: Dict[pd.Timestamp, List[str]] = {}
         filtered_log: Dict[pd.Timestamp, List[str]] = {}
         trades_log: Dict[pd.Timestamp, int] = {}
+        nan_streak: Dict[str, int] = {}   # uid → consecutive NaN-price trading days
 
         # Pre-compute EOM rebalance set if needed
         _eom_set = set()
@@ -548,12 +549,99 @@ class WaveRiderStrategy:
                 continue
 
             is_rebal = (date in _eom_set) if c.rebalance_eom else (i % c.rebalance_freq == 0)
-            if is_rebal:
-                portfolio, filtered_out = self.select_portfolio(
-                    date, composite, meme_scores, current_holdings
+
+            # --- NaN-streak tracking (delisting detection) ---
+            # 7 consecutive NaN trading days ≈ 2 calendar weeks; no legitimate data
+            # gap is that long, so streak >= 7 means the stock is truly gone.
+            for uid in list(current_holdings):
+                raw_px = prices.at[date, uid] if uid in prices.columns else float("nan")
+                if pd.isna(raw_px) or raw_px <= 0:
+                    nan_streak[uid] = nan_streak.get(uid, 0) + 1
+                else:
+                    nan_streak[uid] = 0   # valid price → reset streak
+
+            confirmed_delistings = {
+                uid for uid in current_holdings
+                if nan_streak.get(uid, 0) >= 7
+            }
+
+            # --- Mid-month sell + replace (streak >= 7, NOT a rebalance day) ---
+            if confirmed_delistings and not is_rebal:
+                n_vacant = len(confirmed_delistings)
+                for uid in confirmed_delistings:
+                    if uid in positions:
+                        px = prices_ffill.at[date, uid] if uid in prices_ffill.columns else 0.0
+                        cash_pool += positions.pop(uid) * float(px)
+                    current_holdings.discard(uid)
+                    nan_streak.pop(uid, None)
+
+                # Find exactly n_vacant replacements.
+                # IMPORTANT: use .update() not = to avoid displacing non-delisted
+                # held stocks mid-month (select_portfolio may meme-filter them,
+                # creating ghost positions that never get properly sold).
+                replacement_buys: set = set()
+                if cash_pool > 0:
+                    new_portfolio, _ = self.select_portfolio(
+                        date, composite, meme_scores, current_holdings
+                    )
+                    scores_today = composite.loc[date].dropna()
+                    new_entries = sorted(
+                        new_portfolio - current_holdings,
+                        key=lambda s: scores_today.get(s, -999),
+                        reverse=True,
+                    )
+                    replacement_buys = set(new_entries[:n_vacant])
+
+                    if replacement_buys:
+                        per_buy = cash_pool / len(replacement_buys)
+                        cash_spent = 0.0
+                        for uid in sorted(replacement_buys):
+                            if uid in prices.columns:
+                                px = float(prices.at[date, uid])
+                                if pd.notna(px) and px > 0:
+                                    positions[uid] = per_buy / px
+                                    cash_spent += per_buy
+                        cash_pool = max(0.0, cash_pool - cash_spent)
+                        tc_mid = c.transaction_cost_bps / 10000
+                        for uid in replacement_buys:
+                            if uid in positions:
+                                positions[uid] *= (1.0 - tc_mid)
+                        cash_pool *= (1.0 - tc_mid)
+                        current_holdings.update(replacement_buys)
+
+                trades_log[date] = (
+                    trades_log.get(date, 0) + n_vacant + len(replacement_buys)
                 )
+
+            if is_rebal:
+                # Confirmed delistings on EOM day — sell first, before normal rebalance
+                for uid in confirmed_delistings:
+                    if uid in positions:
+                        px = prices_ffill.at[date, uid] if uid in prices_ffill.columns else 0.0
+                        cash_pool += positions.pop(uid) * float(px)
+                    current_holdings.discard(uid)
+                    nan_streak.pop(uid, None)
+
+                # Tentative holds (1-6 NaN days): keep, fill only remaining slots
+                tentative = {uid for uid in current_holdings if 0 < nan_streak.get(uid, 0) < 7}
+                n_tentative = len(tentative)
+
+                effective_current = current_holdings - tentative
+                portfolio, filtered_out = self.select_portfolio(
+                    date, composite, meme_scores, effective_current
+                )
+                # Trim to (top_n - n_tentative) to leave room for tentative holds
+                if n_tentative > 0 and len(portfolio) > c.top_n - n_tentative:
+                    scores_today = composite.loc[date].dropna()
+                    ranked = sorted(
+                        portfolio, key=lambda u: scores_today.get(u, -999), reverse=True
+                    )
+                    portfolio = set(ranked[: c.top_n - n_tentative])
+                # Re-add tentative holds (they still occupy their slots)
+                portfolio = portfolio | tentative
+
                 buys  = portfolio - current_holdings
-                sells = current_holdings - portfolio
+                sells = current_holdings - portfolio  # tentative NOT in sells
 
                 # SELL: proceeds use ffill price (acquisition price if stock delisted)
                 for uid in sells:
